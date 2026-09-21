@@ -1,0 +1,48 @@
+# Venv
+.venv
+
+# Python cache and compiled files
+**/__pycache__/
+*.pyc
+
+# Tools
+.mypy_cache
+.ruff_cache
+.pytest_cache
+
+# Packaging
+*.egg-info
+*.whl
+dist/
+
+# Editor
+*.swp
+.vscode
+
+# Workspace
+.workspace
+.workspace_baseline
+
+# Local mirrors of platform-side byte-equivalence reference / candidate
+# trees, downloaded from hosted-compute invocation outputs.
+.platform-baseline/
+
+# Docker bag-replay artefacts.
+# - test/fixtures/                MCAP downloads (cached per developer
+#                                 machine, fetched by
+#                                 test/ros_smoke/fetch_fixture.py).
+# - test/ros_smoke/ws/            the colcon build tree the docker
+#                                 harness drops next to the package
+#                                 skeleton; rebuilt from scratch on
+#                                 every container run (--symlink-install
+#                                 is deliberately skipped — see
+#                                 run_in_container.sh).
+# - the rendered gen-node output and synthesised manifest inside the
+#   colcon package skeleton.
+test/fixtures/
+test/ros_smoke/ws/
+test/ros_smoke/ros_pkg/inference_node/node.py
+test/ros_smoke/ros_pkg/manifest.json
+
+# Claude
+.claude/

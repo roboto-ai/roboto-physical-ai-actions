@@ -1,0 +1,41 @@
+# Applies to both `scripts/build.sh` and `roboto actions invoke-local`,
+# which both use this directory as the docker build context. Without this,
+# a ~9 GB local .venv and caches stream into the daemon on every build.
+
+# -- Python virtualenvs (local dev only; image installs fresh via uv) --
+.venv/
+venv/
+env/
+
+# -- Python build + tool caches --
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+dist/
+build/
+
+# -- Editor / IDE / OS --
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# -- Assistants / workspace --
+.git/
+.gitignore
+.claude/
+.serena/
+.workspace/
+
+# -- Docs not needed at build time --
+DEVELOPING.md
+README.md
+
+# -- Tests + fixtures are not needed at image runtime --
+test/

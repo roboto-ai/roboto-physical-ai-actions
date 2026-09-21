@@ -1,0 +1,22 @@
+# Venv
+.venv
+
+# Python cache and compiled files
+**/__pycache__/
+*.pyc
+
+# Tools
+.mypy_cache
+.ruff_cache
+.pytest_cache
+
+# Packaging
+*.egg-info
+dist/
+
+# Editor
+*.swp
+.vscode
+
+# Workspace
+.workspace

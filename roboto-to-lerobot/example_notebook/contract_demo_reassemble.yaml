@@ -1,0 +1,112 @@
+# Run demo with
+# (substitute your own dataset, org and collection ids)
+# roboto actions invoke-local --dataset=ds_xxxxxxxxxxxx --log-level=INFO --parameter contract='contract_demo_reassemble.yaml' --parameter collection_id="cl_xxxxxxxxxxxx"
+
+name: reassemble
+version: 1
+
+# Robot type for LeRobot dataset metadata
+robot_type: pick_and_place
+
+# Episode parameters
+fps: 10  # [Hz] Target FPS for the output dataset
+#action_lead_steps: 150  # [steps] Optional: Shift action sampling N steps into the future to compensate for control delay (default: 0)
+
+# Observations
+observations:
+  # Exo Camera
+  - key: observation.images.external
+    topic: /camera/hama1/image_raw/compressed
+    type: sensor_msgs/msg/CompressedImage
+    image:
+      resize: [480, 854]  # height, width
+    align: {method: nearest, tolerance_ms: 1500}
+
+  # Endo Camera
+  - key: observation.images.gripper
+    topic: /camera/hand/image_raw/compressed
+    type: sensor_msgs/msg/CompressedImage
+    image:
+      resize: [480, 854]  # height, width
+    align: {method: nearest, tolerance_ms: 1500}
+
+  # Joint positions for robot 0
+  - key: observation.state
+    topic: /robot/joint_states
+    type: sensor_msgs/msg/JointState
+    selector:
+      names:
+        - joint_1
+        - joint_2
+        - joint_3
+        - joint_4
+        - joint_5
+        - joint_6
+        - joint_7
+      lerobot_names:
+        - arm_1
+        - arm_2
+        - arm_3
+        - arm_4
+        - arm_5
+        - arm_6
+        - arm_7
+    align: {method: hold, tolerance_ms: 1500}
+
+# Actions
+# No alignment for actions: defaulting to hold with the auto-bounded
+# tolerance (max(2/fps, 50ms), same formula the live runtime uses).
+actions:
+
+  # Actions for robot 0
+  - key: action
+    topic: /robot/gripper_states
+    type: sensor_msgs/msg/JointState
+    selector:
+      names:
+        - finger_joint1
+        - finger_joint2
+      lerobot_names:
+        - gripper_1
+        - gripper_2
+    transforms: # executed in order of appearance
+      - type: resample_uniform
+        stage: pre                    # Resample raw data to uniform intervals
+      - type: butterworth_lowpass
+        stage: pre                    # Filter before alignment
+        cutoff_hz: 30
+        order: 2
+
+# ── Transform Examples ──
+# Transforms are applied in order of appearance. Each transform can specify a 'stage':
+#   - stage: pre   → Applied BEFORE time-alignment (operates on raw timestamps)
+#   - stage: post  → Applied AFTER time-alignment (operates on aligned timeline)
+#   - (no stage)   → Defaults to 'post'
+#
+# Example 1: Resample non-uniform data, then filter
+#   transforms:
+#     - type: resample_uniform
+#       stage: pre                    # Resample raw data to uniform intervals
+#     - type: butterworth_lowpass
+#       stage: pre                    # Filter before alignment
+#       cutoff_hz: 20
+#       order: 2
+#
+# Example 2: Compute velocity after alignment
+#   transforms:
+#     - type: finite_difference       # Compute velocity on aligned timeline (post is default)
+#     - type: butterworth_lowpass
+#       cutoff_hz: 10
+#       order: 2
+#
+# Example 3: Resample, filter, align, then compute velocity
+#   transforms:
+#     - type: resample_uniform
+#       stage: pre                    # Resample raw data to uniform intervals
+#     - type: butterworth_lowpass
+#       stage: pre                    # Filter before alignment
+#       cutoff_hz: 20
+#       order: 2
+#     - type: finite_difference       # Compute velocity after alignment (post is default)
+#
+# See transforms.py for full list and parameters.

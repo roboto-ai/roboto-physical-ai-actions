@@ -1,0 +1,47 @@
+# Applies to `scripts/build.sh`, whose buildx context is this package dir.
+# Without this, buildx streams ~10 GB of local venv + captured data into
+# the daemon on every build.
+
+# -- Python virtualenvs (local dev only; image installs fresh via uv) --
+.venv/
+venv/
+env/
+
+# -- Python build + tool caches --
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+dist/
+build/
+
+# -- Editor / IDE / OS --
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# -- Git + local assistants --
+.git/
+.gitignore
+.claude/
+.serena/
+.workspace/
+
+# -- Local test / capture data --
+*_data/
+contract_example.yaml
+contract_demo_reassemble.yaml
+**/*.mcap
+**/*.bag
+**/*.parquet
+**/*.arrow
+
+# -- Docs not needed at build time --
+DEVELOPING.md
+README.md

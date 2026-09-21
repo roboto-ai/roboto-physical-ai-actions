@@ -1,0 +1,14 @@
+.serena/
+.claude/
+.ipynb_checkpoints/
+.venv/
+compare_actions.py
+
+# uv lockfiles are dev-env side effects: action images resolve deps from
+# pyproject.toml at build time and never consume a lockfile, and the
+# roboto-to-lerobot two-variant build (lerobot 0.3.3 vs 0.5.1) cannot be
+# represented by a single lock. integration-example is the exception — a
+# standalone runnable example whose committed lock helps users reproduce it.
+uv.lock
+!integration-example/uv.lock
+.idea

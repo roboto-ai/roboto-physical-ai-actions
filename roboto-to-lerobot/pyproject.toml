@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "roboto_to_lerobot"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    # The [video] extra (PyAV) backs the GOP-aware decoder for
+    # foxglove_msgs/CompressedVideo camera topics — see roboto_to_lerobot/video.py.
+    # >= 0.52.0 is where roboto.experimental.video gained its codec registry
+    # (resolve_codec / supported_formats); 0.51 was H.264-only.
+    "roboto[video] >= 0.52.0",
+    "lerobot >= 0.3.3, < 0.6",
+    "numpy",
+    "pandas",
+    "opencv-python",
+    "scipy",
+]
+
+[project.optional-dependencies]
+# gen-node (codegen) deps — kept out of core so a live-inference-only
+# install stays lean. jinja2 is required to render; black is an optional
+# formatting post-pass (render.py degrades gracefully without it).
+codegen = [
+    "jinja2 >= 3.1",
+    "black >= 24",
+]
+dev = [
+    "pytest",
+    "ruff~=0.16.8",
+    "jinja2 >= 3.1",
+    "black >= 24",
+]
+
+[project.scripts]
+roboto-to-lerobot = "roboto_to_lerobot.codegen.cli:main"
+
+[tool.setuptools.package-data]
+"roboto_to_lerobot.codegen" = ["templates/*.j2"]

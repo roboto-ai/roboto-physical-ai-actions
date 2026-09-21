@@ -1,0 +1,42 @@
+# Lint contract for every action package in this repo.
+#
+# `select` is stated explicitly rather than left to ruff's default. Ruff's
+# default rule set has grown substantially across releases, so a config that
+# relies on it silently changes what `scripts/verify.sh` enforces the moment a
+# contributor installs a newer ruff — which is how this repo ended up with
+# hundreds of lint errors on an unmodified checkout. Each package's dev extras
+# pin a matching ruff range; widen both together, deliberately.
+#
+# Discovery note: ruff walks up from each file, so this root config applies to
+# every package even though `verify.sh` runs `ruff check .` from inside one.
+
+# Set explicitly: ruff only infers this from a `requires-python` in the same
+# pyproject.toml as the config, which a shared root config is not. Every
+# package in the repo declares `requires-python = ">=3.12"`. If one ever
+# supports an older Python, lower this to that floor rather than leaving it
+# high — under-targeting only makes ruff decline a newer-syntax rewrite,
+# whereas over-targeting lets it emit syntax that package cannot run.
+target-version = "py312"
+
+[lint]
+select = [
+    "E4",   # pycodestyle: import formatting
+    "E7",   # pycodestyle: statement-level slips
+    "E9",   # pycodestyle: syntax / IO errors
+    "F",    # pyflakes: unused imports and names, f-string slips
+    "I",    # isort: deterministic import order
+    "UP",   # pyupgrade: keep syntax current with requires-python
+    "B",    # flake8-bugbear: mutable defaults, shadowed loop vars, zip() length
+    "C4",   # flake8-comprehensions
+    "RUF",  # ruff's own checks
+]
+
+ignore = [
+    # Ambiguous-unicode checks. This repo writes prose in docstrings, comments
+    # and user-facing strings using typographic punctuation (em dashes, curly
+    # quotes, arrows). That is deliberate house style, not a homoglyph attack,
+    # and these three rules flag every instance.
+    "RUF001",  # ambiguous character in a string
+    "RUF002",  # ambiguous character in a docstring
+    "RUF003",  # ambiguous character in a comment
+]

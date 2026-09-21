@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_v3_to_v2_1"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "roboto >= 0.31.0",
+    "lerobot >= 0.5.0, < 0.6",
+    # `datasets` is pulled (and version-constrained to >=4.0.0) by lerobot 0.5.x;
+    # the vendored converter imports it but needs no separate pin. Verified
+    # working on datasets 4.8.5.
+    "jsonlines",
+    "tqdm",
+    "numpy",
+    "pyarrow",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff~=0.16.8",
+]
+
+[tool.ruff]
+# A per-package [tool.ruff] REPLACES the root ruff.toml rather than merging
+# with it, so inherit the shared rule set explicitly before adding to it.
+extend = "../ruff.toml"
+# The vendored downgrade script is kept byte-for-byte identical to upstream so
+# it can be re-synced with a plain diff; don't lint or reformat it.
+extend-exclude = ["src/lerobot_v3_to_v2_1/convert/convert_dataset_v30_to_v21.py"]

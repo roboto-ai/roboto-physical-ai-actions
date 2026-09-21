@@ -1,0 +1,38 @@
+{
+    "name": "roboto-to-lerobot",
+    "description": "Converts Roboto ingested data referenced by a Roboto Collection of events into a LeRobot dataset, one output episode per event in the collection. Which topics become which state, action, and video features is driven entirely by a contract YAML read from the invocation dataset (defaults to 'contract.yaml' at the dataset root) — see https://docs.roboto.ai/reference/roboto-to-lerobot-contract.html for the contract schema and https://docs.roboto.ai/user-guides/convert-to-lerobot.html for the authoring guide. Deployed as two variants with an identical interface: roboto-to-lerobot-v2_1 writes LeRobot 2.1 datasets (lerobot 0.3.3) and roboto-to-lerobot-v3_0 writes LeRobot 3.0 datasets (lerobot 0.5.1); only v3_0 supports sharded (parallel) writing.",
+    "compute_requirements": {
+        "vCPU": 16384,
+        "memory": 65536,
+        "storage": 200
+    },
+    "parameters": [
+        {
+            "name": "collection_id",
+            "description": "ID of a Roboto Collection whose resource_type is 'event'. Each event in the collection becomes one episode in the output LeRobot dataset.",
+            "required": true
+        },
+        {
+            "name": "contract",
+            "description": "Path, inside the invocation dataset, to the contract YAML that defines which Roboto topics to read and how they map to LeRobot state, action, and video features — see https://docs.roboto.ai/reference/roboto-to-lerobot-contract.html for the contract schema. Defaults to 'contract.yaml' at the dataset root; the run fails if no contract.yaml is found there and this parameter is not set, or if a specified path does not exist in the dataset.",
+            "required": false
+        },
+        {
+            "name": "pool_size",
+            "description": "Number of worker processes used to read and process events in parallel, per shard. Leave unset to auto-size from the host CPU count: min(16, cpu_count / shard_count) — on the default 16-vCPU compute with shard_count=3 that is 5. Any explicit value is used verbatim and is not capped.",
+            "required": false
+        },
+        {
+            "name": "encoder_threads",
+            "description": "Level-of-parallelism given to the SVT-AV1 video encoder per camera stream. Must be >= 2: lower values risk the encoder's internal frame queue overflowing under bursty writes, which silently drops frames from the output video. Leave unset to use the built-in value of 2. Only the v3_0 variant acts on it — the v2_1 variant (lerobot 0.3.3) accepts this parameter and silently ignores it, since lerobot 0.3.x has no equivalent encoder-tuning knob, so leave it unset on v2_1.",
+            "required": false
+        },
+        {
+            "name": "shard_count",
+            "description": "Number of parallel writer shards; each shard independently writes a partial dataset that is then merged (stream-copy, no re-encoding) into the final output. Sharded writing requires lerobot >= 0.5, so only the v3_0 variant acts on it — the v2_1 variant (lerobot 0.3.3) accepts this parameter and ignores it, falling back to a single writer and logging a warning. Sharding also changes episode order: episodes in the merged dataset are grouped by shard rather than strictly chronological, though each episode's original start_time_ns is preserved in the output manifest.",
+            "required": false,
+            "default": "3"
+        }
+    ],
+    "requires_downloaded_inputs": false
+}

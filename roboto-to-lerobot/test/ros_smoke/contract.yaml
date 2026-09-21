@@ -1,0 +1,70 @@
+# Stripped-down contract for the docker bag-replay smoke.
+#
+# Derived from the reference contract used by the converter-side
+# byte-equivalence gate. That contract uses ``butterworth_lowpass`` +
+# ``resample_uniform`` on the action stream — both non-causal, both
+# refused at gen-node time. The
+# docker smoke only needs to prove the data path: one JointState
+# observation in, one JointState action out, on real MCAP timestamps.
+# The image streams from the real contract are dropped to keep the
+# smoke fast and to avoid bringing OpenCV's video stack into the ROS 2
+# Humble image.
+#
+# fps is 10 so the timer fires often enough that the bag (~5-30 s
+# real-time per episode) yields at least a few ticks before
+# ros2 topic echo --once latches a message.
+name: ros_smoke
+version: 1
+robot_type: ros_smoke_robot
+fps: 10
+
+observations:
+  - key: observation.state
+    topic: /robot/joint_states
+    type: sensor_msgs/msg/JointState
+    selector:
+      names:
+        - joint_1
+        - joint_2
+        - joint_3
+        - joint_4
+        - joint_5
+        - joint_6
+        - joint_7
+        - joint_8
+        - joint_9
+      lerobot_names:
+        - measured_joint_pos_1
+        - measured_joint_pos_2
+        - measured_joint_pos_3
+        - measured_joint_pos_4
+        - measured_joint_pos_5
+        - measured_joint_pos_6
+        - measured_joint_pos_7
+        - measured_joint_pos_8
+        - measured_joint_pos_9
+    align: {method: hold, tolerance_ms: 1500}
+
+actions:
+  - key: action
+    topic: /teleop/action
+    type: sensor_msgs/msg/JointState
+    selector:
+      names:
+        - joint_1
+        - joint_2
+        - joint_3
+        - joint_4
+        - joint_5
+        - joint_6
+        - joint_7
+        - joint_8
+      lerobot_names:
+        - command_joint_pos_1
+        - command_joint_pos_2
+        - command_joint_pos_3
+        - command_joint_pos_4
+        - command_joint_pos_5
+        - command_joint_pos_6
+        - command_joint_pos_7
+        - command_joint_pos_8

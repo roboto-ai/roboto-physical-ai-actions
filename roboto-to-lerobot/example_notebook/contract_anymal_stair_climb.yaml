@@ -1,0 +1,136 @@
+# ANYmal (legged quadruped) → LeRobot contract.
+#
+# Source: ETH "GrandTour" ANYmal recording, one hike spread across ~11 ROS1
+# bags that Roboto has ingested into a single topic namespace. Each event in
+# the input collection (e.g. the 19 s "stair_climb" event) becomes one episode.
+#
+# Unlike the manipulation demo, the proprioception and the policy command live
+# in custom ANYmal message types, decoded by:
+#   - anymal_msgs/AnymalState                     (leg joint positions → state)
+#   - series_elastic_actuator_msgs/SeActuatorReadings (commanded.position → action)
+# The front HDR camera and the IMU use the stock CompressedImage / Imu decoders.
+#
+# Invoke (local dry-run) with, e.g.:
+#   roboto actions invoke-local --dataset=<INVOCATION_DATASET_ID> \
+#     --log-level=INFO --parameter collection_id="<COLLECTION_ID>" \
+#     --parameter contract="contract_anymal_stair_climb.yaml" --dry-run
+
+name: anymal_stair_climb
+version: 1
+
+# Legged robot — proprioceptive joint state + policy joint-position command.
+robot_type: anymal
+
+# The front HDR camera caps the cadence at ~10 Hz; the 400 Hz proprioception
+# and command streams are aligned down onto this timeline.
+fps: 10
+
+# ── Observations ──────────────────────────────────────────────────────────
+observations:
+  # Front HDR camera (native 640×960, ~10 Hz), downscaled preserving 2:3 aspect.
+  - key: observation.images.front
+    topic: /boxi/hdr/front/image_raw/compressed
+    type: sensor_msgs/msg/CompressedImage
+    image:
+      resize: [480, 720]  # height, width
+    align: {method: nearest, tolerance_ms: 100}
+
+  # Leg joint positions (12) — the first 12 dims of observation.state.
+  # Order: <LF|RF|LH|RH>_<HAA|HFE|KFE>. Bare selector names default to the
+  # joint position field of anymal_msgs/AnymalState.joints.
+  - key: observation.state
+    topic: /anymal/state_estimator/anymal_state
+    type: anymal_msgs/AnymalState
+    selector:
+      names:
+        - LF_HAA
+        - LF_HFE
+        - LF_KFE
+        - RF_HAA
+        - RF_HFE
+        - RF_KFE
+        - LH_HAA
+        - LH_HFE
+        - LH_KFE
+        - RH_HAA
+        - RH_HFE
+        - RH_KFE
+      # ``q_*`` = measured joint position (standard robotics notation), kept
+      # distinct from the commanded ``q_des_*`` action names below (this action
+      # requires globally-unique LeRobot feature names).
+      lerobot_names:
+        - q_LF_HAA
+        - q_LF_HFE
+        - q_LF_KFE
+        - q_RF_HAA
+        - q_RF_HFE
+        - q_RF_KFE
+        - q_LH_HAA
+        - q_LH_HFE
+        - q_LH_KFE
+        - q_RH_HAA
+        - q_RH_HFE
+        - q_RH_KFE
+    align: {method: hold, tolerance_ms: 100}
+
+  # IMU angular velocity + linear acceleration (6) — concatenated onto
+  # observation.state after the joints, giving an 18-dim state vector.
+  # (orientation is not populated on this stream, so it is left out.)
+  - key: observation.state
+    topic: /anymal/imu
+    type: sensor_msgs/msg/Imu
+    selector:
+      names:
+        - angular_velocity.x
+        - angular_velocity.y
+        - angular_velocity.z
+        - linear_acceleration.x
+        - linear_acceleration.y
+        - linear_acceleration.z
+      lerobot_names:
+        - imu_ang_vel_x
+        - imu_ang_vel_y
+        - imu_ang_vel_z
+        - imu_lin_acc_x
+        - imu_lin_acc_y
+        - imu_lin_acc_z
+    align: {method: hold, tolerance_ms: 100}
+
+# ── Actions ───────────────────────────────────────────────────────────────
+# The RL locomotion policy is position-controlled: commanded.position is the
+# per-joint setpoint (velocity/torque commands are unused here). Bare selector
+# names default to the commanded.position field of each actuator reading, in
+# the same joint order as the state above.
+actions:
+  - key: action
+    topic: /anymal/actuator_readings
+    type: series_elastic_actuator_msgs/SeActuatorReadings
+    selector:
+      names:
+        - LF_HAA
+        - LF_HFE
+        - LF_KFE
+        - RF_HAA
+        - RF_HFE
+        - RF_KFE
+        - LH_HAA
+        - LH_HFE
+        - LH_KFE
+        - RH_HAA
+        - RH_HFE
+        - RH_KFE
+      # ``q_des_*`` = commanded (desired) joint position — the policy setpoint.
+      lerobot_names:
+        - q_des_LF_HAA
+        - q_des_LF_HFE
+        - q_des_LF_KFE
+        - q_des_RF_HAA
+        - q_des_RF_HFE
+        - q_des_RF_KFE
+        - q_des_LH_HAA
+        - q_des_LH_HFE
+        - q_des_LH_KFE
+        - q_des_RH_HAA
+        - q_des_RH_HFE
+        - q_des_RH_KFE
+    align: {method: hold, tolerance_ms: 100}

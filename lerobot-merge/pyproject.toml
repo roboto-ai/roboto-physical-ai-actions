@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_merge"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "roboto >= 0.31.0",
+    "lerobot >= 0.5.0, < 0.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff~=0.16.8",
+]

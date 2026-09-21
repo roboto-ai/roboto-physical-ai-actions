@@ -1,0 +1,29 @@
+{
+    "name": "training-dataset-metrics",
+    "description": "Audits the statistical quality of robot training data and produces a self-contained quality report. Runs in one of two modes depending on whether `collection_id` is set: pre-conversion mode audits raw Roboto topics before they're converted to LeRobot; post-conversion mode audits an already-converted LeRobot dataset (v2.1 or v3.0). Metrics cover effective sample size, effective dimensionality, state/action autocorrelation, demonstrator speed and action-velocity distributions, cross-episode variance, state-action temporal alignment, state coverage of the declared operating range, and episode-length/dead-channel filtering checks; problem episodes are flagged (e.g. stuck sensors, misaligned timing, near-zero movement, jerky or outlier-velocity motion, length outliers, dead channels, low effective sample size). Output artifacts land in the invocation's output dataset under `audit_reports/<invocation_id>/`: `report.json` (machine-readable), `audit_report.html` (a single browsable file with embedded plots), and per-metric PNG plots.",
+    "compute_requirements": {
+        "vCPU": 4096,
+        "memory": 8192,
+        "storage": 50
+    },
+    "parameters": [
+        {
+            "name": "collection_id",
+            "description": "Set this to switch into pre-conversion mode: audit raw Roboto topics before conversion, using the same input contract as the roboto-to-lerobot conversion action. Must be the ID of a Roboto Collection whose resource_type is 'event' — each event in the collection becomes one audited episode. The collection may span multiple source datasets; each event is routed to its own source dataset's topics for decoding, so events do NOT need to belong to the dataset this action was invoked on. An event is skipped only if it has no dataset association at all. Leave unset to run in post-conversion mode instead, which audits the already-converted LeRobot dataset supplied as this invocation's input.",
+            "required": false
+        },
+        {
+            "name": "contract",
+            "description": "Pre-conversion mode only (has no effect unless collection_id is set). Path within the invocation dataset to the roboto-to-lerobot contract YAML describing observation and action topic roles. Defaults to a file named 'contract.yaml' found anywhere in the dataset.",
+            "required": false,
+            "default": "contract.yaml"
+        },
+        {
+            "name": "write_audit_tags",
+            "description": "Pre-conversion mode only — set alongside collection_id. Has no effect in post-conversion mode (a warning is logged) because there are no source Roboto events to tag in that mode. When true, writes the audit verdict back onto Roboto: every event whose episode raised one or more flags gets an `audit:<flag_name>` tag per flag; events with no flags get `audit:clean`. The source collection also gets an `audit:<invocation_id>` tag pointing at this run, so anyone browsing the collection can find the corresponding audit_report.html. Tags left over from a prior audit run that no longer apply are removed, so the tag state always reflects only the most recent run. When false (default), the audit is read-only and no Roboto tags are written.",
+            "required": false,
+            "default": "false"
+        }
+    ],
+    "requires_downloaded_inputs": true
+}

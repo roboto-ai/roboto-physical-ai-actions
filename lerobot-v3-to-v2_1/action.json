@@ -1,0 +1,17 @@
+{
+    "name": "lerobot-v3-to-v2_1",
+    "description": "Convert an uploaded LeRobot v3.0 dataset into a LeRobot v2.1 dataset. De-aggregates v3.0's consolidated parquet shards back into per-episode parquet files, splits the concatenated per-camera video shards into per-episode MP4s (lossless, frame-exact), and rewrites metadata into the v2.1 schema (info.json, tasks.jsonl, episodes.jsonl, episodes_stats.jsonl). The source dataset is read-only; by default the action creates a new dataset (name inherited from the source) for the v2.1 output and stamps provenance metadata linking back to the source.",
+    "compute_requirements": {
+        "vCPU": 4096,
+        "memory": 8192,
+        "storage": 200
+    },
+    "parameters": [
+        {
+            "name": "output_dataset_id",
+            "description": "Optional. If set, upload the converted v2.1 dataset into this existing Roboto dataset instead of creating a new one. By default the action creates a new dataset whose name is derived from the source dataset (\"<source name> (LeRobot v2.1)\") and stamps provenance metadata pointing back to the source.",
+            "required": false
+        }
+    ],
+    "requires_downloaded_inputs": true
+}

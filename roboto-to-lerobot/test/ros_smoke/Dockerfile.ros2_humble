@@ -1,0 +1,102 @@
+# ROS 2 Humble image for the docker bag-replay smoke.
+#
+# Why Humble (not Iron/Jazzy/Rolling): v0.1.0 ships against Humble
+# only; the docker layer's job is to prove
+# the generated node + runtime kernel actually work inside a real ROS 2
+# environment, not to validate cross-distro behavior.
+#
+# Why `--ignore-requires-python`: the package's ``requires-python =
+# ">=3.12"`` reflects the *converter* image (which uses python:3.12-slim);
+# the runtime kernel + codegen layer use only conservative syntax that
+# works on Python 3.10 (ROS 2 Humble's interpreter). The pin will relax
+# once a runtime-only wheel ships separately. Until
+# then, the override lets the package install on Humble without forcing
+# everything else to drop 3.12 support.
+#
+# Why no `--break-system-packages`: Ubuntu 22.04 (ros:humble-ros-base's
+# base) does not enforce PEP 668 — the marker first lands in Ubuntu
+# 23.04. The flag itself isn't recognised by pip 22.0.2 (Humble's apt
+# pip), so passing it would fail with "no such option". When this
+# image moves to a newer ROS distro (Jazzy on 24.04) the flag has to
+# come back.
+#
+# Why `--no-deps` then explicit deps: the full dependency list pulls
+# torch + lerobot (~2 GB) that the docker smoke never touches. The
+# explicit list below is the actual import-time closure for
+# runtime.live_adapter + codegen.cli — enough to gen-node and boot a
+# generated node, not enough to convert datasets.
+
+FROM ros:humble-ros-base
+
+# Apt-installed deps:
+#   python3-pip                    — installer (not in -ros-base by default)
+#   ros-humble-rosbag2-storage-mcap — MCAP storage plugin for ros2 bag play
+#                                    (Humble's default storage is sqlite3;
+#                                    our fixture is .mcap, which needs the
+#                                    rosbag2_storage_mcap plugin)
+#   python3-numpy                  — apt-shipped numpy avoids pip pulling a
+#                                    heavier wheel; matches whatever rclpy
+#                                    is linked against
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3-pip \
+        ros-humble-rosbag2-storage-mcap \
+        python3-numpy \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /pkg
+
+# Copy the package source. Build context is the repo root (see run.sh)
+# so the COPY src/ resolves to roboto-to-lerobot/src/.
+COPY pyproject.toml ./
+COPY src/ ./src/
+
+# Install:
+#   . with --no-deps           — install the package itself, skip the
+#                                heavy transitive deps (lerobot, torch,
+#                                opencv-python, scipy)
+#   the named runtime deps     — the actual import-time closure for
+#                                runtime + codegen + contract_utils:
+#     jinja2          — codegen template engine; mirrors pyproject's
+#                       [codegen] extra (kept explicit, not `.[codegen]`,
+#                       because --no-deps would skip the extra's deps and
+#                       a plain `.[codegen]` would pull torch+lerobot;
+#                       black is also intentionally omitted — render.py
+#                       degrades gracefully without it). Keep in sync if
+#                       the extra gains a hard dep.
+#     PyYAML          — contract_utils.load_contract parses YAML
+#     pandas          — runtime.decoders import chain
+#     opencv-python-headless — runtime.image (cv2.resize); headless
+#                              avoids the GUI libs the full wheel pulls
+#     roboto >= 0.31  — contract_utils imports the SDK at module load;
+#                       the docker test never makes a network call, so
+#                       only the import surface matters
+# Upgrade pip only: Ubuntu 22.04's apt pip is 22.0.2, which predates
+# full PEP 621 (`[project]` table) support — installing our
+# pyproject.toml-only package with that version silently produces an
+# UNKNOWN-0.0.0 wheel and never lays down the source tree. pip 24+
+# parses PEP 621 metadata correctly.
+#
+# Do **not** upgrade setuptools: colcon's `ament_python` build_type
+# drives `setup.py install ... --uninstall ...`, which setuptools >=64
+# removed. Leaving the apt-installed setuptools (59.6.0 on jammy) in
+# place keeps colcon build working; pip 24+ supplies its own modern
+# build backend for the package install above without needing the
+# system setuptools to be modern.
+RUN pip install --upgrade "pip>=24"
+
+RUN pip install --ignore-requires-python --no-deps . \
+    && pip install \
+        "jinja2>=3.1" \
+        "PyYAML>=6.0" \
+        "pandas>=2.0" \
+        "opencv-python-headless>=4.8" \
+        "roboto>=0.31.0"
+
+# The smoke harness scripts; bind-mounted in run.sh too so iterative
+# edits during development don't require a docker rebuild. Copying them
+# into the image makes a clean ``docker run`` reproducible without
+# bind mounts (useful for CI machines).
+COPY test/ros_smoke/ /smoke/
+
+# Default cwd: the smoke harness expects to be invoked from /smoke.
+WORKDIR /smoke

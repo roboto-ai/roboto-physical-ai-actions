@@ -1,0 +1,42 @@
+{
+    "name": "lerobot-merge",
+    "description": "Merge N sharded LeRobot datasets (produced by parallel roboto-to-lerobot invocations) into one merged LeRobot dataset. Videos are stream-copy concatenated (no re-encode); parquet column values (episode_index, index, task_index) are reindexed in one pass; tasks are unioned by string; per-feature stats are aggregated. Writes a self-contained merged manifest equivalent to a single-shot conversion manifest — the per-shard collections and intermediate outputs can be safely deleted after the merge without loss of provenance.",
+    "compute_requirements": {
+        "vCPU": 4096,
+        "memory": 16384,
+        "storage": 200
+    },
+    "parameters": [
+        {
+            "name": "shard_invocation_ids",
+            "description": "JSON array of conversion invocation IDs, in the order they should be merged. Each ID names a per-invocation prefix in the invocation's data_source dataset, written by the conversion action as '<iv>/combined/' (LeRobot tree), '<iv>/manifest.json', and '<iv>/contract.yaml'. Merge order is load-bearing: aggregate_datasets stacks shards in input order, and the merged manifest's episode_to_event indices are offset accordingly. Example: '[\"iv_abc\", \"iv_def\"]'. The input_data list on the invocation must include patterns that cover these prefixes (e.g. '<iv>/**') so the platform pre-downloads them into context.input_dir.",
+            "required": true
+        },
+        {
+            "name": "parent_collection_id",
+            "description": "ID of the parent event collection that was partitioned into sub-collections before fan-out. Stamped onto the merged manifest as collection_id so the merged dataset's provenance matches what a single-shot conversion would produce.",
+            "required": true
+        },
+        {
+            "name": "parent_collection_version",
+            "description": "Version of the parent collection at partition time. Recorded on the merged manifest as collection_version. If unset, the merged manifest's collection_version is null.",
+            "required": false
+        },
+        {
+            "name": "data_files_size_in_mb",
+            "description": "Override for lerobot.aggregate_datasets data_files_size_in_mb. If unset, lerobot's default (100) is used.",
+            "required": false
+        },
+        {
+            "name": "video_files_size_in_mb",
+            "description": "Override for lerobot.aggregate_datasets video_files_size_in_mb. If unset, lerobot's default (200) is used. Set to 0 to force every source video file to be a pure shutil.copy (no MP4 container rewrites).",
+            "required": false
+        },
+        {
+            "name": "chunk_size",
+            "description": "Override for lerobot.aggregate_datasets chunk_size (max files per chunk-XXX directory). If unset, lerobot's default (1000) is used.",
+            "required": false
+        }
+    ],
+    "requires_downloaded_inputs": true
+}

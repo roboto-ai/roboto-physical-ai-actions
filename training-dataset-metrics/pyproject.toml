@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "training_dataset_metrics"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    # The [video] extra (PyAV) backs the GOP-aware decoder the vendored
+    # roboto-to-lerobot subset uses for foxglove_msgs/CompressedVideo camera
+    # topics; see _vendored/roboto_to_lerobot/video.py. >= 0.52.0 is where
+    # roboto.experimental.video gained its codec registry (resolve_codec /
+    # supported_formats); 0.51 was H.264-only.
+    "roboto[analytics,video]>=0.52.0",
+    "lerobot>=0.5.1",
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+    "matplotlib",
+    "pydantic>=2",
+    "opencv-python",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff~=0.16.8",
+]
+
+[tool.ruff]
+# A per-package [tool.ruff] REPLACES the root ruff.toml rather than merging
+# with it, so inherit the shared rule set explicitly before adding to it.
+extend = "../ruff.toml"
+# `_vendored/roboto_to_lerobot/` is a byte-for-byte `cp` mirror of the sibling
+# roboto-to-lerobot package, refreshed by scripts/sync_vendored.sh and checked
+# for drift by scripts/verify.sh. Linting it here would duplicate findings
+# already reported against upstream and, worse, invite a local "fix" that
+# silently breaks the mirror. Lint it at the source instead.
+extend-exclude = ["src/training_dataset_metrics/_vendored"]
