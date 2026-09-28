@@ -1,10 +1,12 @@
-"""Adapter for lerobot 0.5.x (LeRobot dataset format 3.0).
+"""Adapter for lerobot 0.6.x (LeRobot dataset format 3.0).
 
 API differences vs 0.3.x that this adapter papers over:
 - ``LeRobotDataset.add_frame`` reads ``task`` from the frame dict; passing it
   as a kwarg is rejected.
 - ``LeRobotDataset.finalize()`` must be called once after the last episode
   to write the dataset-level metadata.
+- ``LeRobotDataset.create`` takes the codec inside an ``RGBEncoderConfig``
+  (``rgb_encoder``) rather than as a ``vcodec`` kwarg.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ _VCODEC: Final[str] = "libsvtav1"
 
 
 class LeRobotWriter:
-    """0.5.x adapter — see :class:`roboto_to_lerobot.writers.base.LeRobotWriter`."""
+    """0.6.x adapter — see :class:`roboto_to_lerobot.writers.base.LeRobotWriter`."""
 
     def __init__(self, dataset: Any) -> None:
         self._dataset = dataset
@@ -39,6 +41,7 @@ class LeRobotWriter:
         encoder_threads: int | None = None,
         encoder_queue_maxsize: int = 30,
     ) -> LeRobotWriter:
+        from lerobot.configs.video import RGBEncoderConfig
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
         dataset = LeRobotDataset.create(
@@ -48,7 +51,9 @@ class LeRobotWriter:
             root=root,
             robot_type=robot_type,
             use_videos=True,
-            vcodec=_VCODEC,
+            # Other RGBEncoderConfig defaults (g=2, crf=30, preset=12) match
+            # what 0.5.x hard-coded, so encoded videos are unchanged.
+            rgb_encoder=RGBEncoderConfig(vcodec=_VCODEC),
             image_writer_threads=image_writer_threads,
             batch_encoding_size=batch_encoding_size,
             streaming_encoding=streaming_encoding,
@@ -58,7 +63,7 @@ class LeRobotWriter:
         return cls(dataset)
 
     def add_frame(self, frame: dict[str, Any], task: str) -> None:
-        # 0.5.x reads ``task`` from the frame dict. The explicit kwarg wins
+        # 0.6.x reads ``task`` from the frame dict. The explicit kwarg wins
         # over any pre-existing ``task`` key so the writer stays the single
         # source of truth.
         frame_with_task = {**frame, "task": task}

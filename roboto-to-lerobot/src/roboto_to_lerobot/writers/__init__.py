@@ -33,15 +33,23 @@ def _select_writer_class(version_str: str) -> type[_Protocol]:
             f"Could not parse lerobot version: {version_str!r}"
         )
     parts = (int(match.group(1)), int(match.group(2)))
-    if parts >= (0, 5):
+    if parts >= (0, 6):
         from .v3_0 import LeRobotWriter as _Writer
         return _Writer
+    if parts >= (0, 5):
+        # 0.5.x squares uint8 pixels before converting to float, so every
+        # camera's per-episode std comes out as 0. The v3_0 adapter also
+        # uses the 0.6.x ``rgb_encoder`` API, which 0.5.x lacks.
+        raise RuntimeError(
+            f"Unsupported lerobot version: {version_str!r} "
+            f"(0.5.x writes zero image std; use lerobot >= 0.6)"
+        )
     if parts >= (0, 3):
         from .v2_1 import LeRobotWriter as _Writer
         return _Writer
     raise RuntimeError(
         f"Unsupported lerobot version: {version_str!r} "
-        f"(roboto-to-lerobot supports 0.3.x and 0.5.x)"
+        f"(roboto-to-lerobot supports 0.3.x and 0.6.x)"
     )
 
 

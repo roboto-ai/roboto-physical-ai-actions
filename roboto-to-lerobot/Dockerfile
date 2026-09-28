@@ -7,7 +7,7 @@ ARG OS_VARIANT=slim-bookworm
 # that cannot pass a build arg at all: a bare `docker build`, and
 # `roboto actions invoke-local` against this directory. Both therefore
 # build the v3_0 variant. Keep in step with deploy.sh's LEROBOT_V3_0_VERSION.
-ARG LEROBOT_VERSION=0.5.1
+ARG LEROBOT_VERSION=0.6.1
 ARG PY_BASE=public.ecr.aws/docker/library/python:${PYTHON_MAJOR}.${PYTHON_MINOR}-${OS_VARIANT}
 
 
