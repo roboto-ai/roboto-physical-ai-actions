@@ -1,6 +1,6 @@
 """Adapter for lerobot 0.3.x (LeRobot dataset format 2.1).
 
-API differences vs 0.5.x that this adapter papers over:
+API differences vs 0.6.x that this adapter papers over:
 - ``LeRobotDataset.add_frame`` takes ``task`` as a separate kwarg; ``task``
   must NOT be inside the frame dict.
 - ``LeRobotDataset.finalize()`` does not exist on 0.3.x — episodes are
@@ -37,7 +37,7 @@ class LeRobotWriter:
         encoder_threads: int | None = None,
         encoder_queue_maxsize: int = 30,
     ) -> LeRobotWriter:
-        # 0.5.x-only encoder knobs: 0.3.x's LeRobotDataset.create rejects
+        # 0.6.x-only encoder knobs: 0.3.x's LeRobotDataset.create rejects
         # them, so we keep them in the adapter signature (so main.py has a
         # single call shape) and drop them before calling lerobot.
         _ = (
@@ -71,7 +71,7 @@ class LeRobotWriter:
 
     def discard_episode(self) -> None:
         # 0.3.x has no documented abort hook, so fall through a ladder:
-        #   1. clear_episode_buffer (0.5.x-style, kept in case 0.3.x exposes it)
+        #   1. clear_episode_buffer (0.6.x-style, kept in case 0.3.x exposes it)
         #   2. rebuild the buffer via create_episode_buffer
         #   3. warn — never raise. discard_episode is the soft-drop path; if
         #      it propagates, a single bad event takes down the whole run.

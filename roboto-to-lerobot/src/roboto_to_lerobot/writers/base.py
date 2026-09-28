@@ -45,7 +45,7 @@ class LeRobotWriter(Protocol):
         """Create a fresh on-disk dataset rooted at ``root``.
 
         ``batch_encoding_size`` / ``streaming_encoding`` / ``encoder_threads``
-        / ``encoder_queue_maxsize`` are lerobot 0.5.x encoder knobs. The v2_1
+        / ``encoder_queue_maxsize`` are lerobot 0.6.x encoder knobs. The v2_1
         adapter accepts them in its signature but drops them on the call into
         lerobot, since 0.3.x's ``LeRobotDataset.create`` would reject them.
         This keeps a single call shape in ``main.py`` across versions.
@@ -81,7 +81,7 @@ class LeRobotWriter(Protocol):
     def finalize(self) -> None:
         """Finalise the on-disk dataset (write metadata, close handles).
 
-        On lerobot 0.3.x this is a no-op; on 0.5.x it must be called once
+        On lerobot 0.3.x this is a no-op; on 0.6.x it must be called once
         after the last episode.
         """
         ...

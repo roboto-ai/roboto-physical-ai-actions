@@ -2,7 +2,7 @@
 
 # Build and register LeRobot variants from the same source tree:
 #   - roboto-to-lerobot-v2_1  (lerobot==0.3.3 → LeRobot 2.1 format)
-#   - roboto-to-lerobot-v3_0  (lerobot==0.5.1 → LeRobot 3.0 format)
+#   - roboto-to-lerobot-v3_0  (lerobot==0.6.1 → LeRobot 3.0 format)
 #
 # ``roboto actions create`` upserts under the hood (falls back to
 # ``Action.update`` on conflict), so re-running this after a code change
@@ -17,7 +17,7 @@
 # Override the lerobot pin per variant via env vars when smoke-testing a
 # new patch release without editing this script:
 #   LEROBOT_V2_1_VERSION=0.3.4 ./scripts/deploy.sh --variant v2_1
-#   LEROBOT_V3_0_VERSION=0.5.2 ./scripts/deploy.sh --variant v3_0
+#   LEROBOT_V3_0_VERSION=0.6.2 ./scripts/deploy.sh --variant v3_0
 
 set -euo pipefail
 
@@ -40,7 +40,7 @@ Positional:
 
 Env overrides:
   LEROBOT_V2_1_VERSION   lerobot pin for the v2_1 variant (default: 0.3.3).
-  LEROBOT_V3_0_VERSION   lerobot pin for the v3_0 variant (default: 0.5.1).
+  LEROBOT_V3_0_VERSION   lerobot pin for the v3_0 variant (default: 0.6.1).
 EOF
 }
 
@@ -125,7 +125,7 @@ deploy_variant() {
     fi
 
     # Both variants register from the same action.json. ``shard_count`` and
-    # ``encoder_threads`` are lerobot-0.5-only knobs; the v2_1 image accepts
+    # ``encoder_threads`` are lerobot-0.6-only knobs; the v2_1 image accepts
     # both and ignores them at runtime (see ``_shard_path_supported`` in
     # main.py), so no per-variant patching is needed.
     local action_file="$PACKAGE_ROOT/action.json"

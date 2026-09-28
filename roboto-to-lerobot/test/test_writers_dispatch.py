@@ -21,9 +21,15 @@ from roboto_to_lerobot.writers.v2_1 import LeRobotWriter as V21Writer
 from roboto_to_lerobot.writers.v3_0 import LeRobotWriter as V30Writer
 
 
-@pytest.mark.parametrize("version", ["0.5.0", "0.5.1", "0.5.99", "0.6.0", "1.0.0"])
-def test_dispatches_v3_0_for_0_5_or_newer(version: str) -> None:
+@pytest.mark.parametrize("version", ["0.6.0", "0.6.1", "0.7.0", "1.0.0"])
+def test_dispatches_v3_0_for_0_6_or_newer(version: str) -> None:
     assert _select_writer_class(version) is V30Writer
+
+
+@pytest.mark.parametrize("version", ["0.5.0", "0.5.1", "0.5.99"])
+def test_rejects_0_5_for_zero_image_std(version: str) -> None:
+    with pytest.raises(RuntimeError, match="zero image std"):
+        _select_writer_class(version)
 
 
 @pytest.mark.parametrize("version", ["0.3.0", "0.3.3", "0.4.7"])
@@ -38,7 +44,7 @@ def test_rejects_versions_below_0_3(version: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "version", ["0.5.0+cpu", "0.5.0a1", "0.5.0.dev1", "0.3.4rc1"]
+    "version", ["0.6.0+cpu", "0.6.0a1", "0.6.0.dev1", "0.3.4rc1"]
 )
 def test_dispatches_for_pep440_modifiers(version: str) -> None:
     """Pre-releases and local-version installs should still dispatch."""
@@ -83,18 +89,28 @@ def _install_fake_lerobot(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     fake_module = types.ModuleType("lerobot.datasets.lerobot_dataset")
     fake_module.LeRobotDataset = fake_dataset_class
 
+    # ``RGBEncoderConfig(vcodec=...)`` becomes a namespace, so tests can read
+    # ``kwargs["rgb_encoder"].vcodec``.
+    fake_video = types.ModuleType("lerobot.configs.video")
+    fake_video.RGBEncoderConfig = types.SimpleNamespace
+
     # Construct the parent packages so ``from lerobot.datasets.lerobot_dataset
     # import LeRobotDataset`` finds our stub.
     fake_lerobot = types.ModuleType("lerobot")
     fake_datasets = types.ModuleType("lerobot.datasets")
     fake_datasets.lerobot_dataset = fake_module
     fake_lerobot.datasets = fake_datasets
+    fake_configs = types.ModuleType("lerobot.configs")
+    fake_configs.video = fake_video
+    fake_lerobot.configs = fake_configs
 
     monkeypatch.setitem(sys.modules, "lerobot", fake_lerobot)
     monkeypatch.setitem(sys.modules, "lerobot.datasets", fake_datasets)
     monkeypatch.setitem(
         sys.modules, "lerobot.datasets.lerobot_dataset", fake_module
     )
+    monkeypatch.setitem(sys.modules, "lerobot.configs", fake_configs)
+    monkeypatch.setitem(sys.modules, "lerobot.configs.video", fake_video)
     return fake_dataset_class
 
 
@@ -176,7 +192,7 @@ def test_v3_0_kwarg_task_overrides_frame_task(
 #
 # The Protocol gained four encoder kwargs (batch_encoding_size,
 # streaming_encoding, encoder_threads, encoder_queue_maxsize). The v3_0
-# adapter forwards them and locks vcodec="libsvtav1"; the v2_1 adapter
+# adapter forwards them and locks the RGB codec to libsvtav1; the v2_1 adapter
 # accepts and silently drops them so main.py can pass them uniformly.
 # -----------------------------------------------------------------------------
 
@@ -192,7 +208,7 @@ def test_v3_0_forwards_new_encoding_kwargs(
         encoder_queue_maxsize=30,
     )
     kwargs = fake_lerobot.create.call_args.kwargs
-    assert kwargs["vcodec"] == "libsvtav1"
+    assert kwargs["rgb_encoder"].vcodec == "libsvtav1"
     assert kwargs["batch_encoding_size"] == 16
     assert kwargs["streaming_encoding"] is True
     assert kwargs["encoder_threads"] is None
@@ -205,13 +221,15 @@ def test_v3_0_vcodec_locked_to_libsvtav1(
     """``vcodec`` is not a Protocol kwarg — the v3_0 adapter hard-codes it.
 
     Two guarantees:
-      1. The forwarded kwargs always include ``vcodec="libsvtav1"``, even
-         when the caller passes nothing about codec.
+      1. The forwarded ``rgb_encoder`` always carries ``vcodec="libsvtav1"``,
+         even when the caller passes nothing about codec.
       2. ``LeRobotWriter.create`` itself rejects a ``vcodec`` kwarg, so
          callers can't sneak h264 in.
     """
     V30Writer.create(**_create_kwargs(tmp_path))
-    assert fake_lerobot.create.call_args.kwargs["vcodec"] == "libsvtav1"
+    kwargs = fake_lerobot.create.call_args.kwargs
+    assert kwargs["rgb_encoder"].vcodec == "libsvtav1"
+    assert "vcodec" not in kwargs
 
     with pytest.raises(TypeError, match="vcodec"):
         V30Writer.create(**_create_kwargs(tmp_path), vcodec="libx264")
@@ -247,7 +265,7 @@ def test_v2_1_silently_drops_new_encoding_kwargs(
 
 # -----------------------------------------------------------------------------
 # discard_episode: soft-drop abort hook for the per-event try/except in
-# _run_pool_drain. v3_0 delegates to lerobot 0.5.x's clear_episode_buffer.
+# _run_pool_drain. v3_0 delegates to lerobot 0.6.x's clear_episode_buffer.
 # v2_1 has to probe for that method first because 0.3.x's surface differs.
 # -----------------------------------------------------------------------------
 
@@ -255,7 +273,7 @@ def test_v2_1_silently_drops_new_encoding_kwargs(
 def test_v3_0_discard_calls_clear_episode_buffer(
     fake_lerobot: MagicMock, tmp_path: Path
 ) -> None:
-    """``discard_episode`` forwards straight to lerobot 0.5.x's own abort
+    """``discard_episode`` forwards straight to lerobot 0.6.x's own abort
     hook, passing ``delete_images=True`` so staged tempfiles are cleaned up."""
     writer = V30Writer.create(**_create_kwargs(tmp_path))
     writer.discard_episode()

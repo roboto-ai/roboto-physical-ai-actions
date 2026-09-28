@@ -27,7 +27,7 @@ dataset format:
 | Action name              | LeRobot package | LeRobot dataset format |
 |--------------------------|-----------------|------------------------|
 | `roboto-to-lerobot-v2_1`   | `lerobot==0.3.x` | 2.1                    |
-| `roboto-to-lerobot-v3_0`   | `lerobot==0.5.x` | 3.0                    |
+| `roboto-to-lerobot-v3_0`   | `lerobot==0.6.x` | 3.0                    |
 
 There is one `src/` tree. The variants differ only by the lerobot version
 baked into the image at build time, via the `LEROBOT_VERSION` build arg — so
@@ -82,7 +82,7 @@ $ .venv/bin/roboto users whoami
 | `contract`      | no       | `contract.yaml` (auto-discovered) | Path to the contract YAML inside the invocation dataset. Describes the topics, alignment, and transforms used to build each episode. See [CONTRACT.md](CONTRACT.md) for the full schema, or [`contract_demo_reassemble.yaml`](example_notebook/contract_demo_reassemble.yaml) for a worked example. |
 | `pool_size`     | no       | auto-sized | Worker processes that read and process events in parallel, per shard. Left unset it auto-sizes to `min(16, cpu_count / shard_count)` — on the default 16-vCPU compute with `shard_count=3` that is `5`. Any explicit value is used verbatim and is not capped. |
 | `encoder_threads` | no     | `2` (built in) | Level of parallelism given to the SVT-AV1 video encoder, per camera stream. Must be `>= 2`: lower values risk the encoder's internal frame queue overflowing under bursty writes, silently dropping frames from the output video. Left unset it uses the built-in `2`. Only `roboto-to-lerobot-v3_0` acts on it; `roboto-to-lerobot-v2_1` (lerobot 0.3.3) accepts it and silently ignores it, having no equivalent knob. |
-| `shard_count`   | no       | `3`     | Parallel writer shards. Each shard writes a partial dataset independently, and the shards are then merged by stream-copy with no re-encoding. Sharded writing needs `lerobot.datasets.aggregate.aggregate_datasets`, which is lerobot 0.5.x only, so only `roboto-to-lerobot-v3_0` acts on it — `roboto-to-lerobot-v2_1` accepts it and ignores it, falling back to a single writer and logging a warning. Sharding also groups the merged dataset's episodes by shard rather than strictly chronologically; each episode's original `start_time_ns` is preserved in the output manifest. |
+| `shard_count`   | no       | `3`     | Parallel writer shards. Each shard writes a partial dataset independently, and the shards are then merged by stream-copy with no re-encoding. Sharded writing needs `lerobot.datasets.aggregate.aggregate_datasets`, which is lerobot 0.6.x only, so only `roboto-to-lerobot-v3_0` acts on it — `roboto-to-lerobot-v2_1` accepts it and ignores it, falling back to a single writer and logging a warning. Sharding also groups the merged dataset's episodes by shard rather than strictly chronologically; each episode's original `start_time_ns` is preserved in the output manifest. |
 
 ### Running
 

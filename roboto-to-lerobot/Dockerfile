@@ -7,7 +7,7 @@ ARG OS_VARIANT=slim-bookworm
 # that cannot pass a build arg at all: a bare `docker build`, and
 # `roboto actions invoke-local` against this directory. Both therefore
 # build the v3_0 variant. Keep in step with deploy.sh's LEROBOT_V3_0_VERSION.
-ARG LEROBOT_VERSION=0.5.1
+ARG LEROBOT_VERSION=0.6.1
 ARG PY_BASE=public.ecr.aws/docker/library/python:${PYTHON_MAJOR}.${PYTHON_MINOR}-${OS_VARIANT}
 
 
@@ -42,7 +42,7 @@ COPY pyproject.toml ./
 RUN uv pip install --system --index-url https://download.pytorch.org/whl/cpu torch
 
 # Pin lerobot to the variant we're building. pyproject.toml declares the
-# loose ``lerobot >=0.3.3,<0.6`` so the install below satisfies that pin
+# loose ``lerobot >=0.3.3,<0.7`` so the install below satisfies that pin
 # without a version conflict, and only this layer rebuilds when
 # LEROBOT_VERSION changes.
 RUN if [ -z "${LEROBOT_VERSION}" ]; then \

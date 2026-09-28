@@ -45,13 +45,13 @@ from .stderr_filter import (
 from .writers import LeRobotWriter
 
 # Writer-encoder knobs forwarded to ``LeRobotDataset.create``. The v2_1
-# adapter accepts the same kwargs and silently drops 0.5.x-only ones, so
+# adapter accepts the same kwargs and silently drops 0.6.x-only ones, so
 # callers do not need to branch on lerobot version. ``vcodec`` is hard-coded
 # inside the v3_0 adapter — h264 worsened downstream training.
 #
 # ``_STREAMING_ENCODING=True`` pipes pixels straight into ffmpeg instead of
 # writing PNGs to disk for ffmpeg to read back, saving wall time per run.
-# Trade-off: lerobot 0.5.x routes video stats through the streaming
+# Trade-off: lerobot 0.6.x routes video stats through the streaming
 # encoder's ``finish_episode()`` rather than ``compute_episode_stats``, so
 # the two aggregators disagree on:
 #   * ``count`` — pixel-counted, not frame-counted. Welford-merged stats
@@ -66,11 +66,12 @@ from .writers import LeRobotWriter
 # re-incur the PNG round-trip if a non-streaming-compatible stats path is
 # required.
 _IMAGE_WRITER_THREADS = 8
-# lerobot 0.5.x's ``DatasetWriter.save_episode`` runs both the streaming
-# branch and the batched-flush branch when both knobs are on; the batched
-# flush then crashes because ``EpisodesMeta.save_episode`` never refreshes
-# the in-memory cache that the empty-dataset create path initialises to
-# ``None``. Even absent the crash, the batched flush would redundantly
+# lerobot's ``DatasetWriter.save_episode`` (0.5.x and 0.6.x) runs both the
+# streaming branch and the batched-flush branch when both knobs are on; on
+# 0.5.x the batched flush then crashes because
+# ``EpisodesMeta.save_episode`` never refreshes the in-memory cache that the
+# empty-dataset create path initialises to ``None``. Even absent the crash,
+# the batched flush would redundantly
 # re-encode every Nth episode from scratch. ``batch_encoding_size=1``
 # disables the batched branch so only the streaming branch runs.
 _BATCH_ENCODING_SIZE = 1
@@ -875,8 +876,8 @@ def _spawn_shards(
 def _shard_path_supported() -> bool:
     """Whether the embedded lerobot exposes the sharded path's merge API.
 
-    ``lerobot.datasets.aggregate.aggregate_datasets`` is a 0.5.x-only API.
-    ``pyproject.toml`` allows ``lerobot >= 0.3.3, < 0.6`` and the Dockerfile
+    ``lerobot.datasets.aggregate.aggregate_datasets`` does not exist in 0.3.x.
+    ``pyproject.toml`` allows ``lerobot >= 0.3.3, < 0.7`` and the Dockerfile
     pins ``LEROBOT_VERSION`` at build time, so a 0.3.x image (the v2_1
     variant) has no merge API and cannot shard. Probed before any shard
     subprocess is spawned; the alternative is an opaque
@@ -1242,7 +1243,7 @@ def main(context: roboto.InvocationContext) -> None:
         except Exception:
             embedded = "not installed"
         logger.warning(
-            "shard_count=%d ignored: sharded writing requires lerobot 0.5.x "
+            "shard_count=%d ignored: sharded writing requires lerobot 0.6.x "
             "(lerobot.datasets.aggregate.aggregate_datasets is missing) and "
             "the embedded lerobot is %s. Falling back to the single-writer "
             "path (shard_count=1).",

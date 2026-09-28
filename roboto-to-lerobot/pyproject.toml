@@ -12,7 +12,9 @@ dependencies = [
     # >= 0.52.0 is where roboto.experimental.video gained its codec registry
     # (resolve_codec / supported_formats); 0.51 was H.264-only.
     "roboto[video] >= 0.52.0",
-    "lerobot >= 0.3.3, < 0.6",
+    # 0.6.x moved datasets/pyarrow/av/torchcodec into the [dataset] extra;
+    # 0.3.x has no such extra and lists them as core deps.
+    "lerobot[dataset] >= 0.3.3, < 0.7",
     "numpy",
     "pandas",
     "opencv-python",

@@ -13,7 +13,7 @@
 # that default in step with LEROBOT_V3_0_VERSION below.
 
 LEROBOT_V2_1_VERSION="${LEROBOT_V2_1_VERSION:-0.3.3}"
-LEROBOT_V3_0_VERSION="${LEROBOT_V3_0_VERSION:-0.5.1}"
+LEROBOT_V3_0_VERSION="${LEROBOT_V3_0_VERSION:-0.6.1}"
 
 # Echo the lerobot version for a variant name; exit 1 on an unknown variant.
 lerobot_version_for_variant() {
