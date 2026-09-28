@@ -42,7 +42,7 @@ COPY pyproject.toml ./
 RUN uv pip install --system --index-url https://download.pytorch.org/whl/cpu torch
 
 # Pin lerobot to the variant we're building. pyproject.toml declares the
-# loose ``lerobot >=0.3.3,<0.6`` so the install below satisfies that pin
+# loose ``lerobot >=0.3.3,<0.7`` so the install below satisfies that pin
 # without a version conflict, and only this layer rebuilds when
 # LEROBOT_VERSION changes.
 RUN if [ -z "${LEROBOT_VERSION}" ]; then \

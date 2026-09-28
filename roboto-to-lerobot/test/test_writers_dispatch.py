@@ -265,7 +265,7 @@ def test_v2_1_silently_drops_new_encoding_kwargs(
 
 # -----------------------------------------------------------------------------
 # discard_episode: soft-drop abort hook for the per-event try/except in
-# _run_pool_drain. v3_0 delegates to lerobot 0.5.x's clear_episode_buffer.
+# _run_pool_drain. v3_0 delegates to lerobot 0.6.x's clear_episode_buffer.
 # v2_1 has to probe for that method first because 0.3.x's surface differs.
 # -----------------------------------------------------------------------------
 
@@ -273,7 +273,7 @@ def test_v2_1_silently_drops_new_encoding_kwargs(
 def test_v3_0_discard_calls_clear_episode_buffer(
     fake_lerobot: MagicMock, tmp_path: Path
 ) -> None:
-    """``discard_episode`` forwards straight to lerobot 0.5.x's own abort
+    """``discard_episode`` forwards straight to lerobot 0.6.x's own abort
     hook, passing ``delete_images=True`` so staged tempfiles are cleaned up."""
     writer = V30Writer.create(**_create_kwargs(tmp_path))
     writer.discard_episode()

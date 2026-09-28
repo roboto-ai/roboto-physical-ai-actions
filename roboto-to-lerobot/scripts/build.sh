@@ -14,7 +14,7 @@ usage() {
 Usage: $0 --lerobot-version <ver> [--tag <local_tag>] [--quiet]
 
 Required:
-  --lerobot-version VER  lerobot version to install in the image (e.g. 0.3.3, 0.5.1).
+  --lerobot-version VER  lerobot version to install in the image (e.g. 0.3.3, 0.6.1).
 
 Optional:
   --tag TAG              local docker tag for the built image (default: ${LOCAL_TAG}).
@@ -49,7 +49,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$LEROBOT_VERSION" ]]; then
-    echo "Error: --lerobot-version is required (e.g. 0.3.3 or 0.5.1)" >&2
+    echo "Error: --lerobot-version is required (e.g. 0.3.3 or 0.6.1)" >&2
     usage >&2
     exit 1
 fi

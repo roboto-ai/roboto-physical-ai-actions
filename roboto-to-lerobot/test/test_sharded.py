@@ -201,13 +201,13 @@ def test_resolve_shard_count_rejects_bad_values(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _shard_path_supported: the lerobot-0.5-only merge API probe that decides
+# _shard_path_supported: the lerobot-0.6-only merge API probe that decides
 # whether a shard_count > 1 request is honoured or ignored.
 # ---------------------------------------------------------------------------
 
 
 def test_shard_path_supported_true_when_aggregate_importable():
-    """With the merge API present (a lerobot 0.5.x venv, i.e. the v3_0
+    """With the merge API present (a lerobot 0.6.x venv, i.e. the v3_0
     variant) a shard_count > 1 request is honoured rather than clamped.
 
     Skipped rather than asserted unconditionally because
@@ -230,7 +230,7 @@ def test_shard_path_supported_false_when_aggregate_missing(monkeypatch):
     not fail.
 
     Forcing ``None`` into ``sys.modules`` makes the import machinery raise
-    ImportError for that name only, so this holds on a 0.5.x venv too.
+    ImportError for that name only, so this holds on a 0.6.x venv too.
     """
     import sys
 
