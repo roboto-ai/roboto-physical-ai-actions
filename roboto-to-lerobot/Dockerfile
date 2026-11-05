@@ -55,6 +55,13 @@ RUN if [ -z "${LEROBOT_VERSION}" ]; then \
 # pinned version above.
 RUN uv pip install --system -r pyproject.toml
 
+# lerobot 0.3.x asks only for ``av>=14.2.0`` but calls ``int(stream.base_rate)``,
+# which raises TypeError on the PyAV 19 a fresh install picks, failing every
+# episode at save time. 15.1 and 16.1 are tested; 17 and 18 are not.
+RUN case "${LEROBOT_VERSION}" in \
+        0.3.*) uv pip install --system "av<17" ;; \
+    esac
+
 
 # =====================================================================
 # Stage 2: runtime — slim image with only what the action actually needs.
