@@ -1,4 +1,6 @@
 """Session events reach a LeRobot dataset as sub-tasks that lerobot itself can read."""
+import sys
+
 import numpy as np
 import pytest
 
@@ -128,3 +130,16 @@ def test_event_shorter_than_a_frame_is_reported_rather_than_silently_lost(datase
     assert [d["event_id"] for d in summary["dropped_events"]] == ["ev_instant"]
     dataset = LeRobotDataset(REPO_ID, root=dataset_root)
     assert _active_subtask(dataset, 12) == GAP_SUBTASK
+
+
+def test_lerobot_without_language_columns_skips_subtasks_and_leaves_the_dataset_alone(dataset_root, monkeypatch):
+    # lerobot 0.3.x, behind the v2_1 variant, has no such module.
+    monkeypatch.setitem(sys.modules, "lerobot.datasets.language", None)
+    before = {p: p.read_bytes() for p in dataset_root.rglob("*") if p.is_file()}
+
+    summary = apply_session_subtasks(
+        dataset_root, [_source("se_a", _window("ev_grasp", "grasp", 0.5, 1.0))], [_entry(0, "se_a")], FPS,
+    )
+
+    assert summary is None
+    assert {p: p.read_bytes() for p in dataset_root.rglob("*") if p.is_file()} == before
