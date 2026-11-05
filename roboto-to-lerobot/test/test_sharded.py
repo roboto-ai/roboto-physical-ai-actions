@@ -1002,6 +1002,7 @@ def test_build_skipped_summary_empty_input():
         "by_error_class": {},
         "by_source_dataset": {},
         "event_ids": [],
+        "session_ids": [],
     }
 
 

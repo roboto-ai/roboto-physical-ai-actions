@@ -10,8 +10,10 @@ dependencies = [
     # The [video] extra (PyAV) backs the GOP-aware decoder for
     # foxglove_msgs/CompressedVideo camera topics — see roboto_to_lerobot/video.py.
     # >= 0.52.0 is where roboto.experimental.video gained its codec registry
-    # (resolve_codec / supported_formats); 0.51 was H.264-only.
-    "roboto[video] >= 0.52.0",
+    # (resolve_codec / supported_formats); 0.51 was H.264-only. >= 0.62.0
+    # for session collections: ``SessionFileView`` with ``dataset_id`` and
+    # the wall-clock window / ``unix_epoch_offset_ns`` fields.
+    "roboto[video] >= 0.62.0",
     # 0.6.x moved datasets/pyarrow/av/torchcodec into the [dataset] extra;
     # 0.3.x has no such extra and lists them as core deps.
     "lerobot[dataset] >= 0.3.3, < 0.7",

@@ -22,12 +22,11 @@ from .contract_utils import (
     Contract,
     DataCollection,
     _compute_buffer_ns,
-    collect_topics_from_dataset,
     fps_to_time_step_ns,
     load_contract,
-    resolve_role_bindings,
     resolve_task_label,
 )
+from .episode_sources import annotate_manifest_entry, resolve_episode_sources
 from .event_worker import (
     EventTask,
     WorkerEpisode,
@@ -285,6 +284,10 @@ def _build_skipped_summary(skipped_events: list[dict]) -> dict:
         "event_ids": sorted({
             str(s["event_id"]) for s in skipped_events
             if s["event_id"] is not None
+        }),
+        "session_ids": sorted({
+            str(s["session_id"]) for s in skipped_events
+            if s.get("session_id") is not None
         }),
     }
 
@@ -1023,9 +1026,9 @@ def _warn_oversubscription(
 def main(context: roboto.InvocationContext) -> None:
     """Convert Roboto ingested files to a LeRobot dataset.
 
-    Loads events from the input Roboto Collection, then writes one
-    combined LeRobot dataset where each episode corresponds to one
-    event.
+    Loads the events or sessions of the input Roboto Collection, then
+    writes one combined LeRobot dataset where each episode corresponds to
+    one event or one session.
     """
     # Install before any LeRobotWriter.create (i.e. before the libsvtav1
     # encoder starts) so SVT-AV1's fd-2 banner output is filtered out at
@@ -1058,96 +1061,22 @@ def main(context: roboto.InvocationContext) -> None:
     buffer_ns = _compute_buffer_ns(contract)
     action_lead_ns = contract.action_lead_steps * time_step_ns
 
-    # ``Collection.from_id`` defaults to ``content_mode=Full``, which makes
-    # the server hydrate every event resource and return full EventRecord
-    # payloads in ``record.resources``. Building ``Event`` instances from
-    # those records avoids an N-extra-RTT round trip per invocation that
-    # ``collection.events`` → ``Event.from_id(eid)`` would otherwise pay.
     collection = roboto.Collection.from_id(collection_id)
-    if collection.record.resource_type != roboto.CollectionResourceType.Event:
-        raise ValueError(
-            f"collection_id {collection_id!r} has resource_type="
-            f"{collection.record.resource_type.value!r}; this action requires "
-            f"a collection of events (resource_type='event')."
-        )
     collection_version = collection.record.version
-
-    hydrated_event_resources = collection.record.resources.get(
-        roboto.CollectionResourceType.Event, []
-    )
-    if not hydrated_event_resources:
-        raise ValueError(
-            f"Collection {collection_id!r} (version {collection_version}) "
-            f"contains no events."
-        )
-    missing_events = collection.record.missing.get(
-        roboto.CollectionResourceType.Event, []
-    )
-    if missing_events:
-        logger.warning(
-            "Collection %s references %d event(s) that could not be hydrated "
-            "(deleted or inaccessible) — skipping: %s",
-            collection_id,
-            len(missing_events),
-            sorted(ref.resource_id for ref in missing_events),
-        )
-    events = sorted(
-        (
-            roboto.Event(
-                roboto.EventRecord.model_validate(r) if isinstance(r, dict) else r,
-            )
-            for r in hydrated_event_resources
-        ),
-        key=lambda e: e.start_time,
-    )
-    logger.info(
-        "Loaded %d events from collection %s (version %d)",
-        len(events), collection_id, collection_version,
-    )
-
-    # Earliest event (chronologically) with at least one dataset
-    # association — its DataCollection is reused for feature discovery
-    # and (in the single-writer path) inlined as the first episode.
-    distinct_ds_ids: set[str] = set()
-    first_event: roboto.Event | None = None
-    first_ds_id: str | None = None
-    for event in events:
-        ds_ids = list(event.dataset_ids() or [])
-        if not ds_ids:
-            logger.warning(
-                "Event %s has no dataset_ids; skipping",
-                getattr(event, "event_id", "?"),
-            )
-            continue
-        if first_event is None:
-            first_event = event
-            first_ds_id = ds_ids[0]
-        distinct_ds_ids.update(ds_ids)
-    if first_event is None or first_ds_id is None:
-        raise ValueError(
-            f"None of the {len(events)} event(s) in collection {collection_id!r} "
-            f"are associated with a dataset."
-        )
-
-    # Per-dataset role resolution before topic discovery: a contract that
-    # binds specs to ``role:`` placeholders gets its topics filled in from
-    # ``file.metadata["role"]`` on this dataset's files. Contracts that
-    # already use literal ``topic:`` pass through ``resolve_role_bindings``
-    # unchanged.
-    prepared: dict[str, tuple[roboto.Dataset, Contract, dict]] = {}
-    # Per-dataset dedup reports, flattened later into the manifest.
-    dedup_by_dataset: dict[str, list[dict]] = {}
-    logger.info(
-        "Matching contract topics against files in %d dataset(s)...",
-        len(distinct_ds_ids),
-    )
-    for ds_id in distinct_ds_ids:
-        ds = roboto.Dataset.from_id(ds_id)
-        resolved = resolve_role_bindings(ds, contract)
-        topics, dedup_groups = collect_topics_from_dataset(ds, resolved)
-        prepared[ds_id] = (ds, resolved, topics)
-        if dedup_groups:
-            dedup_by_dataset[ds_id] = dedup_groups
+    collection_resource_type = collection.record.resource_type.value
+    # Every event, or every session, of the collection becomes one episode;
+    # see ``episode_sources`` for how each kind is windowed and which files
+    # its topics are read from. ``prepared`` is keyed by each source's
+    # ``scope_key`` (dataset id for events, session id for sessions).
+    sources, prepared = resolve_episode_sources(collection, contract)
+    dedup_by_dataset: dict[str, list[dict]] = {
+        key: scope.dedup_groups for key, scope in prepared.items() if scope.dedup_groups
+    }
+    # Earliest source (chronologically) — its DataCollection is reused for
+    # feature discovery and (in the single-writer path) inlined as the first
+    # episode.
+    first_event = sources[0]
+    first_ds_id = first_event.scope_key
 
     # Write under output_dir/<invocation_id>/ so the runtime's auto-upload
     # lands it at <invocation_dataset>/<invocation_id>/..., keeping repeat
@@ -1156,7 +1085,7 @@ def main(context: roboto.InvocationContext) -> None:
     dataset_root = subfolder / "combined"
     dataset_root.parent.mkdir(parents=True, exist_ok=True)
 
-    _, first_resolved, first_topics = prepared[first_ds_id]
+    first_resolved, first_topics, _ = prepared[first_ds_id]
 
     logger.info("Preloading first event to discover feature shapes...")
     first_data = DataCollection(
@@ -1179,10 +1108,8 @@ def main(context: roboto.InvocationContext) -> None:
         resolved_features=first_data.resolved_features,
     )
 
-    # Index every event-with-a-matching-dataset in chronological order.
-    # Events whose ``dataset_ids`` do not intersect ``prepared`` are
-    # silently skipped; the index becomes the ``event_idx`` we ship to the
-    # pool and drain by below.
+    # Index every source in chronological order; the index becomes the
+    # ``event_idx`` we ship to the pool and drain by below.
     #
     # ``task_label`` here is the *raw* event metadata task only (``None``
     # when absent/empty) — final resolution against the contract's
@@ -1192,23 +1119,14 @@ def main(context: roboto.InvocationContext) -> None:
     # and inline for the preloaded episode below.
     matched: list[tuple[int, str, str | None, int]] = []  # (event_idx, src_ds_id, task_label, num_frames)
     matched_events: list = []
-    for event in events:
-        ds_ids = [d for d in (event.dataset_ids() or []) if d in prepared]
-        if not ds_ids:
-            continue
-        src_ds_id = ds_ids[0]
+    for event in sources:
+        src_ds_id = event.scope_key
         raw_task_meta = (event.metadata or {}).get("task")
         task_label = str(raw_task_meta) if raw_task_meta else None
         num_frames = int((event.end_time - event.start_time) / time_step_ns) + 1
         event_idx = len(matched)
         matched.append((event_idx, src_ds_id, task_label, num_frames))
         matched_events.append(event)
-
-    if not matched_events:
-        raise ValueError(
-            "Every event was filtered by the prepared-datasets intersection; "
-            "nothing to convert."
-        )
 
     # Materialised _DeferredFrame entries on the main process need the video
     # spec for decoder dispatch + resize. Videos pass through
@@ -1221,7 +1139,7 @@ def main(context: roboto.InvocationContext) -> None:
     # its own RobotoClient.
     descriptors_by_ds: dict[str, dict[str, list]] = {}
     contracts_by_ds: dict[str, Contract] = {}
-    for ds_id, (_, resolved_ds, topics_dict) in prepared.items():
+    for ds_id, (resolved_ds, topics_dict, _) in prepared.items():
         descriptors_by_ds[ds_id] = topic_descriptors_from_topics(topics_dict)
         contracts_by_ds[ds_id] = resolved_ds
 
@@ -1492,11 +1410,22 @@ def main(context: roboto.InvocationContext) -> None:
             accumulator.skipped_events.extend(r.get("skipped_events", []))
 
     # Manifest assembly expects the pre-refactor names; rebind from the
-    # accumulator so the rest of ``main`` stays untouched.
+    # accumulator so the rest of ``main`` stays untouched. The drain keys
+    # every entry and count by ``scope_key``, which for a session is the
+    # session id; relabel those with the session's real dataset ids.
     total_frames = accumulator.total_frames
     total_episodes = accumulator.total_episodes
-    per_dataset_counts = accumulator.per_dataset_counts
-    episode_to_event = accumulator.episode_to_event
+    sources_by_key = {s.scope_key: s for s in sources}
+    episode_to_event = [
+        annotate_manifest_entry(e, sources_by_key) for e in accumulator.episode_to_event
+    ]
+    accumulator.skipped_events = [
+        annotate_manifest_entry(e, sources_by_key) for e in accumulator.skipped_events
+    ]
+    per_dataset_counts: dict[str, int] = defaultdict(int)
+    for e in episode_to_event:
+        per_dataset_counts[e["source_dataset_id"]] += 1
+    source_dataset_ids = sorted({d for s in sources for d in s.dataset_ids})
 
     # Archive the contract bytes so the run survives later edits to the source.
     archived_contract_filename = "contract.yaml"
@@ -1512,7 +1441,9 @@ def main(context: roboto.InvocationContext) -> None:
     dropped_file_ids: set[str] = set()
     for ds_id, groups in dedup_by_dataset.items():
         for g in groups:
-            dedup_records.append({"source_dataset_id": ds_id, **g})
+            dedup_records.append(annotate_manifest_entry(
+                {"source_dataset_id": ds_id, **g}, sources_by_key,
+            ))
             for d in g["dropped"]:
                 dropped_file_ids.add(d["file_id"])
     dedup_summary = {
@@ -1539,7 +1470,8 @@ def main(context: roboto.InvocationContext) -> None:
         },
         "collection_id": collection_id,
         "collection_version": collection_version,
-        "source_datasets": sorted(prepared.keys()),
+        "collection_resource_type": collection_resource_type,
+        "source_datasets": source_dataset_ids,
         "episodes_per_dataset": dict(per_dataset_counts),
         "episode_to_event": episode_to_event,
         "total_episodes": total_episodes,
@@ -1566,6 +1498,7 @@ def main(context: roboto.InvocationContext) -> None:
         "contract_path": contract_rel_path,
         "collection_id": collection_id,
         "collection_version": collection_version,
+        "collection_resource_type": collection_resource_type,
         "lerobot_version": lerobot_version,
     }
     _stamp_output_files(context, subfolder, per_file_stamp)
@@ -1609,6 +1542,7 @@ def main(context: roboto.InvocationContext) -> None:
             "source_dataset_id": context.dataset_id,
             "collection_id": collection_id,
             "collection_version": collection_version,
+            "collection_resource_type": collection_resource_type,
             "total_episodes": total_episodes,
             "total_frames": total_frames,
             "lerobot_version": lerobot_version,
@@ -1637,6 +1571,6 @@ def main(context: roboto.InvocationContext) -> None:
     logger.info(
         "Done. %d episodes, %d frames across %d datasets. "
         "Output at %s/ inside dataset %s.",
-        total_episodes, total_frames, len(prepared),
+        total_episodes, total_frames, len(source_dataset_ids),
         context.invocation_id, output_dataset_id,
     )

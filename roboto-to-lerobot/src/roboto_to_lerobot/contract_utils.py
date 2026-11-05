@@ -23,6 +23,7 @@ License text: ``runtime/LICENSE-rosetta``.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
@@ -601,6 +602,24 @@ def resolve_role_bindings(
     Specs that already carry a literal ``topic`` (no ``role``) are returned
     unchanged, so legacy contracts pass through untouched.
     """
+    return resolve_role_bindings_for_files(
+        dataset.list_files, contract, scope=f"dataset {dataset.dataset_id}",
+    )
+
+
+def resolve_role_bindings_for_files(
+    list_files: Callable[[], Iterable[roboto.File]],
+    contract: Contract,
+    *,
+    scope: str,
+) -> Contract:
+    """:func:`resolve_role_bindings` over an explicit set of files.
+
+    ``list_files`` is only called when the contract has role-bound specs,
+    so callers can pass an expensive lister without paying for it on
+    literal-topic contracts. ``scope`` names the file set in error messages
+    (e.g. ``"dataset ds_abc"`` or ``"session se_abc"``).
+    """
     from .logger import logger
 
     role_specs: list[tuple[str, Any]] = []
@@ -614,9 +633,9 @@ def resolve_role_bindings(
     if not role_specs:
         return contract
 
-    # Single dataset.list_files pass: bucket every file by its role tag.
+    # Single list_files pass: bucket every file by its role tag.
     files_by_role: dict[str, list] = {}
-    for file in dataset.list_files():
+    for file in list_files():
         md = getattr(file, "metadata", None) or {}
         role = md.get("role") if isinstance(md, dict) else None
         if not role:
@@ -628,13 +647,13 @@ def resolve_role_bindings(
         if len(matches) == 0:
             raise ValueError(
                 f"Role '{spec.role}' (spec key='{spec.key}') not found on any "
-                f"file in dataset {dataset.dataset_id}. Tag files with a "
+                f"file in {scope}. Tag files with a "
                 f"`role` metadata field first."
             )
         if len(matches) > 1:
             raise ValueError(
                 f"Role '{spec.role}' (spec key='{spec.key}') matched "
-                f"{len(matches)} files in dataset {dataset.dataset_id}: "
+                f"{len(matches)} files in {scope}: "
                 f"{[f.relative_path for f in matches]}. Expected exactly 1."
             )
         file = matches[0]
@@ -680,8 +699,27 @@ def collect_topics_from_dataset(
     dataset: roboto.Dataset,
     contract: Contract,
 ) -> tuple[dict[str, list[roboto.Topic]], list[dict]]:
+    """Collect the contract's topics from every file in ``dataset``.
+
+    See :func:`collect_topics_from_files` for chunking, dedup, and errors.
     """
-    Collect all topics from a dataset that are mentioned in the contract.
+    return collect_topics_from_files(
+        dataset.list_files(), contract,
+        scope=f"Dataset {getattr(dataset, 'dataset_id', '?')}",
+    )
+
+
+def collect_topics_from_files(
+    files: Iterable[roboto.File],
+    contract: Contract,
+    *,
+    scope: str,
+) -> tuple[dict[str, list[roboto.Topic]], list[dict]]:
+    """
+    Collect all topics from ``files`` that are mentioned in the contract.
+
+    ``scope`` names the file set in the summary log line and errors (e.g.
+    ``"Dataset ds_abc"`` or ``"Session se_abc"``).
 
     Chunked recordings — same topic name across multiple files with disjoint
     time ranges — are preserved here and merged later in ``_merge_spec_dfs``
@@ -714,7 +752,7 @@ def collect_topics_from_dataset(
     raw: dict[str, list[tuple[roboto.Topic, str]]] = {}
     files_scanned = 0
 
-    for file in dataset.list_files():
+    for file in files:
         files_scanned += 1
         for topic in file.get_topics():
             if topic.name in contract_topics:
@@ -730,7 +768,7 @@ def collect_topics_from_dataset(
     missing_topics = contract_topics - set(raw.keys())
     if missing_topics:
         raise ValueError(
-            f"The following topics from the contract were not found in the dataset: "
+            f"The following topics from the contract were not found in {scope}: "
             f"{sorted(missing_topics)}"
         )
 
@@ -777,8 +815,8 @@ def collect_topics_from_dataset(
             kept.append(winner)
         topics[name] = kept
 
-    # One summary line per dataset replaces the chatty per-binding /
-    # per-(topic, file) INFO output. dataset_id keeps it greppable when
+    # One summary line per file set replaces the chatty per-binding /
+    # per-(topic, file) INFO output. ``scope`` keeps it greppable when
     # multiple datasets share a run; chunk_count gives a hint when a
     # multi-file recording fanned out into multiple Topic objects under
     # the same name.
@@ -786,8 +824,8 @@ def collect_topics_from_dataset(
     dedup_dropped = sum(len(g["dropped"]) for g in dedup_groups)
     suffix = f"; deduped {dedup_dropped} duplicate(s)" if dedup_dropped else ""
     logger.info(
-        "Dataset %s: matched %d topic(s) (%d chunk(s)) across %d file(s)%s",
-        getattr(dataset, "dataset_id", "?"),
+        "%s: matched %d topic(s) (%d chunk(s)) across %d file(s)%s",
+        scope,
         len(topics), chunk_count, files_scanned, suffix,
     )
 

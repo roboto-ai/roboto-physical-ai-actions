@@ -3,8 +3,8 @@
 The `roboto-to-lerobot` action is driven by a **contract YAML** that lives in
 the invocation dataset. It tells the action which ROS topics to read, how to
 extract values from each message, how to align streams onto a common timeline,
-and what transforms to apply along the way. Each event in the input collection
-becomes one episode in the output LeRobot dataset; the contract is applied
+and what transforms to apply along the way. Each event or session in the input
+collection becomes one episode in the output LeRobot dataset; the contract is applied
 identically to every episode.
 
 ## Table of contents
