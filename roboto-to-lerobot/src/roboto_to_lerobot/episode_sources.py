@@ -41,6 +41,7 @@ from .contract_utils import (
     resolve_role_bindings_for_files,
 )
 from .logger import logger
+from .subtasks import SubtaskWindow, session_subtask_windows
 
 SourceType = Literal["event", "session"]
 
@@ -62,6 +63,7 @@ class EpisodeSource:
     start_time: int
     end_time: int
     metadata: dict[str, Any] = field(default_factory=dict)
+    subtask_windows: tuple[SubtaskWindow, ...] = ()
 
     @property
     def event_id(self) -> str:
@@ -255,6 +257,7 @@ def _resolve_session_sources(
             start_time=start_time,
             end_time=end_time,
             metadata=dict(session.metadata or {}),
+            subtask_windows=session_subtask_windows(session, session_files),
         ))
     if not sources:
         raise ValueError(

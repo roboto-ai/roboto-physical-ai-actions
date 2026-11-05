@@ -4,7 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 import roboto
-from roboto_to_lerobot import episode_sources
+from roboto.exceptions import RobotoFeatureNotAvailableException
+from roboto_to_lerobot import episode_sources, subtasks
 from roboto_to_lerobot.contract_utils import ActionSpec, Contract, ObservationSpec
 from roboto_to_lerobot.episode_sources import (
     EpisodeSource,
@@ -44,9 +45,16 @@ class FakeSession:
     min_timestamp_ns: int | None = None
     max_timestamp_ns: int | None = None
     metadata: dict = field(default_factory=dict)
+    events: list = field(default_factory=list)
+    has_session_events: bool = True
 
     def list_files(self):
         return list(self.files)
+
+    def list_events(self):
+        if not self.has_session_events:
+            raise RobotoFeatureNotAvailableException("no session events in this org")
+        return list(self.events)
 
 
 def _session_file(file_id, dataset_id="ds_a", lo=None, hi=None, offset=0):
@@ -88,7 +96,11 @@ def platform(monkeypatch):
     hydrated records and looks files up by id; both are routed to fakes
     registered on the returned namespace.
     """
-    state = SimpleNamespace(files={})
+    state = SimpleNamespace(files={}, legacy_events={})
+    monkeypatch.setattr(
+        subtasks.roboto.Event, "get_by_file",
+        lambda file_id: iter(state.legacy_events.get(file_id, [])),
+    )
     fake_roboto = SimpleNamespace(
         CollectionResourceType=roboto.CollectionResourceType,
         Session=lambda record: record,
@@ -213,3 +225,41 @@ def test_annotate_relabels_session_entries_and_leaves_event_entries():
         "source_dataset_ids": ["ds_a", "ds_b"],
     }
     assert annotate_manifest_entry(event_entry, by_key) is event_entry
+
+
+def _event(event_id, name, start, end):
+    return SimpleNamespace(event_id=event_id, name=name, start_time=start, end_time=end)
+
+
+def _subtask_names(platform, session):
+    sources, _ = resolve_episode_sources(_collection([session]), _contract())
+    return [w.name for w in sources[0].subtask_windows]
+
+
+def test_subtasks_come_from_the_events_on_the_session(platform):
+    platform.add_file("fl_1", "ds_a", 100, 200)
+    platform.legacy_events["fl_1"] = [_event("ev_old", "legacy", 110, 120)]
+    session = FakeSession(
+        "se_a", [_session_file("fl_1")], min_timestamp_ns=100, max_timestamp_ns=200,
+        events=[_event("evt_2", "lift", 150, 160), _event("evt_1", "grasp", 120, 130)],
+    )
+
+    assert _subtask_names(platform, session) == ["grasp", "lift"]
+
+
+def test_org_without_session_events_uses_the_events_on_the_sessions_files(platform):
+    platform.add_file("fl_1", "ds_a", 100, 200)
+    platform.add_file("fl_2", "ds_a", 200, 300)
+    platform.add_file("fl_other", "ds_a", 100, 300)
+    shared = _event("ev_shared", "span", 190, 210)
+    platform.legacy_events.update({
+        "fl_1": [_event("ev_1", "grasp", 110, 120), shared],
+        "fl_2": [shared],
+        "fl_other": [_event("ev_other", "not_this_session", 110, 120)],
+    })
+    session = FakeSession(
+        "se_a", [_session_file("fl_1"), _session_file("fl_2")],
+        min_timestamp_ns=100, max_timestamp_ns=300, has_session_events=False,
+    )
+
+    assert _subtask_names(platform, session) == ["grasp", "span"]

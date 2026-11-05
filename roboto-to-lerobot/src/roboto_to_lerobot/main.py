@@ -36,6 +36,7 @@ from .event_worker import (
 )
 from .lerobot import generate_frames, materialize_deferred
 from .logger import logger
+from .subtasks import apply_session_subtasks
 from .stderr_filter import (
     disable_progress_bars,
     install_svt_stderr_filter,
@@ -1426,6 +1427,9 @@ def main(context: roboto.InvocationContext) -> None:
     for e in episode_to_event:
         per_dataset_counts[e["source_dataset_id"]] += 1
     source_dataset_ids = sorted({d for s in sources for d in s.dataset_ids})
+    subtasks_summary = apply_session_subtasks(
+        dataset_root, sources, episode_to_event, contract.fps,
+    )
 
     # Archive the contract bytes so the run survives later edits to the source.
     archived_contract_filename = "contract.yaml"
@@ -1474,6 +1478,7 @@ def main(context: roboto.InvocationContext) -> None:
         "source_datasets": source_dataset_ids,
         "episodes_per_dataset": dict(per_dataset_counts),
         "episode_to_event": episode_to_event,
+        "subtasks": subtasks_summary,
         "total_episodes": total_episodes,
         "total_frames": total_frames,
         "dedup": dedup_records,

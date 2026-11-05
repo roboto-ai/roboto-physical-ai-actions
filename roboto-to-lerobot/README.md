@@ -9,6 +9,12 @@ combined LeRobot dataset. An event episode covers the event's time window,
 read from the event's first associated dataset; a session episode covers the
 session's time window, read from the session's own files only (which may span
 several datasets).
+Events on a session become that episode's **sub-tasks**, named after the event,
+in the `language_persistent` column that lerobot 0.6 reads (`roboto-to-lerobot-v3_0`
+only). The session's own events are used, or in an org without session events, the
+events on its files. Frames no event covers get the sub-task `no_subtask`, and
+`manifest.json` records every segment under `subtasks`. Datasets whose sessions have
+no events are unchanged.
 The signal/topic schema, alignment strategy, and any pre/post transforms are
 described in a `contract.yaml` read from the invocation dataset — see
 [CONTRACT.md](CONTRACT.md) for the full schema reference, or
