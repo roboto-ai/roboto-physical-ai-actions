@@ -40,7 +40,11 @@ def compute(episodes: list[EpisodeData], config: dict | None = None) -> MetricRe
             ep_row[f"{role}_ess_mean"] = safe_float(np.nanmean(ess))
             dataset_ess_per_channel[role].extend(ess.tolist())
             if role == "action":
-                total_ess_action += float(np.nansum(ess))
+                # Average channels within this episode, then add episode evidence.
+                # A dataset-wide channel count would also average away episodes.
+                total_ess_action += float(np.nansum(ess)) / max(
+                    1, int(np.count_nonzero(np.isfinite(ess)))
+                )
             else:
                 total_ess_state += float(np.nansum(ess))
         per_episode.append(ep_row)
@@ -49,10 +53,9 @@ def compute(episodes: list[EpisodeData], config: dict | None = None) -> MetricRe
         "total_frames": total_frames,
         "ess_per_action_channel": scalar_summary(dataset_ess_per_channel["action"]),
         "ess_per_state_channel": scalar_summary(dataset_ess_per_channel["state"]),
-        # Dataset-wide "total" = sum of per-episode per-channel ESS, averaged across channels.
+        # Dataset-wide total = sum of per-episode means across finite channels.
         "total_ess_action_approx": safe_float(
             total_ess_action
-            / max(1, len([x for x in dataset_ess_per_channel["action"] if np.isfinite(x)]))
             if dataset_ess_per_channel["action"]
             else float("nan")
         ),
