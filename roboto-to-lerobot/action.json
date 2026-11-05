@@ -13,6 +13,11 @@
             "required": true
         },
         {
+            "name": "output_tags",
+            "description": "Comma-separated tags to add to the output dataset once the converted files are uploaded, for example to start a trigger on dataset.tag_added. Requires the invocation's output dataset to be set. Unset, the runtime uploads the output after the action exits and nothing is tagged.",
+            "required": false
+        },
+        {
             "name": "contract",
             "description": "Path, inside the invocation dataset, to the contract YAML that defines which Roboto topics to read and how they map to LeRobot state, action, and video features — see https://docs.roboto.ai/reference/roboto-to-lerobot-contract.html for the contract schema. Defaults to 'contract.yaml' at the dataset root; the run fails if no contract.yaml is found there and this parameter is not set, or if a specified path does not exist in the dataset.",
             "required": false

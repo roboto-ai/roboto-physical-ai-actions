@@ -36,6 +36,7 @@ from .event_worker import (
 )
 from .lerobot import generate_frames, materialize_deferred
 from .logger import logger
+from .output_publish import parse_tags, publish_tagged_output
 from .subtasks import apply_session_subtasks
 from .stderr_filter import (
     disable_progress_bars,
@@ -1556,6 +1557,10 @@ def main(context: roboto.InvocationContext) -> None:
         })
         .build()
     )
+
+    output_tags = parse_tags(context.get_optional_parameter("output_tags"))
+    if output_tags and not context.is_dry_run:
+        publish_tagged_output(output_dataset, context.output_dir, subfolder, output_tags)
 
     if dedup_records:
         logger.warning(
