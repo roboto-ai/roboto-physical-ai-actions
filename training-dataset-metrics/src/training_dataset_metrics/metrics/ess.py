@@ -55,9 +55,7 @@ def compute(episodes: list[EpisodeData], config: dict | None = None) -> MetricRe
         "ess_per_state_channel": scalar_summary(dataset_ess_per_channel["state"]),
         # Dataset-wide total = sum of per-episode means across finite channels.
         "total_ess_action_approx": safe_float(
-            total_ess_action
-            if dataset_ess_per_channel["action"]
-            else float("nan")
+            total_ess_action if dataset_ess_per_channel["action"] else float("nan")
         ),
     }
 

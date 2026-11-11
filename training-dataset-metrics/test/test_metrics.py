@@ -6,10 +6,11 @@ state-based assertions, parametrize instead of loops, DAMP over DRY.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from training_dataset_metrics.core.pairing import pair_state_action
-from training_dataset_metrics.core.types import MetricResult
+from training_dataset_metrics.core.types import EpisodeData, MetricResult
 from training_dataset_metrics.metrics import METRICS
 from training_dataset_metrics.metrics import alignment as alignment_metric
 
@@ -167,6 +168,32 @@ def test_effective_sample_size_emits_one_row_per_episode(clean_episodes):
         f"expected {len(clean_episodes)} per-episode rows, "
         f"got {len(result.per_episode)}"
     )
+
+
+def test_effective_sample_size_total_sums_episodes_and_averages_finite_channels():
+    """The dataset total is the sum over episodes of each episode's mean ESS
+    across its finite channels: more episodes add evidence, more channels do
+    not, and a channel with undefined ESS does not dilute the others."""
+
+    # Arrange: alternating samples give a negative lag-1 ACF, so tau=1 and
+    # ESS equals the episode length on every channel.
+    def episode(index: int, length: int) -> EpisodeData:
+        signal = np.tile([1.0, -1.0], length // 2)
+        return EpisodeData(
+            episode_index=index,
+            fps=30.0,
+            n_frames=length,
+            action=np.repeat(signal[:, None], 2, axis=1),
+        )
+
+    short, long = episode(0, 4), episode(1, 8)
+    short.action[:, 1] = 0.0  # constant channel: undefined ACF, NaN ESS
+
+    # Act
+    result = METRICS["effective_sample_size"].compute([short, long])
+
+    # Assert
+    assert result.per_dataset["total_ess_action_approx"] == pytest.approx(4 + 8)
 
 
 def test_effective_dimensionality_reports_participation_ratio_per_role(
