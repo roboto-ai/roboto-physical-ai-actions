@@ -3,7 +3,7 @@
   <name>inference_node</name>
   <version>0.1.0</version>
   <description>roboto-to-lerobot docker bag-replay smoke package.</description>
-  <maintainer email="dev@roboto.ai">Roboto</maintainer>
+  <maintainer email="noreply@example.com">Roboto</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_python</buildtool_depend>

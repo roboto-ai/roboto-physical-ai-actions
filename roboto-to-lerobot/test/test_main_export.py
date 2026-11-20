@@ -23,7 +23,7 @@ from roboto_to_lerobot.episode_sources import (
     ResolvedSources,
 )
 from roboto_to_lerobot.subtasks import SubtaskWindow
-from test_episode_cache import _DS, _SECOND, _events, _Harness, main_mod
+from test_episode_cache import _DS, _SECOND, _T0, _events, _Harness, main_mod
 
 pytestmark = pytest.mark.skipif(
     not main_mod._shard_path_supported(), reason="v3.0 output needs lerobot 0.6 or later",
@@ -135,6 +135,27 @@ def test_session_collection_exports_through_the_cache_with_subtasks_and_session_
     second_session = LeRobotDataset(root.name, root=root, episode_filter=lambda ep: ep["roboto/session_id"] == "se_1")
     assert second_session.episodes == [1]
     assert "language_persistent" in second_session.meta.features
+
+
+def test_subtasks_stay_on_their_frames_when_an_episode_drops_frames_at_its_start(export):
+    # Arrange
+    # The session starts 0.3 s before the recording has data, so its first frames are left out.
+    start = _T0 - 3 * _SECOND // 10
+    grasp = SubtaskWindow("ev_grasp", "grasp", _T0 + 2 * _SECOND // 10, _T0 + 6 * _SECOND // 10)
+    session = EpisodeSource("session", "se_0", "se_0", (_DS,), start, _T0 + _SECOND, {}, (grasp,))
+
+    # Act
+    out = export(roboto.CollectionResourceType.Session, [session], episode_cache="true")
+
+    # Assert
+    manifest = json.loads((out / "manifest.json").read_text())
+    (episode,) = manifest["episode_to_event"]
+    dropped = episode["dropped_frames"]
+    assert dropped and dropped == list(range(len(dropped)))
+    assert episode["n_frames"] == 14 - len(dropped)
+    # grasp covers reference frames 5 to 8, which the episode numbers without the dropped ones.
+    starts = {s["content"]: s["start_frame"] for s in manifest["subtasks"]["episodes"][0]["segments"][1:]}
+    assert starts == {"grasp": 5 - len(dropped), "no_subtask": 9 - len(dropped)}
 
 
 def test_event_collection_exports_with_event_ids_and_no_session_fields(export):
