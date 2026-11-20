@@ -150,6 +150,7 @@ def _worker_build_episode(
         name="timestamp",
     )
 
+    dropped_frames: list[int] = []
     frames = list(
         generate_frames(
             contract,
@@ -157,12 +158,14 @@ def _worker_build_episode(
             reference_timestamps,
             task=resolved_task_label,
             defer_image_decode=True,
+            dropped_frames=dropped_frames,
         )
     )
     return WorkerEpisode(
         event_idx=task.event_idx,
         task_label=resolved_task_label,
         frames=frames,
+        dropped_frames=tuple(dropped_frames),
     )
 
 
@@ -171,11 +174,16 @@ class WorkerEpisode(NamedTuple):
 
     Lives outside the function so tests can construct it directly when
     monkeypatching the worker call.
+
+    ``dropped_frames`` are the positions, on the episode's reference
+    timeline, of the frames left out of ``frames`` because a stream had no
+    value for them. ``frames`` are numbered without them.
     """
 
     event_idx: int
     task_label: str
     frames: list[dict[str, Any]]
+    dropped_frames: tuple[int, ...] = ()
 
 
 def topic_descriptors_from_topics(

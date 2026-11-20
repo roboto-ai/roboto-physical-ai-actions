@@ -18,6 +18,11 @@
             "required": false
         },
         {
+            "name": "subtask_events",
+            "description": "Which events on a session become its episode's sub-tasks, by event name: comma-separated glob patterns, where a leading '!' excludes. An event is used when it matches one of the patterns without '!' (or when there are none) and none of the patterns with '!'. For example 'grasp*,lift' uses only those events and '!qa/*' uses every event except those under 'qa/'. Unset, every event becomes a sub-task. Applies to collections of sessions on roboto-to-lerobot-v3_0.",
+            "required": false
+        },
+        {
             "name": "contract",
             "description": "Path, inside the invocation dataset, to the contract YAML that defines which Roboto topics to read and how they map to LeRobot state, action, and video features — see https://docs.roboto.ai/reference/roboto-to-lerobot-contract.html for the contract schema. Defaults to 'contract.yaml' at the dataset root; the run fails if no contract.yaml is found there and this parameter is not set, or if a specified path does not exist in the dataset.",
             "required": false

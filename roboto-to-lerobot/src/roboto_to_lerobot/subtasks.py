@@ -13,6 +13,11 @@ episode's events into one label per frame and marks the frames no event covers
 with :data:`GAP_SUBTASK`; without that row, a sub-task would appear to run on
 through the gap after its event ended.
 
+An episode leaves out the frames for which a stream has no data and numbers
+the rest without them; ``plan_segments`` takes those positions so that labels
+stay on the frames their events cover. The ``subtask_events`` parameter
+chooses the events by name (:func:`parse_event_patterns`).
+
 The columns are added after the dataset is finalized and merged, so sharded
 writing and video encoding are unaffected. A dataset whose sessions have no
 events is left exactly as it was written.
@@ -20,10 +25,12 @@ events is left exactly as it was written.
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -85,17 +92,54 @@ def session_subtask_windows(
     return tuple(sorted(windows, key=lambda w: (w.start_time, w.event_id)))
 
 
+class EventPatterns(NamedTuple):
+    """Which events become sub-tasks, by name: any ``include`` glob (or all, when empty) and no ``exclude`` glob."""
+
+    include: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = ()
+
+    def select(self, name: str) -> bool:
+        included = not self.include or any(fnmatchcase(name, pattern) for pattern in self.include)
+        return included and not any(fnmatchcase(name, pattern) for pattern in self.exclude)
+
+
+ALL_EVENTS = EventPatterns()
+
+
+def parse_event_patterns(raw: object) -> EventPatterns:
+    """Parse the ``subtask_events`` parameter: comma-separated globs, where a leading ``!`` excludes.
+
+    Unset or blank selects every event.
+    """
+    patterns = [pattern.strip() for pattern in str(raw or "").split(",") if pattern.strip()]
+    return EventPatterns(
+        include=tuple(p for p in patterns if not p.startswith("!")),
+        exclude=tuple(p[1:].strip() for p in patterns if p.startswith("!") and p[1:].strip()),
+    )
+
+
 def plan_segments(
     windows: Iterable[SubtaskWindow],
     *,
     episode_start_ns: int,
     n_frames: int,
     time_step_ns: int,
+    dropped_frames: Sequence[int] = (),
 ) -> tuple[list[SubtaskSegment], list[SubtaskWindow]]:
     """Flatten overlapping windows into one sub-task per frame.
 
     Where windows overlap, the one that started last is active, and the earlier
     one resumes if it outlasts it. Windows are clipped to the episode.
+
+    Args:
+        windows: The events to label the episode with.
+        episode_start_ns: The time of the first position on the episode's
+            reference timeline.
+        n_frames: The frames the episode kept.
+        time_step_ns: The spacing of the reference timeline.
+        dropped_frames: The positions on the reference timeline that the
+            episode left out, sorted. The kept frames are numbered without
+            them, so a window's frames move up by the drops before it.
 
     Returns:
         The segments, empty if no window covers a frame, and the windows that
@@ -104,7 +148,8 @@ def plan_segments(
     """
 
     def frame_of(time_ns: int) -> int:
-        return round((time_ns - episode_start_ns) / time_step_ns)
+        position = round((time_ns - episode_start_ns) / time_step_ns)
+        return position - bisect_left(dropped_frames, position)
 
     active: list[SubtaskWindow | None] = [None] * n_frames
     dropped: list[SubtaskWindow] = []
@@ -203,20 +248,28 @@ def apply_session_subtasks(
     sources: Iterable[Any],
     episode_to_event: Iterable[Mapping[str, Any]],
     fps: float,
+    event_patterns: EventPatterns = ALL_EVENTS,
 ) -> dict[str, Any] | None:
     """Write the sub-tasks of every session episode into the finished dataset.
 
     Args:
         dataset_root: The finalized, merged LeRobot dataset.
         sources: The episode sources of the run.
-        episode_to_event: The run's final manifest entries, one per written episode.
+        episode_to_event: The run's final manifest entries, one per written
+            episode, each with the ``dropped_frames`` of its episode.
         fps: The dataset's frame rate.
+        event_patterns: Which events become sub-tasks, by name.
 
     Returns:
         The manifest's record of what was written, or ``None`` if no sub-tasks
-        were: the sessions have no events, or lerobot cannot store them.
+        were: no session has an event that ``event_patterns`` selects, or
+        lerobot cannot store them.
     """
-    windows_by_session = {s.source_id: s.subtask_windows for s in sources if s.subtask_windows}
+    windows_by_session = {
+        s.source_id: windows
+        for s in sources
+        if (windows := tuple(w for w in s.subtask_windows if event_patterns.select(w.name)))
+    }
     if not windows_by_session:
         return None
     if not _supports_language_columns():
@@ -237,18 +290,12 @@ def apply_session_subtasks(
             continue
         n_frames = int(entry["n_frames"])
         start_ns = int(entry["start_time_ns"])
-        expected_frames = (int(entry["end_time_ns"]) - start_ns) // time_step_ns + 1
-        if n_frames != expected_frames:
-            # Frames are numbered after NaN rows are dropped, so labels after a drop run early.
-            logger.warning(
-                "Session %s kept %d of %d frames; its sub-task boundaries may be off by the difference.",
-                session_id, n_frames, expected_frames,
-            )
         segments, dropped = plan_segments(
             windows_by_session[session_id],
             episode_start_ns=start_ns,
             n_frames=n_frames,
             time_step_ns=time_step_ns,
+            dropped_frames=entry["dropped_frames"],
         )
         for window in dropped:
             logger.warning(
@@ -267,4 +314,9 @@ def apply_session_subtasks(
     if segments_by_episode:
         write_subtasks(dataset_root, segments_by_episode)
         logger.info("Wrote sub-tasks for %d episode(s).", len(segments_by_episode))
-    return {"gap_subtask": GAP_SUBTASK, "episodes": episodes, "dropped_events": dropped_events}
+    return {
+        "gap_subtask": GAP_SUBTASK,
+        "event_patterns": event_patterns._asdict(),
+        "episodes": episodes,
+        "dropped_events": dropped_events,
+    }
