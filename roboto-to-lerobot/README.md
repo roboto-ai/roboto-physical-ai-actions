@@ -86,6 +86,7 @@ $ .venv/bin/roboto users whoami
 |-----------------|----------|---------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `collection_id` | yes      | —       | ID of a Roboto Collection whose `resource_type` is `event` or `session`. Each event or session in the collection becomes one episode in the output dataset. A session's window is its aggregate time bounds; a session without bounds falls back to the windows it holds of its files, or to the span of the contract topics on them. Sessions that re-anchor a file with a `unix_epoch_offset_ns` are rejected. The collection's version observed at invocation time is recorded in the output manifest for reproducibility. For session collections, each `episode_to_event` / `skipped_events` entry in the manifest carries `session_id` and `source_dataset_ids`, with `event_id` set to `null`. |
 | `output_tags`   | no       | — | Comma-separated tags for the output dataset, applied once the converted files are uploaded, so a `dataset.tag_added` trigger sees the whole dataset. A tag the dataset already has is removed and added again so its trigger fires. Check which triggers in your org fire on a tag before using it. |
+| `subtask_events` | no      | every event | Which events on a session become its episode's sub-tasks, by event name: comma-separated glob patterns, where a leading `!` excludes. `grasp*,lift` uses only those events; `!qa/*` uses every event except those under `qa/`. See [Session collections and sub-tasks](#session-collections-and-sub-tasks). |
 | `contract`      | no       | `contract.yaml` (auto-discovered) | Path to the contract YAML inside the invocation dataset. Describes the topics, alignment, and transforms used to build each episode. See [CONTRACT.md](CONTRACT.md) for the full schema, or [`contract_demo_reassemble.yaml`](example_notebook/contract_demo_reassemble.yaml) for a worked example. |
 | `pool_size`     | no       | auto-sized | Worker processes that read and process events in parallel, per shard. Left unset it auto-sizes to `min(16, cpu_count / shard_count)` — on the default 16-vCPU compute with `shard_count=3` that is `5`. Any explicit value is used verbatim and is not capped. |
 | `encoder_threads` | no     | `2` (built in) | Level of parallelism given to the SVT-AV1 video encoder, per camera stream. Higher values encode each camera faster. The export waits for the encoder rather than dropping frames, so a low value costs time, not frames. Left unset it uses the built-in `2`. Only `roboto-to-lerobot-v3_0` acts on it; `roboto-to-lerobot-v2_1` (lerobot 0.3.3) accepts it and silently ignores it, having no equivalent knob. |
@@ -169,8 +170,12 @@ from the session's own files only, which may span several datasets.
 Events on a session become that episode's **sub-tasks**, named after the
 event, in the `language_persistent` column that lerobot 0.6 and later read.
 The session's own events are used, or, in an org without session events, the
-events on its files. Frames no event covers get the sub-task `no_subtask`,
-and `manifest.json` records every segment under `subtasks`. Datasets whose
+events on its files. Every event is used unless `subtask_events` narrows
+them by name. Frames no event covers get the sub-task `no_subtask`,
+and `manifest.json` records every segment under `subtasks`. An episode leaves
+out the frames for which a stream has no data and numbers the rest without
+them; the manifest lists those positions as the episode's `dropped_frames`,
+and sub-tasks are placed on the frames their events cover. Datasets whose
 sessions have no events are unchanged. Only `roboto-to-lerobot-v3_0` writes
 sub-tasks: lerobot 0.3.3 has no column for them, so `roboto-to-lerobot-v2_1`
 logs a warning and writes none.
