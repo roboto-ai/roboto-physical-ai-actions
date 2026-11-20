@@ -123,7 +123,12 @@ def episode_key(
     contract: Contract,
     topics: dict[str, list[Any]],
 ) -> str:
-    """Hash one event's inputs.
+    """Hash one event's inputs, or one session's.
+
+    For a session, ``event_id`` and ``src_ds_id`` are both the session id
+    and ``topics`` are those of the session's files. The events on a session
+    are not hashed: they become sub-tasks, which the export writes after it
+    merges the entries.
 
     ``contract`` is the dataset's role-resolved contract, so a change in
     which topic a ``role:`` binds to changes the key. Each topic chunk that

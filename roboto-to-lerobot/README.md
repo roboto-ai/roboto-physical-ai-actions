@@ -5,16 +5,8 @@ Convert data ingested into the Roboto Data Platform into a LeRobot dataset.
 
 The action is driven by a **Roboto Collection of events or of sessions**:
 each event or session in the input collection becomes one episode in a single
-combined LeRobot dataset. An event episode covers the event's time window,
-read from the event's first associated dataset; a session episode covers the
-session's time window, read from the session's own files only (which may span
-several datasets).
-Events on a session become that episode's **sub-tasks**, named after the event,
-in the `language_persistent` column that lerobot 0.6 reads (`roboto-to-lerobot-v3_0`
-only). The session's own events are used, or in an org without session events, the
-events on its files. Frames no event covers get the sub-task `no_subtask`, and
-`manifest.json` records every segment under `subtasks`. Datasets whose sessions have
-no events are unchanged.
+combined LeRobot dataset, and the events on a session become that episode's
+sub-tasks (see [Session collections and sub-tasks](#session-collections-and-sub-tasks)).
 The signal/topic schema, alignment strategy, and any pre/post transforms are
 described in a `contract.yaml` read from the invocation dataset — see
 [CONTRACT.md](CONTRACT.md) for the full schema reference, or
@@ -55,6 +47,7 @@ version-to-variant mapping lives in [`scripts/variants.sh`](scripts/variants.sh)
   - [Running](#running)
     - [Local Invocation](#local-invocation)
     - [Hosted Invocation](#hosted-invocation)
+- [Session collections and sub-tasks](#session-collections-and-sub-tasks)
 - [Lineage](#lineage)
 - [Lance output](#lance-output)
 - [LeRobot 0.7 in roboto-to-lerobot-v3_0](#lerobot-07-in-roboto-to-lerobot-v3_0)
@@ -97,7 +90,7 @@ $ .venv/bin/roboto users whoami
 | `pool_size`     | no       | auto-sized | Worker processes that read and process events in parallel, per shard. Left unset it auto-sizes to `min(16, cpu_count / shard_count)` — on the default 16-vCPU compute with `shard_count=3` that is `5`. Any explicit value is used verbatim and is not capped. |
 | `encoder_threads` | no     | `2` (built in) | Level of parallelism given to the SVT-AV1 video encoder, per camera stream. Must be `>= 2`: lower values risk the encoder's internal frame queue overflowing under bursty writes, silently dropping frames from the output video. Left unset it uses the built-in `2`. Only `roboto-to-lerobot-v3_0` acts on it; `roboto-to-lerobot-v2_1` (lerobot 0.3.3) accepts it and silently ignores it, having no equivalent knob. |
 | `shard_count`   | no       | `3`     | Parallel writer shards. Each shard writes a partial dataset independently, and the shards are then merged by stream-copy with no re-encoding. Sharded writing needs `lerobot.datasets.aggregate.aggregate_datasets`, which lerobot 0.3.x lacks, so without the episode cache only `roboto-to-lerobot-v3_0` acts on it: `roboto-to-lerobot-v2_1` accepts it and ignores it, falling back to a single writer and logging a warning. With `episode_cache=true`, both variants use it as the maximum number of processes that convert the episodes missing from the cache. Without the episode cache, sharding also groups the merged dataset's episodes by shard rather than strictly chronologically; each episode's original `start_time_ns` is preserved in the output manifest. |
-| `episode_cache` | no | `false` | Set to `true` to cache each converted episode in the org's assets, so a re-export converts only new or changed events. Caching requires org asset storage to be enabled for your org; where it is not enabled, this parameter has no effect: the action logs a warning and converts every event. Each episode is stored once, as a one-episode LeRobot dataset at `.lerobot-cache/<recipe_hash>/<episode_key>/`, a hidden folder in the org's assets. The recipe hash covers the contract, the converter source, the lerobot version and the output features. The episode key covers the event (id, bounds, task, source dataset) and the source topics it reads, so an edited event or a re-uploaded file is converted again. At most `shard_count` processes convert the episodes missing from the cache, and each new entry is uploaded as soon as it is converted. The export then merges cached and new episodes in chronological order without re-encoding: `roboto-to-lerobot-v3_0` stream-copies them into its packed files, and `roboto-to-lerobot-v2_1` moves each episode's files into place and renumbers the episode. The dataset's [lineage](#lineage) records which episodes came from the cache. Both variants act on it, each caching episodes in its own LeRobot format. |
+| `episode_cache` | no | `false` | Set to `true` to cache each converted episode in the org's assets, so a re-export converts only new or changed events or sessions. Caching requires org asset storage to be enabled for your org; where it is not enabled, this parameter has no effect: the action logs a warning and converts every event. Each episode is stored once, as a one-episode LeRobot dataset at `.lerobot-cache/<recipe_hash>/<episode_key>/`, a hidden folder in the org's assets. The recipe hash covers the contract, the converter source, the lerobot version and the output features. The episode key covers the event or session (id, bounds, task, and the source dataset of an event) and the source topics it reads, so an edited event, a session whose bounds or files changed, or a re-uploaded file is converted again. At most `shard_count` processes convert the episodes missing from the cache, and each new entry is uploaded as soon as it is converted. The export then merges cached and new episodes in chronological order without re-encoding: `roboto-to-lerobot-v3_0` stream-copies them into its packed files, and `roboto-to-lerobot-v2_1` moves each episode's files into place and renumbers the episode. The dataset's [lineage](#lineage) records which episodes came from the cache. Both variants act on it, each caching episodes in its own LeRobot format. |
 | `output_format` | no | `lerobot` | `lerobot` writes the LeRobot dataset to `combined/`; `lance` writes its [Lance layout](#lance-output) to `lance/` instead; `both` writes both. Only `roboto-to-lerobot-v3_0` supports `lance` and `both`; `roboto-to-lerobot-v2_1` fails the run before converting. |
 
 ### Running
@@ -164,6 +157,34 @@ Full usage:
 $ .venv/bin/roboto actions invoke --help
 ```
 
+## Session collections and sub-tasks
+
+An event episode covers the event's time window, read from the event's first
+associated dataset. A session episode covers the session's time window, read
+from the session's own files only, which may span several datasets.
+
+Events on a session become that episode's **sub-tasks**, named after the
+event, in the `language_persistent` column that lerobot 0.6 and later read.
+The session's own events are used, or, in an org without session events, the
+events on its files. Frames no event covers get the sub-task `no_subtask`,
+and `manifest.json` records every segment under `subtasks`. Datasets whose
+sessions have no events are unchanged. Only `roboto-to-lerobot-v3_0` writes
+sub-tasks: lerobot 0.3.3 has no column for them, so `roboto-to-lerobot-v2_1`
+logs a warning and writes none.
+
+Session episodes go through the rest of the export as event episodes do:
+
+- **Episode cache.** A session's episode is cached under the session's id,
+  bounds, task and the topics of its files. Sub-tasks are not part of a
+  cache entry: the export writes them after it has merged cached and new
+  episodes. Adding, renaming or moving an event on a session therefore
+  changes the sub-tasks of the next export without converting the session
+  again.
+- **Lineage.** The [lineage](#lineage) names each episode's session in
+  `session_id` and leaves `event_id` empty.
+- **Lance output.** The [Lance layout](#lance-output) keeps the sub-task
+  columns.
+
 ## Lineage
 
 Every export records where its episodes came from inside the LeRobot
@@ -172,11 +193,12 @@ convert it to Lance:
 
 - `meta/roboto_lineage.json` (both variants) names the invocation, the
   collection and its version, the contract (name, version, sha256), the
-  lerobot version and the recipe hash, and lists each episode's event id,
-  source dataset id, start and end time in nanoseconds, and whether it came
-  from the episode cache (with its `episode_key` when the cache was on).
+  lerobot version and the recipe hash, and lists each episode's event id or
+  session id (the other is null), source dataset id, start and end time in
+  nanoseconds, and whether it came from the episode cache (with its
+  `episode_key` when the cache was on).
 - In a `roboto-to-lerobot-v3_0` dataset, the episode metadata also has the
-  columns `roboto/event_id`, `roboto/source_dataset_id`,
+  columns `roboto/event_id`, `roboto/session_id`, `roboto/source_dataset_id`,
   `roboto/start_time_ns`, `roboto/end_time_ns`, `roboto/cache_hit` and
   `roboto/recipe_hash`, so LeRobot can select episodes by their source:
 
@@ -194,7 +216,7 @@ convert it to Lance:
   LeRobot's `delete_episodes` and `split_dataset` keep neither.
 
 The invocation folder also has a `manifest.json`, which maps each episode
-to its event.
+to its event or session.
 
 ## Lance output
 
