@@ -10,11 +10,21 @@ dependencies = [
     # The [video] extra (PyAV) backs the GOP-aware decoder for
     # foxglove_msgs/CompressedVideo camera topics — see roboto_to_lerobot/video.py.
     # >= 0.52.0 is where roboto.experimental.video gained its codec registry
-    # (resolve_codec / supported_formats); 0.51 was H.264-only.
-    "roboto[video] >= 0.52.0",
-    # 0.6.x moved datasets/pyarrow/av/torchcodec into the [dataset] extra;
-    # 0.3.x has no such extra and lists them as core deps.
-    "lerobot[dataset] >= 0.3.3, < 0.7",
+    # (resolve_codec / supported_formats); 0.51 was H.264-only. >= 0.61.0 is
+    # the first release with Org.assets, where the episode cache lives.
+    "roboto[video] >= 0.61.0",
+    # 0.6 moved datasets/pyarrow/av/torchcodec into the [dataset] extra;
+    # 0.3.x has no such extra and lists them as core deps. The Dockerfile and
+    # scripts/setup.sh pin the exact version per variant (scripts/variants.sh).
+    # 0.4 and 0.5 are excluded: they have aggregate_datasets, so the sharded
+    # and cached paths would start, but lack the modules those paths import
+    # and would fail after every event had converted.
+    "lerobot[dataset] >= 0.3.3, < 0.8, != 0.4.*, != 0.5.*",
+    # lerobot 0.3.3 (the v2_1 variant) records each video's frame rate with
+    # int(stream.base_rate), which raises from PyAV 19 on, where base_rate
+    # is an av.AVRational instead of a Fraction; every episode then fails
+    # to save. lerobot 0.6 and 0.7 already require av < 16.
+    "av < 19",
     "numpy",
     "pandas",
     "opencv-python",

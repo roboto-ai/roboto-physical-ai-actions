@@ -23,7 +23,10 @@ compose into that integration:
 
 from __future__ import annotations
 
+import http.client
+import sys
 from concurrent.futures import Future
+from concurrent.futures.process import BrokenProcessPool
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
@@ -51,20 +54,34 @@ class _SyncPool:
     """Drop-in replacement for ``ProcessPoolExecutor`` that runs submitted
     callables inline. Mirrors the surface ``_run_pool_drain`` touches
     (``submit`` returning a pre-resolved Future; ``shutdown`` is a no-op).
+    If the initializer raises, every future fails with ``BrokenProcessPool``,
+    as a real pool's pending futures do once a worker's initializer fails.
+    (A real pool also raises it from ``submit`` after it marks itself broken;
+    this double does not.)
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self._initializer = kwargs.get("initializer")
         self._initargs = kwargs.get("initargs", ())
+        self._broken: BrokenProcessPool | None = None
         if self._initializer is not None:
             # The real pool invokes ``initializer`` once per worker; for
             # the synchronous double we run it exactly once so that any
             # state ``_worker_init`` would set up is still set up before
             # any task runs.
-            self._initializer(*self._initargs)
+            try:
+                self._initializer(*self._initargs)
+            except Exception:
+                self._broken = BrokenProcessPool(
+                    "A process in the process pool was terminated abruptly "
+                    "while the future was running or pending."
+                )
 
     def submit(self, fn, task):
         f: Future = Future()
+        if self._broken is not None:
+            f.set_exception(self._broken)
+            return f
         try:
             f.set_result(fn(task))
         except BaseException as exc:
@@ -784,6 +801,50 @@ def test_pool_drain_skips_worker_failure(monkeypatch):
     assert writer.discard_calls == 0
 
 
+def _raise_connection_error(*_args: Any) -> None:
+    raise http.client.RemoteDisconnected("Remote end closed connection without response")
+
+
+@pytest.mark.parametrize(
+    ("failing", "reason"),
+    [
+        pytest.param("_worker_init", "the worker pool broke", id="initializer_fails"),
+        pytest.param(
+            "_worker_build_episode",
+            "a network or service error outlasted the SDK's retries",
+            id="connection_error_in_worker",
+        ),
+    ],
+)
+def test_pool_drain_fails_the_run_on_infrastructure_failure(monkeypatch, failing, reason):
+    """A worker pool that breaks (its initializer fails) or a connection error
+    that outlasted the SDK's retries fails the run with an error that names the
+    first event and the kind of failure, instead of dropping the events as skips."""
+    # Arrange
+    _patch_drain_internals(monkeypatch)
+    monkeypatch.setattr(sys.modules["roboto_to_lerobot.main"], failing, _raise_connection_error)
+
+    matched, events = _drain_inputs(3)
+    drain_order, pool_tasks = _make_drain_inputs(matched, events)
+    accumulator = _DrainAccum()
+
+    # Act / Assert
+    with pytest.raises(RuntimeError, match=f"event_id=ev_0.*{reason}"):
+        _run_pool_drain(
+            writer=_FakeWriter(),
+            video_specs_by_key={},
+            pool_tasks=pool_tasks,
+            drain_order=drain_order,
+            descriptors_by_ds={},
+            contracts_by_ds={},
+            pool_size=2,
+            accumulator=accumulator,
+        )
+
+    # Assert
+    assert accumulator.skipped_events == []
+
+
 def test_pool_drain_skips_writer_failure_and_recovers(monkeypatch):
     """A ``save_episode`` failure mid-drain triggers ``discard_episode`` on
     the writer, then the next event saves cleanly."""
@@ -1100,3 +1161,36 @@ def test_drop_empty_shards_all_non_empty_is_a_noop(caplog):
 
     assert result == shard_results
     assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_preload_failure_leaves_the_event_to_the_pool(monkeypatch, caplog):
+    """A first event that cannot be built in the main process is not reported as skipped.
+
+    The pool converts it afterwards, so a skip entry would list an event
+    that the export contains.
+    """
+    # Arrange
+    import pandas as pd
+    from roboto_to_lerobot import main as main_module
+
+    event = SimpleNamespace(event_id="ev_first", start_time=0, end_time=10)
+
+    def _fail(*args, **kwargs):
+        raise ValueError("no usable data")
+
+    monkeypatch.setattr(main_module, "resolve_task_label", lambda **kwargs: "default")
+    monkeypatch.setattr(main_module, "generate_frames", _fail)
+
+    # Act
+    episode = main_module._preload_episode(
+        contract=None,
+        episode_data=None,
+        event=event,
+        event_idx=0,
+        metadata_task="default",
+        ref_ts=pd.Series([0], name="timestamp"),
+    )
+
+    # Assert
+    assert episode is None
+    assert "ev_first" in caplog.text

@@ -97,5 +97,9 @@ class LeRobotWriter:
         )
 
     def finalize(self) -> None:
-        # 0.3.x does not expose a finalize step — save_episode is sufficient.
-        pass
+        # 0.3.x has no finalize step: save_episode writes every file.
+        # Stopping the image writer joins its threads, which would otherwise
+        # idle until the process exits. The episode cache creates one writer
+        # per episode, so without this a shard would keep every episode's
+        # threads alive.
+        self._dataset.stop_image_writer()

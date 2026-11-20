@@ -2,8 +2,8 @@
 #
 # Single source of truth for the variant -> lerobot version mapping.
 #
-# Sourced by deploy.sh and invoke_local.sh. Override either pin in the
-# environment to smoke-test a new patch release without editing this file:
+# Sourced by deploy.sh, invoke_local.sh and setup.sh. Override either pin in
+# the environment to smoke-test a new patch release without editing this file:
 #
 #   LEROBOT_V2_1_VERSION=0.3.4 ./scripts/deploy.sh --variant v2_1
 #
@@ -11,9 +11,13 @@
 # builds that cannot pass --build-arg (a bare `docker build`, and
 # `roboto actions invoke-local` run directly against this directory). Keep
 # that default in step with LEROBOT_V3_0_VERSION below.
+#
+# lerobot_pins.sh has torch pins, extras and overrides for 0.7.x only and
+# gives every other version the 0.3.x ones, so a pin to another minor
+# version needs its own cases there.
 
 LEROBOT_V2_1_VERSION="${LEROBOT_V2_1_VERSION:-0.3.3}"
-LEROBOT_V3_0_VERSION="${LEROBOT_V3_0_VERSION:-0.6.1}"
+LEROBOT_V3_0_VERSION="${LEROBOT_V3_0_VERSION:-0.7.0}"
 
 # Echo the lerobot version for a variant name; exit 1 on an unknown variant.
 lerobot_version_for_variant() {

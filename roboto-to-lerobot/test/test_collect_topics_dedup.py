@@ -24,6 +24,10 @@ class FakeFile:
     relative_path: str
     topics: list[FakeTopic] = field(default_factory=list)
 
+    @property
+    def file_id(self):
+        return self.topics[0].file_id
+
     def get_topics(self):
         return list(self.topics)
 
@@ -34,6 +38,9 @@ class FakeDataset:
 
     def list_files(self):
         return list(self.files)
+
+    def get_topics(self, include=None):
+        return [t for f in self.files for t in f.topics if include is None or t.name in include]
 
 
 def _contract_with_topic(name: str) -> Contract:

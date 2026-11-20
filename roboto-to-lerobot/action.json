@@ -1,6 +1,6 @@
 {
     "name": "roboto-to-lerobot",
-    "description": "Converts Roboto ingested data referenced by a Roboto Collection of events into a LeRobot dataset, one output episode per event in the collection. Which topics become which state, action, and video features is driven entirely by a contract YAML read from the invocation dataset (defaults to 'contract.yaml' at the dataset root) — see https://docs.roboto.ai/reference/roboto-to-lerobot-contract.html for the contract schema and https://docs.roboto.ai/user-guides/convert-to-lerobot.html for the authoring guide. Deployed as two variants with an identical interface: roboto-to-lerobot-v2_1 writes LeRobot 2.1 datasets (lerobot 0.3.3) and roboto-to-lerobot-v3_0 writes LeRobot 3.0 datasets (lerobot 0.6.1); only v3_0 supports sharded (parallel) writing.",
+    "description": "Converts Roboto ingested data referenced by a Roboto Collection of events into a LeRobot dataset, one output episode per event in the collection. Which topics become which state, action, and video features is driven entirely by a contract YAML read from the invocation dataset (defaults to 'contract.yaml' at the dataset root) — see https://docs.roboto.ai/reference/roboto-to-lerobot-contract.html for the contract schema and https://docs.roboto.ai/user-guides/convert-to-lerobot.html for the authoring guide. Deployed as two variants with an identical interface: roboto-to-lerobot-v2_1 writes LeRobot 2.1 datasets (lerobot 0.3.3) and roboto-to-lerobot-v3_0 writes LeRobot 3.0 datasets (lerobot 0.7.0); only v3_0 supports sharded (parallel) writing, except with the episode cache, which converts episodes in parallel on both.",
     "compute_requirements": {
         "vCPU": 16384,
         "memory": 65536,
@@ -29,9 +29,20 @@
         },
         {
             "name": "shard_count",
-            "description": "Number of parallel writer shards; each shard independently writes a partial dataset that is then merged (stream-copy, no re-encoding) into the final output. Sharded writing requires lerobot >= 0.5, so only the v3_0 variant acts on it — the v2_1 variant (lerobot 0.3.3) accepts this parameter and ignores it, falling back to a single writer and logging a warning. Sharding also changes episode order: episodes in the merged dataset are grouped by shard rather than strictly chronological, though each episode's original start_time_ns is preserved in the output manifest.",
+            "description": "Number of parallel writer shards; each shard independently writes a partial dataset that is then merged (stream-copy, no re-encoding) into the final output. Sharded writing needs a merge API that lerobot 0.3.x lacks, so without episode_cache only the v3_0 variant acts on it: the v2_1 variant (lerobot 0.3.3) accepts this parameter and ignores it, falling back to a single writer and logging a warning. With episode_cache, both variants use it as the maximum number of processes that convert the episodes missing from the cache. Without episode_cache, sharding also changes episode order: episodes in the merged dataset are grouped by shard rather than strictly chronological, though each episode's original start_time_ns is preserved in the output manifest.",
             "required": false,
             "default": "3"
+        },
+        {
+            "name": "episode_cache",
+            "description": "Set to 'true' to cache each converted episode in the org's assets, so a re-export converts only new or changed events. Caching requires org asset storage to be enabled for your org; where it is not enabled, this parameter has no effect: the action logs a warning and converts every event. Each episode is stored once, as a one-episode LeRobot dataset in '.lerobot-cache/', a hidden folder in the org's assets, keyed by the contract, the converter source, the lerobot version, the event and its source topics. At most shard_count processes convert the episodes missing from the cache, on both variants, and each new entry is uploaded as soon as it is converted. The export then merges cached and new episodes, always in chronological order, and records which episodes came from the cache in the dataset's lineage file, meta/roboto_lineage.json. Leave unset or 'false' to convert every event without the cache. Both variants act on it, each caching episodes in its own LeRobot format (v2.1 or v3.0).",
+            "required": false
+        },
+        {
+            "name": "output_format",
+            "description": "What the export writes into the invocation's folder: 'lerobot' (default) writes the LeRobot dataset to combined/; 'lance' writes its Lance layout to lance/ instead; 'both' writes both. After the LeRobot dataset is built, the converter from the lerobot-lancedb package (which LeRobot's lancedb-convert extra installs) writes the Lance layout, with the same videos, metadata and lineage; it converts the whole dataset on every run, even when the episode cache supplied every episode. The Lance layout is read-only and needs LeRobot >= 0.7.0 to read; training can read it in place from object storage with random access instead of downloading the dataset first, though not from Roboto itself, whose read-only dataset credentials do not allow the listing the Lance reader needs: download lance/ or copy it to a bucket you control. LeRobot's tools cannot edit it, merge it or push it to the Hugging Face Hub; keep the LeRobot dataset ('both') for those. Only roboto-to-lerobot-v3_0 supports 'lance' and 'both'; roboto-to-lerobot-v2_1 fails the run before converting.",
+            "required": false,
+            "default": "lerobot"
         }
     ],
     "requires_downloaded_inputs": false
