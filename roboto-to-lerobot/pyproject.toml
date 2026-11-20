@@ -12,7 +12,11 @@ dependencies = [
     # >= 0.52.0 is where roboto.experimental.video gained its codec registry
     # (resolve_codec / supported_formats); 0.51 was H.264-only. >= 0.61.0 is
     # the first release with Org.assets, where the episode cache lives.
-    "roboto[video] >= 0.61.0",
+    # >= 0.62.0 for session collections: ``SessionFileView`` with
+    # ``dataset_id`` and the wall-clock window / ``unix_epoch_offset_ns``
+    # fields. >= 0.63.0 for ``Session.list_events``, which sub-tasks are read
+    # from.
+    "roboto[video] >= 0.63.0",
     # 0.6 moved datasets/pyarrow/av/torchcodec into the [dataset] extra;
     # 0.3.x has no such extra and lists them as core deps. The Dockerfile and
     # scripts/setup.sh pin the exact version per variant (scripts/variants.sh).

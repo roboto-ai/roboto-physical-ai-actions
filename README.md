@@ -35,7 +35,7 @@ Local invocation runs the same Docker image the hosted platform runs, so behavio
 
 | Directory | What it does |
 |---|---|
-| [`roboto-to-lerobot`](./roboto-to-lerobot/README.md) | Converts data ingested into Roboto into a LeRobot dataset, one episode per event in a Roboto event collection. Which topics become which state, action and video features is declared in a contract YAML. Deployed as two variants: `roboto-to-lerobot-v2_1` (LeRobot 2.1) and `roboto-to-lerobot-v3_0` (LeRobot 3.0). |
+| [`roboto-to-lerobot`](./roboto-to-lerobot/README.md) | Converts data ingested into Roboto into a LeRobot dataset, one episode per event or per session in a Roboto collection of events or of sessions. Which topics become which state, action and video features is declared in a contract YAML. Deployed as two variants: `roboto-to-lerobot-v2_1` (LeRobot 2.1) and `roboto-to-lerobot-v3_0` (LeRobot 3.0). |
 | [`lerobot-merge`](./lerobot-merge/README.md) | Merges the shard outputs of several parallel `roboto-to-lerobot` invocations into one LeRobot dataset, concatenating video by stream copy rather than re-encoding, and writing a single self-contained provenance manifest. |
 | [`training-dataset-metrics`](./training-dataset-metrics/README.md) | Audits the statistical quality of robot training data and emits an HTML plus JSON report with plots, flagging episodes likely to hurt training. Runs either on raw Roboto topics before conversion or on an already-converted LeRobot dataset. |
 | [`enrich-lerobot-dataset`](./enrich-lerobot-dataset/README.md) | A small worked example of adding a derived feature to an existing LeRobot dataset using LeRobot's `add_features`. The shipped example computes the element-wise difference between `action` and `observation.state`. |
@@ -47,7 +47,7 @@ Local invocation runs the same Docker image the hosted platform runs, so behavio
 
 **Before conversion.** `training-dataset-metrics` can audit the raw Roboto topics using the same contract YAML the converter would use, so you can spot stuck sensors, misaligned timing or dead channels before spending compute on a conversion. Video streams are skipped in this mode.
 
-**Conversion.** `roboto-to-lerobot` reads a collection of Roboto events and writes one LeRobot episode per event, driven by the contract. The v3.0 variant can also write in parallel shards within a single invocation.
+**Conversion.** `roboto-to-lerobot` reads a collection of Roboto events or sessions and writes one LeRobot episode per event or session, driven by the contract. The v3.0 variant can also write in parallel shards within a single invocation.
 
 **Fan-out and merge.** For collections too large for one invocation, the pattern is to partition the collection, run several conversions in parallel, and then use `lerobot-merge` to stitch the shard outputs into one dataset whose manifest matches what a single-shot conversion would have produced.
 

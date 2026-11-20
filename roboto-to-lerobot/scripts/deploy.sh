@@ -143,9 +143,9 @@ deploy_variant() {
 
 if [[ "$VARIANT" == "v2_1" || "$VARIANT" == "all" ]]; then
     deploy_variant "$LEROBOT_V2_1_VERSION" roboto-to-lerobot-v2_1 \
-        "Converts a Roboto Collection of events into a LeRobot 2.1 dataset (lerobot ${LEROBOT_V2_1_VERSION}), one episode per event, driven by a contract YAML in the invocation dataset."
+        "Converts a Roboto Collection of events or sessions into a LeRobot 2.1 dataset (lerobot ${LEROBOT_V2_1_VERSION}), one episode per event or session, driven by a contract YAML in the invocation dataset."
 fi
 if [[ "$VARIANT" == "v3_0" || "$VARIANT" == "all" ]]; then
     deploy_variant "$LEROBOT_V3_0_VERSION" roboto-to-lerobot-v3_0 \
-        "Converts a Roboto Collection of events into a LeRobot 3.0 dataset (lerobot ${LEROBOT_V3_0_VERSION}), one episode per event, driven by a contract YAML in the invocation dataset; supports sharded parallel writing via shard_count."
+        "Converts a Roboto Collection of events or sessions into a LeRobot 3.0 dataset (lerobot ${LEROBOT_V3_0_VERSION}), one episode per event or session, driven by a contract YAML in the invocation dataset; supports sharded parallel writing via shard_count."
 fi

@@ -202,7 +202,7 @@ class _Harness:
         monkeypatch.setattr(episode_cache, "download_refs", _copy_refs)
 
     def _worker_init(self, descriptors_by_ds, contracts_by_ds) -> None:
-        event_worker._WORKER_STATE["topics"] = {_DS: self.topics}
+        event_worker._WORKER_STATE["topics"] = dict.fromkeys(contracts_by_ds, self.topics)
         event_worker._WORKER_STATE["contracts"] = contracts_by_ds
 
     def _spawn_inline(self, *, chunks_drain, chunks_tasks, shard_workdir, on_episodes, **kwargs):
