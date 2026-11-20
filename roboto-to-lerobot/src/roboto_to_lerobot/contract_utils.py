@@ -714,8 +714,19 @@ def collect_topics_from_dataset(
     raw: dict[str, list[tuple[roboto.Topic, str]]] = {}
     files_scanned = 0
 
+    # List the dataset's topics once to find the files that hold a contract
+    # topic, then list topics per file (one call per file) only for those
+    # files. The per-file listing is still needed because only it returns the
+    # topics' message paths. Files without a contract topic, such as earlier
+    # exports uploaded into the dataset, cost no per-file call. The SDK applies
+    # ``include`` on the client, so the dataset-wide listing pages through
+    # every topic in the dataset.
+    contract_file_ids = {t.file_id for t in dataset.get_topics(include=sorted(contract_topics))}
+
     for file in dataset.list_files():
         files_scanned += 1
+        if file.file_id not in contract_file_ids:
+            continue
         for topic in file.get_topics():
             if topic.name in contract_topics:
                 raw.setdefault(topic.name, []).append((topic, file.relative_path))

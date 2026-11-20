@@ -6,8 +6,9 @@ ARG OS_VARIANT=slim-bookworm
 # images never rely on the default. The default exists for the two paths
 # that cannot pass a build arg at all: a bare `docker build`, and
 # `roboto actions invoke-local` against this directory. Both therefore
-# build the v3_0 variant. Keep in step with deploy.sh's LEROBOT_V3_0_VERSION.
-ARG LEROBOT_VERSION=0.6.1
+# build the v3_0 variant. Keep in step with LEROBOT_V3_0_VERSION in
+# scripts/variants.sh.
+ARG LEROBOT_VERSION=0.7.0
 ARG PY_BASE=public.ecr.aws/docker/library/python:${PYTHON_MAJOR}.${PYTHON_MINOR}-${OS_VARIANT}
 
 
@@ -35,25 +36,30 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/
-COPY pyproject.toml ./
+COPY pyproject.toml scripts/lerobot_pins.sh ./
 
-# CPU-only torch wheel from the PyTorch CPU index. Installed before lerobot
-# so lerobot doesn't pull the default CUDA-enabled torch (~2 GB).
-RUN uv pip install --system --index-url https://download.pytorch.org/whl/cpu torch
+# CPU-only torch wheels from the PyTorch CPU index. Installed before lerobot
+# so lerobot doesn't pull the default CUDA-enabled torch (~2 GB) from PyPI.
+# That works only while the versions that lerobot_pins.sh picks satisfy
+# lerobot's torch caps.
+RUN uv pip install --system --index-url https://download.pytorch.org/whl/cpu \
+        $(sh lerobot_pins.sh torch "${LEROBOT_VERSION}")
 
-# Pin lerobot to the variant we're building. pyproject.toml declares the
-# loose ``lerobot >=0.3.3,<0.7`` so the install below satisfies that pin
-# without a version conflict, and only this layer rebuilds when
-# LEROBOT_VERSION changes.
+# Pin lerobot to the variant being built; pyproject.toml accepts any
+# ``lerobot >=0.3.3,<0.8``.
 RUN if [ -z "${LEROBOT_VERSION}" ]; then \
         echo "ERROR: --build-arg LEROBOT_VERSION is required" >&2; \
         exit 1; \
     fi && \
     uv pip install --system "lerobot==${LEROBOT_VERSION}"
 
-# Install everything else. lerobot is already satisfied so it stays at the
-# pinned version above.
-RUN uv pip install --system -r pyproject.toml
+# Install pyproject.toml's dependencies with the lerobot extras and uv
+# overrides from lerobot_pins.sh. lerobot is requested again at the pinned
+# version because, on a conflict, uv would otherwise install another lerobot
+# version instead of failing.
+RUN sh lerobot_pins.sh overrides "${LEROBOT_VERSION}" > /tmp/overrides.txt && \
+    uv pip install --system --overrides /tmp/overrides.txt -r pyproject.toml \
+        "lerobot[$(sh lerobot_pins.sh extras "${LEROBOT_VERSION}")]==${LEROBOT_VERSION}"
 
 
 # =====================================================================

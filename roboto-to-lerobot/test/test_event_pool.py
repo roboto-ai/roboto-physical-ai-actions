@@ -8,8 +8,8 @@ This file covers the pieces that compose into that integration:
 * :func:`materialize_deferred` — decode + resize parity with the inline path.
 * ``generate_frames(defer_image_decode=True)`` — emits sentinels for video
   keys and numpy arrays for everything else.
-* ``_worker_init`` — reconstructs Topic objects via ``Topic.from_id`` and
-  stashes them keyed by dataset id.
+* ``_worker_init`` — builds Topic objects from the records the main process
+  ships, without an API call, and stashes them keyed by dataset id.
 * Drain-order semantics — the orchestration loop receives episodes in
   ``event_idx`` order even when workers finish out of order.
 
@@ -21,14 +21,16 @@ patched ``_worker_build_episode`` is enough to assert the drain order.
 
 from __future__ import annotations
 
+import pickle
 from concurrent.futures import Future
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
 
 import cv2
 import numpy as np
 import pandas as pd
 import pytest
+import roboto
 from roboto_to_lerobot.contract_utils import (
     AlignSpec,
     Contract,
@@ -37,7 +39,6 @@ from roboto_to_lerobot.contract_utils import (
 from roboto_to_lerobot.event_worker import (
     _WORKER_STATE,
     EventTask,
-    TopicDescriptor,
     WorkerEpisode,
     _worker_init,
     topic_descriptors_from_topics,
@@ -274,54 +275,79 @@ def test_generate_frames_no_defer_decodes_inline():
 
 
 # ---------------------------------------------------------------------------
-# _worker_init: reconstructs Topic objects keyed by dataset id, one
-# ``Topic.from_id`` call per descriptor.
+# _worker_init: builds the main process's Topic objects in the worker without
+# an API call.
 # ---------------------------------------------------------------------------
 
 
-def test_worker_init_calls_from_id_for_each_descriptor(monkeypatch):
-    _WORKER_STATE.clear()
-    calls: list[str] = []
+class _CallLogClient:
+    """``RobotoClient`` stand-in that logs each GET path and answers topic
+    lookups from the records it holds."""
 
-    def fake_from_id(topic_id: str, *, roboto_client=None):
-        calls.append(topic_id)
-        return MagicMock(topic_id=topic_id, name=f"topic-{topic_id}")
+    def __init__(self, records: list[roboto.TopicRecord]) -> None:
+        self.calls: list[str] = []
+        self._records = {r.topic_id: r for r in records}
 
-    monkeypatch.setattr("roboto.Topic.from_id", staticmethod(fake_from_id))
-    monkeypatch.setattr(
-        "roboto.RobotoClient.defaulted",
-        staticmethod(lambda: MagicMock(name="client")),
-    )
+    def get(self, path: str, **_kwargs: Any) -> SimpleNamespace:
+        self.calls.append(path)
+        record = self._records[path.rsplit("/", 1)[-1]]
+        return SimpleNamespace(to_record=lambda _cls: record)
 
-    descriptors = {
-        "ds_a": {
-            "/state": [TopicDescriptor(
-                topic_id="t1", file_id="f1", topic_name="/state",
-                start_time_ns=0, end_time_ns=10**9, message_count=10,
-            )],
-            "/cmd": [TopicDescriptor(
-                topic_id="t2", file_id="f1", topic_name="/cmd",
-                start_time_ns=0, end_time_ns=10**9, message_count=10,
-            )],
-        },
-        "ds_b": {
-            "/state": [TopicDescriptor(
-                topic_id="t3", file_id="f2", topic_name="/state",
-                start_time_ns=0, end_time_ns=10**9, message_count=10,
-            )],
-        },
+
+def _topic_record(topic_id: str, name: str, file_id: str) -> roboto.TopicRecord:
+    stamp = {"created": "2026-01-01T00:00:00Z", "created_by": "u", "modified": "2026-01-01T00:00:00Z",
+             "modified_by": "u", "org_id": "og_test"}
+    return roboto.TopicRecord.model_validate({
+        **stamp,
+        "association": {"association_id": file_id, "association_type": "file", "association_version": 2},
+        "topic_id": topic_id, "topic_name": name,
+        "start_time": 0, "end_time": 10**9, "message_count": 10, "schema_checksum": "sha",
+        "message_paths": [{
+            **stamp, "message_path_id": f"mp_{topic_id}", "topic_id": topic_id, "message_path": "position",
+            "source_path": "position", "path_in_schema": ["position"],
+            "data_type": "float64[]", "canonical_data_type": "array",
+        }],
+    })
+
+
+def _records_by_name(
+    topics_by_ds: dict[str, dict[str, list[roboto.Topic]]],
+) -> dict[str, dict[str, list[roboto.TopicRecord]]]:
+    return {ds: {name: [t.record for t in topics] for name, topics in by_name.items()}
+            for ds, by_name in topics_by_ds.items()}
+
+
+def test_worker_init_builds_the_main_process_topics_without_api_calls(monkeypatch):
+    # Arrange
+    records = [
+        _topic_record("t1", "/state", "f1"),
+        _topic_record("t2", "/state", "f2"),
+        _topic_record("t3", "/cmd", "f1"),
+        _topic_record("t4", "/state", "f3"),
+    ]
+    client = _CallLogClient(records)
+    monkeypatch.setattr("roboto.RobotoClient.defaulted", staticmethod(lambda *_: client))
+    topics_by_ds = {
+        "ds_a": {"/state": [roboto.Topic(r, roboto_client=client) for r in records[:2]],
+                 "/cmd": [roboto.Topic(records[2], roboto_client=client)]},
+        "ds_b": {"/state": [roboto.Topic(records[3], roboto_client=client)]},
     }
     contract = Contract(
         name="t", version=1, fps=30, action_lead_steps=0,
         observations=[], videos=[], actions=[], tasks=[], robot_type=None,
     )
-    _worker_init(descriptors, {"ds_a": contract, "ds_b": contract})
+    contracts = {"ds_a": contract, "ds_b": contract}
+    descriptors = {ds: topic_descriptors_from_topics(topics) for ds, topics in topics_by_ds.items()}
+    _WORKER_STATE.clear()
 
-    assert sorted(calls) == ["t1", "t2", "t3"]
-    assert set(_WORKER_STATE["topics"]) == {"ds_a", "ds_b"}
-    assert set(_WORKER_STATE["topics"]["ds_a"]) == {"/state", "/cmd"}
-    assert len(_WORKER_STATE["topics"]["ds_b"]["/state"]) == 1
-    assert _WORKER_STATE["contracts"]["ds_a"] is contract
+    # Act
+    # The pool pickles the initializer's arguments into each spawned worker.
+    _worker_init(*pickle.loads(pickle.dumps((descriptors, contracts))))
+
+    # Assert
+    assert client.calls == []
+    assert _records_by_name(_WORKER_STATE["topics"]) == _records_by_name(topics_by_ds)
+    assert _WORKER_STATE["contracts"] == contracts
 
 
 # ---------------------------------------------------------------------------
@@ -364,10 +390,8 @@ def test_drain_loop_preserves_event_order_when_futures_complete_out_of_order():
 
 
 def test_event_task_round_trips_through_pickle():
-    """``EventTask`` / ``TopicDescriptor`` / ``WorkerEpisode`` cross the
+    """``EventTask`` / ``WorkerEpisode`` cross the
     multiprocessing pipe — they must pickle cleanly."""
-    import pickle
-
     task = EventTask(
         event_idx=3,
         event_id="ev_abc",
@@ -378,10 +402,6 @@ def test_event_task_round_trips_through_pickle():
         num_frames=30,
         buffer_ns=int(1e9),
         action_lead_ns=0,
-    )
-    td = TopicDescriptor(
-        topic_id="t1", file_id="f1", topic_name="/state",
-        start_time_ns=0, end_time_ns=10**9, message_count=10,
     )
     deferred = _DeferredFrame(
         video_key="observation.images.cam",
@@ -399,9 +419,8 @@ def test_event_task_round_trips_through_pickle():
         }],
     )
 
-    # NamedTuples compare element-wise — fine for tasks + descriptors.
-    for obj in (task, td):
-        assert pickle.loads(pickle.dumps(obj)) == obj
+    # NamedTuples compare element-wise.
+    assert pickle.loads(pickle.dumps(task)) == task
 
     # WorkerEpisode's ``frames`` carry numpy arrays, so unpick the structure
     # and compare field-by-field with numpy-aware assertions.
@@ -416,25 +435,6 @@ def test_event_task_round_trips_through_pickle():
     )
     assert rt_frame["observation.images.cam"] == deferred
     assert rt_frame["task"] == "grab-block"
-
-
-def test_topic_descriptors_from_topics_projects_attribute_subset():
-    """``topic_descriptors_from_topics`` reads attributes off arbitrary
-    Topic-shaped objects so the orchestrator stays free of roboto SDK
-    internals during descriptor extraction."""
-    # ``MagicMock(name=...)`` clobbers the mock's own internal ``.name``;
-    # set the data attribute explicitly so the descriptor reads our value
-    # instead of the mock's auto-generated identifier.
-    topic = MagicMock(
-        topic_id="t1", file_id="f1",
-        start_time=0, end_time=10**9, message_count=10,
-    )
-    topic.name = "/state"
-    out = topic_descriptors_from_topics({"/state": [topic]})
-    assert out == {"/state": [TopicDescriptor(
-        topic_id="t1", file_id="f1", topic_name="/state",
-        start_time_ns=0, end_time_ns=10**9, message_count=10,
-    )]}
 
 
 # ---------------------------------------------------------------------------

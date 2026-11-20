@@ -27,7 +27,7 @@ dataset format:
 | Action name              | LeRobot package | LeRobot dataset format |
 |--------------------------|-----------------|------------------------|
 | `roboto-to-lerobot-v2_1`   | `lerobot==0.3.x` | 2.1                    |
-| `roboto-to-lerobot-v3_0`   | `lerobot==0.6.x` | 3.0                    |
+| `roboto-to-lerobot-v3_0`   | `lerobot==0.7.x` | 3.0                    |
 
 There is one `src/` tree. The variants differ only by the lerobot version
 baked into the image at build time, via the `LEROBOT_VERSION` build arg — so
@@ -45,6 +45,9 @@ version-to-variant mapping lives in [`scripts/variants.sh`](scripts/variants.sh)
   - [Running](#running)
     - [Local Invocation](#local-invocation)
     - [Hosted Invocation](#hosted-invocation)
+- [Lineage](#lineage)
+- [Lance output](#lance-output)
+- [LeRobot 0.7 in roboto-to-lerobot-v3_0](#lerobot-07-in-roboto-to-lerobot-v3_0)
 - [Authoring a contract](#authoring-a-contract)
 - [Development](#development)
 - [Deployment](#deployment)
@@ -82,7 +85,9 @@ $ .venv/bin/roboto users whoami
 | `contract`      | no       | `contract.yaml` (auto-discovered) | Path to the contract YAML inside the invocation dataset. Describes the topics, alignment, and transforms used to build each episode. See [CONTRACT.md](CONTRACT.md) for the full schema, or [`contract_demo_reassemble.yaml`](example_notebook/contract_demo_reassemble.yaml) for a worked example. |
 | `pool_size`     | no       | auto-sized | Worker processes that read and process events in parallel, per shard. Left unset it auto-sizes to `min(16, cpu_count / shard_count)` — on the default 16-vCPU compute with `shard_count=3` that is `5`. Any explicit value is used verbatim and is not capped. |
 | `encoder_threads` | no     | `2` (built in) | Level of parallelism given to the SVT-AV1 video encoder, per camera stream. Must be `>= 2`: lower values risk the encoder's internal frame queue overflowing under bursty writes, silently dropping frames from the output video. Left unset it uses the built-in `2`. Only `roboto-to-lerobot-v3_0` acts on it; `roboto-to-lerobot-v2_1` (lerobot 0.3.3) accepts it and silently ignores it, having no equivalent knob. |
-| `shard_count`   | no       | `3`     | Parallel writer shards. Each shard writes a partial dataset independently, and the shards are then merged by stream-copy with no re-encoding. Sharded writing needs `lerobot.datasets.aggregate.aggregate_datasets`, which is lerobot 0.6.x only, so only `roboto-to-lerobot-v3_0` acts on it — `roboto-to-lerobot-v2_1` accepts it and ignores it, falling back to a single writer and logging a warning. Sharding also groups the merged dataset's episodes by shard rather than strictly chronologically; each episode's original `start_time_ns` is preserved in the output manifest. |
+| `shard_count`   | no       | `3`     | Parallel writer shards. Each shard writes a partial dataset independently, and the shards are then merged by stream-copy with no re-encoding. Sharded writing needs `lerobot.datasets.aggregate.aggregate_datasets`, which lerobot 0.3.x lacks, so without the episode cache only `roboto-to-lerobot-v3_0` acts on it: `roboto-to-lerobot-v2_1` accepts it and ignores it, falling back to a single writer and logging a warning. With `episode_cache=true`, both variants use it as the maximum number of processes that convert the episodes missing from the cache. Without the episode cache, sharding also groups the merged dataset's episodes by shard rather than strictly chronologically; each episode's original `start_time_ns` is preserved in the output manifest. |
+| `episode_cache` | no | `false` | Set to `true` to cache each converted episode in the org's assets, so a re-export converts only new or changed events. Caching requires org asset storage to be enabled for your org; where it is not enabled, this parameter has no effect: the action logs a warning and converts every event. Each episode is stored once, as a one-episode LeRobot dataset at `.lerobot-cache/<recipe_hash>/<episode_key>/`, a hidden folder in the org's assets. The recipe hash covers the contract, the converter source, the lerobot version and the output features. The episode key covers the event (id, bounds, task, source dataset) and the source topics it reads, so an edited event or a re-uploaded file is converted again. At most `shard_count` processes convert the episodes missing from the cache, and each new entry is uploaded as soon as it is converted. The export then merges cached and new episodes in chronological order without re-encoding: `roboto-to-lerobot-v3_0` stream-copies them into its packed files, and `roboto-to-lerobot-v2_1` moves each episode's files into place and renumbers the episode. The dataset's [lineage](#lineage) records which episodes came from the cache. Both variants act on it, each caching episodes in its own LeRobot format. |
+| `output_format` | no | `lerobot` | `lerobot` writes the LeRobot dataset to `combined/`; `lance` writes its [Lance layout](#lance-output) to `lance/` instead; `both` writes both. Only `roboto-to-lerobot-v3_0` supports `lance` and `both`; `roboto-to-lerobot-v2_1` fails the run before converting. |
 
 ### Running
 
@@ -147,6 +152,95 @@ Full usage:
 ```bash
 $ .venv/bin/roboto actions invoke --help
 ```
+
+## Lineage
+
+Every export records where its episodes came from inside the LeRobot
+dataset's `meta/` folder, which travels with the dataset when you copy it or
+convert it to Lance:
+
+- `meta/roboto_lineage.json` (both variants) names the invocation, the
+  collection and its version, the contract (name, version, sha256), the
+  lerobot version and the recipe hash, and lists each episode's event id,
+  source dataset id, start and end time in nanoseconds, and whether it came
+  from the episode cache (with its `episode_key` when the cache was on).
+- In a `roboto-to-lerobot-v3_0` dataset, the episode metadata also has the
+  columns `roboto/event_id`, `roboto/source_dataset_id`,
+  `roboto/start_time_ns`, `roboto/end_time_ns`, `roboto/cache_hit` and
+  `roboto/recipe_hash`, so LeRobot can select episodes by their source:
+
+  ```python
+  from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+  ds = LeRobotDataset(
+      "my-export", root="combined",
+      episode_filter=lambda ep: ep["roboto/source_dataset_id"] == "<DATASET_ID>",
+  )
+  ```
+
+  The columns survive LeRobot 0.7's `aggregate_datasets` and the Lance
+  converter; `meta/roboto_lineage.json` survives only the Lance converter.
+  LeRobot's `delete_episodes` and `split_dataset` keep neither.
+
+The invocation folder also has a `manifest.json`, which maps each episode
+to its event.
+
+## Lance output
+
+With `output_format=lance` or `both`, `roboto-to-lerobot-v3_0` writes the
+dataset in LeRobot's Lance storage format to `lance/`, instead of or next to
+the LeRobot dataset in `combined/`.
+After the LeRobot dataset is built (with or without the episode cache), the
+action converts it with the converter from the
+[`lerobot-lancedb`](https://github.com/lancedb/lerobot-lancedb) package,
+which LeRobot's `lancedb-convert` extra installs (its command-line form is
+`lerobot-lance-convert`). The converter copies `meta/` (with the
+[lineage](#lineage)), stores the frames in one Lance table and the bytes of
+every video file, unchanged, in another, so the Lance layout is about the
+size of the LeRobot dataset. It converts the whole dataset on every export,
+even when the episode cache supplied every episode.
+
+- **Reading.** Reading the Lance layout needs LeRobot >= 0.7.0, with
+  torchcodec for the videos:
+  `LeRobotDataset("<name>", root="<local path or fsspec URI such as s3://...>")`
+  picks the Lance reader from `meta/info.json` (`"storage_format": "lance"`).
+- **Training from object storage.** A training job can read the Lance layout in
+  place from object storage with random access (a global shuffle) instead of
+  downloading it first. The Lance reader lists the dataset's files, which the
+  read-only credentials Roboto issues for a dataset do not allow, so it
+  cannot read the copy in Roboto in place: download `lance/`, or copy it to a
+  bucket you control, and read it from there.
+- **Read-only.** LeRobot's `push_to_hub`, `aggregate_datasets` and dataset
+  editing tools work only on the LeRobot dataset, so keep it (`both`) if you
+  need them.
+
+## LeRobot 0.7 in roboto-to-lerobot-v3_0
+
+`roboto-to-lerobot-v3_0` writes its datasets with `lerobot==0.7.0`; it wrote
+them with 0.6.1 before. The dataset format is still LeRobot 3.0, so datasets
+from either version load in both.
+
+- **The episode cache fills again once.** The recipe hash covers the lerobot
+  version, so the first export after the upgrade finds none of the entries
+  0.6.1 wrote and converts every event; later exports hit the new entries.
+  The old entries stay in `.lerobot-cache/` until you delete them.
+- **Merged quantiles are wider.** LeRobot computes quantiles (`q01`, `q10`,
+  `q50`, `q90`, `q99`) per episode. To combine them into `meta/stats.json`,
+  0.6 averaged each quantile across episodes, weighted by frame count; 0.7
+  takes the envelope instead: each lower quantile (`q01`, `q10`, `q50`) is
+  the smallest across episodes and each upper one (`q90`, `q99`) the largest.
+  Over many episodes `q01` and `q99` come close to `min` and `max`, and
+  `q50` is the smallest episode median, not a median of the dataset. This
+  changes training only for policies that normalize with `QUANTILES`
+  (`q01`/`q99`, for example pi0.5) or `QUANTILE10` (`q10`/`q90`);
+  `MEAN_STD` and `MIN_MAX` use `mean`, `std`, `min` and `max`, which keep
+  their meaning. Every export path (one writer, shards, the episode cache)
+  combines episodes the same way, so the same events give the same stats
+  either way. To normalize with dataset-wide quantiles instead, compute
+  them from the data before training.
+- **Per-episode statistics are computed in float64.** 0.6 computed them in
+  float32, which could put the `std` of a nearly constant dimension off by
+  an order of magnitude.
 
 ## Authoring a contract
 

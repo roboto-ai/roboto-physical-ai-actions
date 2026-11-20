@@ -1,6 +1,6 @@
-"""Adapter for lerobot 0.6.x (LeRobot dataset format 3.0).
+"""Adapter for lerobot 0.6.x and 0.7.x (LeRobot dataset format 3.0).
 
-API differences vs 0.3.x that this adapter papers over:
+API differences from 0.3.x that this adapter handles:
 - ``LeRobotDataset.add_frame`` reads ``task`` from the frame dict; passing it
   as a kwarg is rejected.
 - ``LeRobotDataset.finalize()`` must be called once after the last episode
@@ -21,7 +21,7 @@ _VCODEC: Final[str] = "libsvtav1"
 
 
 class LeRobotWriter:
-    """0.6.x adapter — see :class:`roboto_to_lerobot.writers.base.LeRobotWriter`."""
+    """0.6.x and 0.7.x adapter — see :class:`roboto_to_lerobot.writers.base.LeRobotWriter`."""
 
     def __init__(self, dataset: Any) -> None:
         self._dataset = dataset
@@ -63,9 +63,8 @@ class LeRobotWriter:
         return cls(dataset)
 
     def add_frame(self, frame: dict[str, Any], task: str) -> None:
-        # 0.6.x reads ``task`` from the frame dict. The explicit kwarg wins
-        # over any pre-existing ``task`` key so the writer stays the single
-        # source of truth.
+        # lerobot 0.6 and later read ``task`` from the frame dict. The
+        # ``task`` argument replaces any ``task`` key already in ``frame``.
         frame_with_task = {**frame, "task": task}
         self._dataset.add_frame(frame_with_task)
 

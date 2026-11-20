@@ -11,9 +11,9 @@ the resulting frame list back to the main process, which serialises
    still works because subprocesses inherit env vars and
    ``RobotoClient.defaulted()`` re-reads the on-disk config inside
    ``_worker_init``.
-2. ``_worker_init`` reconstructs ``roboto.Topic`` objects from
-   ``TopicDescriptor`` payloads via ``Topic.from_id`` — one HTTP GET per
-   topic per worker, amortised across every event that worker processes.
+2. ``_worker_init`` builds ``roboto.Topic`` objects from the topic records
+   the main process already holds, shipped as ``TopicDescriptor`` payloads,
+   so a worker makes no API call to start.
 3. ``_worker_build_episode`` runs the full ``DataCollection`` +
    ``generate_frames`` pipeline with ``defer_image_decode=True``, so video
    keys travel back across IPC as ``_DeferredFrame`` sentinels carrying raw
@@ -27,7 +27,6 @@ arrays (observations / actions) are small enough to pickle as-is.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -35,7 +34,6 @@ import pandas as pd
 import roboto
 
 from .contract_utils import (
-    _TOPIC_FETCH_THREADS,
     Contract,
     DataCollection,
     fps_to_time_step_ns,
@@ -43,31 +41,18 @@ from .contract_utils import (
 )
 from .lerobot import generate_frames
 
-# Concurrency cap for the per-worker ``Topic.from_id`` storm. Spawn-mode
-# workers don't inherit the parent's connection pool, so every ``from_id``
-# pays full TLS + RTT; serialising N of them makes warm-up latency-bound
-# in N rather than in one round-trip. Reusing the per-event topic-fetch
-# thread budget keeps the global socket ceiling at
-# ``pool_size × _TOPIC_FETCH_THREADS`` whether init or a steady-state
-# fetch wave is active, not the sum of both.
-_WORKER_INIT_THREADS = _TOPIC_FETCH_THREADS
-
 
 class TopicDescriptor(NamedTuple):
-    """Picklable subset of ``roboto.Topic`` state needed to fetch fresh.
+    """Picklable form of one ``roboto.Topic``: its record as JSON-shaped data.
 
-    ``Topic.from_id`` returns a fully-functional Topic given just the id, so
-    the descriptor only has to carry enough metadata for the work-list
-    pre-filter (``_topic_intersects_window``) plus a stable file/topic id pair
-    for logging. The actual fetch pulls data over the wire.
+    The main process already holds the full record of every contract topic,
+    listed while matching the contract against the dataset's files. Shipping
+    those records lets each worker build the same ``Topic`` objects without
+    an API call. Fetching each topic again would cost one call per topic per
+    worker, which adds up on recordings chunked across many files.
     """
 
-    topic_id: str
-    file_id: str | None
-    topic_name: str
-    start_time_ns: int | None
-    end_time_ns: int | None
-    message_count: int | None
+    record: dict[str, Any]
 
 
 class EventTask(NamedTuple):
@@ -107,47 +92,23 @@ def _worker_init(
     descriptors_by_ds: dict[str, dict[str, list[TopicDescriptor]]],
     contracts_by_ds: dict[str, Contract],
 ) -> None:
-    """Reconstruct per-worker ``Topic`` objects and stash them on the module.
+    """Build per-worker ``Topic`` objects and stash them on the module.
 
-    Issues one HTTP GET per (ds_id, topic_id), fanned out across a
-    ``ThreadPoolExecutor`` so warm-up cost scales with one round-trip
-    rather than with descriptor count. The thread budget is capped at
-    ``_TOPIC_FETCH_THREADS`` so init and steady-state event fetches share
-    the same per-worker socket ceiling.
+    Makes no API call: each ``Topic`` is built from the record its
+    descriptor carries, against this worker's own ``RobotoClient``, which
+    later fetches the topic's data.
     """
     client = roboto.RobotoClient.defaulted()
-
-    # Flatten so one thread pool parallelises across datasets, topic names,
-    # and chunked descriptors at once rather than per-bucket.
-    work: list[tuple[str, str, int, TopicDescriptor]] = []
-    for ds_id, by_name in descriptors_by_ds.items():
-        for name, descriptors in by_name.items():
-            for idx, descriptor in enumerate(descriptors):
-                work.append((ds_id, name, idx, descriptor))
-
-    topics_by_ds: dict[str, dict[str, list[roboto.Topic | None]]] = {
+    _WORKER_STATE["topics"] = {
         ds_id: {
-            name: [None] * len(descriptors) for name, descriptors in by_name.items()
+            name: [
+                roboto.Topic(roboto.TopicRecord.model_validate(d.record), roboto_client=client)
+                for d in descriptors
+            ]
+            for name, descriptors in by_name.items()
         }
         for ds_id, by_name in descriptors_by_ds.items()
     }
-
-    if work:
-        max_workers = min(_WORKER_INIT_THREADS, len(work))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(
-                    roboto.Topic.from_id,
-                    descriptor.topic_id,
-                    roboto_client=client,
-                ): (ds_id, name, idx)
-                for ds_id, name, idx, descriptor in work
-            }
-            for fut in futures:
-                ds_id, name, idx = futures[fut]
-                topics_by_ds[ds_id][name][idx] = fut.result()
-
-    _WORKER_STATE["topics"] = topics_by_ds
     _WORKER_STATE["contracts"] = contracts_by_ds
 
 
@@ -218,25 +179,10 @@ class WorkerEpisode(NamedTuple):
 
 
 def topic_descriptors_from_topics(
-    topics_dict: dict[str, list[Any]],
+    topics_dict: dict[str, list[roboto.Topic]],
 ) -> dict[str, list[TopicDescriptor]]:
-    """Project a ``{name: [Topic, ...]}`` mapping to picklable descriptors.
-
-    Pulled out of the orchestrator so the test for ``_worker_init`` can
-    feed it a parallel structure of stubs and check the reconstruction
-    behaviour without going through Roboto.
-    """
-    out: dict[str, list[TopicDescriptor]] = {}
-    for name, topic_list in topics_dict.items():
-        out[name] = [
-            TopicDescriptor(
-                topic_id=t.topic_id,
-                file_id=getattr(t, "file_id", None),
-                topic_name=getattr(t, "name", name),
-                start_time_ns=getattr(t, "start_time", None),
-                end_time_ns=getattr(t, "end_time", None),
-                message_count=getattr(t, "message_count", None),
-            )
-            for t in topic_list
-        ]
-    return out
+    """Project a ``{name: [Topic, ...]}`` mapping to picklable descriptors."""
+    return {
+        name: [TopicDescriptor(record=t.record.model_dump(mode="json")) for t in topic_list]
+        for name, topic_list in topics_dict.items()
+    }

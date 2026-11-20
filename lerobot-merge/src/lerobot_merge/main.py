@@ -372,7 +372,11 @@ def _run_aggregate(
     merged_root: pathlib.Path,
     aggregate_kwargs: dict,
 ) -> dict:
-    """Call ``lerobot.datasets.aggregate.aggregate_datasets`` and read merged info."""
+    """Call ``lerobot.datasets.aggregate.aggregate_datasets`` and read merged info.
+
+    :func:`_restat_numbering` corrects the merged ``stats.json`` before the
+    info is read; ``aggregate_elapsed_s`` includes that step.
+    """
     # Imported lazily so the action's module imports stay cheap during cold start.
     from lerobot.datasets.aggregate import aggregate_datasets
 
@@ -389,6 +393,7 @@ def _run_aggregate(
         aggr_root=merged_root,
         **aggregate_kwargs,
     )
+    _restat_numbering(merged_root)
     elapsed = time.monotonic() - t0
     logger.info("aggregate_datasets finished in %.1fs", elapsed)
 
@@ -404,6 +409,41 @@ def _run_aggregate(
         "codebase_version": info.get("codebase_version"),
         "aggregate_elapsed_s": elapsed,
     }
+
+
+def _restat_numbering(dataset_root: pathlib.Path) -> None:
+    """Recompute the ``stats.json`` entries of ``episode_index``, ``index`` and ``task_index`` after a merge.
+
+    ``aggregate_datasets`` renumbers these columns in the data, but builds
+    ``stats.json`` by combining the shards' own ``stats.json`` files, which
+    describe each shard's numbering from 0: a merge of two shards of two
+    episodes each gets an ``episode_index`` maximum of 1.
+
+    A writer that saves every episode into one dataset instead combines its
+    stats so far with each episode's stats as it saves that episode
+    (``aggregate_stats([stats, episode_stats])``). This function repeats
+    those steps with lerobot's functions, over the merged data in episode
+    order, so the three entries equal those that such a writer produces for
+    the merged episodes. Every other entry is left as it is.
+
+    roboto-to-lerobot keeps a copy of this function for lerobot 0.7, whose
+    ``load_info`` returns a ``DatasetInfo`` instead of a dict; the two
+    packages are deployed separately and cannot import each other.
+    """
+    import pandas as pd
+    from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
+    from lerobot.datasets.io_utils import load_info, load_stats, write_stats
+
+    columns = ["episode_index", "index", "task_index"]
+    features = load_info(dataset_root)["features"]
+    stats = None
+    # Each data file holds whole episodes, and the files are numbered in
+    # episode order, so the sorted paths list the episodes in order.
+    for path in sorted((dataset_root / "data").glob("*/*.parquet")):
+        for _, episode in pd.read_parquet(path, columns=columns).groupby("episode_index", sort=True):
+            episode_stats = compute_episode_stats({c: episode[c].to_numpy() for c in columns}, features)
+            stats = episode_stats if stats is None else aggregate_stats([stats, episode_stats])
+    write_stats({**load_stats(dataset_root), **stats}, dataset_root)
 
 
 def _assemble_manifest(

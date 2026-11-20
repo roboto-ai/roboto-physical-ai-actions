@@ -1,20 +1,35 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
+import importlib.util
 import json
 import multiprocessing as mp
 import os
+import resource
 import shutil
+import ssl
+import tempfile
+import time
 import traceback
+import urllib.error
 from collections import Counter, defaultdict
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from importlib.metadata import version as _pkg_version
+from multiprocessing.connection import wait as _wait_for_processes
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import pandas as pd
 import roboto
+from roboto.exceptions import (
+    RobotoFeatureNotAvailableException,
+    RobotoServiceException,
+    RobotoServiceUnavailableException,
+)
 from roboto.updates import MetadataChangeset
 
 from .contract_utils import (
@@ -28,6 +43,14 @@ from .contract_utils import (
     resolve_role_bindings,
     resolve_task_label,
 )
+from .episode_cache import (
+    MARKER_NAME,
+    EpisodeCache,
+    entry_path,
+    episode_key,
+    episode_summary,
+    recipe_hash,
+)
 from .event_worker import (
     EventTask,
     WorkerEpisode,
@@ -37,12 +60,19 @@ from .event_worker import (
 )
 from .lerobot import generate_frames, materialize_deferred
 from .logger import logger
+from .merge_v21 import merge_v21_entries
 from .stderr_filter import (
     disable_progress_bars,
     install_svt_stderr_filter,
     set_libav_log_level,
 )
 from .writers import LeRobotWriter
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from multiprocessing.connection import Connection
+
+    from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 
 # Writer-encoder knobs forwarded to ``LeRobotDataset.create``. The v2_1
 # adapter accepts the same kwargs and silently drops 0.6.x-only ones, so
@@ -108,6 +138,30 @@ _SHARD_COUNT_ENV = "ROBOTO_TO_LEROBOT_SHARD_COUNT"
 # the head-of-line future while workers continue churning. Resident memory
 # peaks around (pool_size + this) × episode_payload_size.
 _POOL_IN_FLIGHT_HEADROOM = 4
+# The file in the dataset's ``meta/`` that records where the dataset and each
+# of its episodes came from. The Lance converter copies ``meta/`` whole.
+_LINEAGE_NAME = "roboto_lineage.json"
+# The lineage fields, with their Arrow types, that a v3.0 dataset also gets
+# as ``roboto/<field>`` columns of its episode metadata, so that
+# ``LeRobotDataset(episode_filter=...)`` can select episodes on them. All but
+# ``recipe_hash`` differ per episode. LeRobot's loaders, LeRobot 0.7's
+# ``aggregate_datasets`` and the Lance converter keep the columns.
+_LINEAGE_COLUMNS: dict[str, str] = {
+    "event_id": "string",
+    "source_dataset_id": "string",
+    "start_time_ns": "int64",
+    "end_time_ns": "int64",
+    "cache_hit": "bool",
+    "recipe_hash": "string",
+}
+# Values of the ``output_format`` parameter: the LeRobot dataset, its Lance
+# layout in its place, or both.
+_OUTPUT_FORMATS = ("lerobot", "lance", "both")
+# Threads the episode cache's merge uses to load the entries' metadata,
+# probe their videos and write packed video files. The disk limits how fast
+# the video files are written whatever the count; the threads mainly speed
+# up loading the metadata.
+_MERGE_THREADS = 4
 
 
 def _parse_pool_size(raw: object, *, source: str) -> int:
@@ -186,6 +240,60 @@ def _resolve_shard_count(param_value: object = None) -> int:
     if raw is None or raw == "":
         return 1
     return _parse_pool_size(raw, source=_SHARD_COUNT_ENV)
+
+
+def _resolve_output_format(param_value: object = None) -> str:
+    """Resolve the ``output_format`` parameter; unset means ``"lerobot"``.
+
+    Ignores case and surrounding whitespace. Raises ``ValueError`` on an
+    unknown value, and on ``"lance"`` or ``"both"`` when the Lance converter
+    (``lerobot-lancedb``) is not installed, as on the v2_1 variant. ``main``
+    resolves it before converting any event, so either error fails the run
+    early.
+    """
+    value = str(param_value or "lerobot").strip().lower()
+    if value not in _OUTPUT_FORMATS:
+        raise ValueError(f"output_format must be one of {', '.join(_OUTPUT_FORMATS)}, got {param_value!r}")
+    if value != "lerobot" and importlib.util.find_spec("lerobot_lancedb") is None:
+        raise ValueError(
+            f"output_format={value!r} needs the Lance converter (lerobot-lancedb), which only "
+            "roboto-to-lerobot-v3_0 includes."
+        )
+    return value
+
+
+def _open_episode_cache(context: roboto.InvocationContext) -> EpisodeCache | None:
+    """Return the episode cache in the org's assets when ``episode_cache`` is on and usable.
+
+    Unset, empty or ``false`` returns ``None`` without any API call. With
+    ``true``, makes one listing call against the invocation org's assets
+    before any conversion work. When the installed SDK has no
+    ``Org.assets``, or the org's asset storage is not enabled, logs one
+    warning and returns ``None``, so the export converts every event as it
+    does without the cache. Any other value raises ``ValueError``, so a typo
+    does not silently disable the cache.
+    """
+    raw = context.get_optional_parameter("episode_cache")
+    if raw is None or raw == "":
+        return None
+    value = str(raw).strip().lower()
+    if value not in ("true", "false"):
+        raise ValueError(f"episode_cache must be 'true' or 'false', got {raw!r}")
+    if value == "false":
+        return None
+
+    files = getattr(context.org, "assets", None)
+    if files is None:
+        reason = "the installed roboto SDK has no Org.assets (needs roboto >= 0.61.0)"
+    else:
+        cache = EpisodeCache(files)
+        try:
+            cache.probe()
+            return cache
+        except RobotoFeatureNotAvailableException:
+            reason = "org asset storage is not enabled for this org"
+    logger.warning("episode_cache ignored: %s. Converting every event.", reason)
+    return None
 
 
 def _load_contract_from_context(
@@ -327,12 +435,92 @@ def _shard_tag(shard_idx: int | None) -> str:
     return f"shard={shard_idx}" if shard_idx is not None else "shard=-"
 
 
+# Failures of building an event's episode that do not come from the event's
+# data: a worker pool that broke (a worker process died, or its initializer
+# failed) and network or service errors that outlasted the SDK's retries.
+# Running the same export again can succeed, so ``_run_pool_drain`` fails the
+# run on one of these; skipping the event would let an export that lacks it
+# report success. Every other exception from a worker skips the event:
+# ``_record_skip`` lists it in the manifest's ``skipped_events``.
+_INFRASTRUCTURE_ERRORS: tuple[type[BaseException], ...] = (
+    BrokenProcessPool,
+    ConnectionError,  # includes http.client.RemoteDisconnected
+    TimeoutError,
+    ssl.SSLError,  # includes ssl.SSLEOFError
+    urllib.error.URLError,
+    http.client.HTTPException,
+    RobotoServiceException,  # a 5xx response without a Roboto error body
+    RobotoServiceUnavailableException,
+)
+
+
+def _infrastructure_failure(
+    exc: BaseException, meta: dict, shard_idx: int | None,
+) -> RuntimeError:
+    """Build the error that fails the run when ``exc``, one of ``_INFRASTRUCTURE_ERRORS``, stops an event.
+
+    ``meta`` is the event's ``drain_order`` entry or its ``EventTask`` as a
+    dict; the message names the event by its ``event_idx``, ``event_id``
+    and ``src_ds_id``.
+    """
+    if isinstance(exc, BrokenProcessPool):
+        reason = (
+            "the worker pool broke: a worker process died, or its initializer "
+            "failed and logged its traceback above"
+        )
+    else:
+        reason = "a network or service error outlasted the SDK's retries"
+    return RuntimeError(
+        f"[{_shard_tag(shard_idx)}] Event event_idx={meta.get('event_idx')} "
+        f"(event_id={meta.get('event_id')}, dataset={meta.get('src_ds_id')}) "
+        f"could not be converted because {reason}. The event's data is not at "
+        "fault, so the run fails instead of dropping the event; running the "
+        f"export again may succeed. Cause: {exc.__class__.__name__}: {exc}"
+    )
+
+
+def _preload_episode(
+    *,
+    contract,
+    episode_data,
+    event,
+    event_idx: int,
+    metadata_task,
+    ref_ts: pd.Series,
+) -> WorkerEpisode | None:
+    """Build the first event's episode in the main process, or return ``None`` if that fails.
+
+    The first event's data is already loaded to discover the features, so
+    building its episode here saves fetching it again in a worker. A failure
+    is logged and not recorded as a skip: the caller then submits the event
+    to the pool like every other event, and what the pool does with it
+    (saves it, skips it, or fails the run) is what the manifest reports.
+    """
+    try:
+        task = resolve_task_label(
+            contract=contract,
+            episode_data=episode_data,
+            start_time_ns=int(event.start_time),
+            end_time_ns=int(event.end_time),
+            metadata_task=metadata_task,
+        )
+        frames = list(generate_frames(contract, episode_data, ref_ts, task=task))
+    except Exception:
+        logger.warning(
+            "Could not build the first event (event_id=%s) in the main process; converting it in the pool instead.",
+            getattr(event, "event_id", None),
+            exc_info=True,
+        )
+        return None
+    return WorkerEpisode(event_idx=event_idx, task_label=task, frames=frames)
+
+
 def _record_skip(
     *,
     accumulator: _DrainAccum,
     meta: dict,
     exc: BaseException,
-    stage: Literal["worker", "drain", "preload"],
+    stage: Literal["worker", "drain"],
     shard_idx: int | None = None,
 ) -> None:
     """Append a soft-drop entry for one failed event and log a WARNING.
@@ -340,10 +528,9 @@ def _record_skip(
     Must be called from inside an ``except`` block — ``traceback.format_exc()``
     reads ``sys.exc_info()`` and would otherwise return ``"NoneType: None\n"``.
 
-    ``stage`` ∈ ``{"worker", "drain", "preload"}`` records which surface
-    raised, so post-hoc analysis can tell apart episode-build failures (the
-    worker process) from writer-side failures (frame iteration / save_episode)
-    and the inline preload path.
+    ``stage`` ∈ ``{"worker", "drain"}`` records which surface raised, so
+    post-hoc analysis can tell apart episode-build failures (the worker
+    process) from writer-side failures (frame iteration / save_episode).
     """
     event_id = meta.get("event_id")
     event_idx = meta.get("event_idx")
@@ -427,6 +614,7 @@ def _run_pool_drain(
     preloaded_event_idx: int | None = None,
     preloaded_episode=None,
     shard_idx: int | None = None,
+    on_episode_saved: Callable[[dict], None] | None = None,
 ) -> None:
     """Drive a ``ProcessPoolExecutor`` and drain ``drain_order`` in order.
 
@@ -440,15 +628,19 @@ def _run_pool_drain(
     If ``drain_order`` has a single entry that matches ``preloaded_event_idx``
     and ``pool_tasks`` is empty, no pool is spun up at all (this preserves
     the single-event optimisation from the pre-shard code).
+
+    An event whose worker raises is recorded as a skip, unless the exception
+    is one of ``_INFRASTRUCTURE_ERRORS``: then the drain raises the
+    ``RuntimeError`` from :func:`_infrastructure_failure`, which names the
+    event. A pool that is already broken when the next task is submitted
+    fails the run the same way, naming that task's event.
+
+    ``on_episode_saved``, if given, is called with an event's
+    ``drain_order`` entry right after its episode is saved. An exception it
+    raises is not recorded as a skip; it ends the drain.
     """
-    only_preloaded = (
-        preloaded_episode is not None
-        and not pool_tasks
-        and len(drain_order) == 1
-        and drain_order[0]["event_idx"] == preloaded_event_idx
-    )
-    if only_preloaded:
-        meta = drain_order[0]
+
+    def _drain(meta: dict, episode) -> None:
         try:
             _drain_one_episode(
                 writer=writer,
@@ -457,19 +649,30 @@ def _run_pool_drain(
                 event_id=meta["event_id"],
                 start_time_ns=meta["start_time_ns"],
                 end_time_ns=meta["end_time_ns"],
-                episode=preloaded_episode,
+                episode=episode,
                 accumulator=accumulator,
                 shard_idx=shard_idx,
             )
         except Exception as exc:
-            # Writer may have buffered frames before the failure — discard
-            # so a subsequent episode can't inherit them. Symmetric with the
-            # loop body even though no follow-on episode exists here.
+            # The writer may have buffered frames before the failure;
+            # discard them so the next episode cannot inherit them.
             _record_skip(
                 accumulator=accumulator, meta=meta, exc=exc, stage="drain",
                 shard_idx=shard_idx,
             )
             _safe_discard_episode(writer)
+        else:
+            if on_episode_saved is not None:
+                on_episode_saved(meta)
+
+    only_preloaded = (
+        preloaded_episode is not None
+        and not pool_tasks
+        and len(drain_order) == 1
+        and drain_order[0]["event_idx"] == preloaded_event_idx
+    )
+    if only_preloaded:
+        _drain(drain_order[0], preloaded_episode)
         return
 
     # ``mp_context="spawn"`` not ``fork``: half-initialised lock state and a
@@ -494,66 +697,35 @@ def _run_pool_drain(
                 preloaded_event_idx is not None
                 and event_idx == preloaded_event_idx
             ):
-                try:
-                    _drain_one_episode(
-                        writer=writer,
-                        video_specs_by_key=video_specs_by_key,
-                        src_ds_id=meta["src_ds_id"],
-                        event_id=meta["event_id"],
-                        start_time_ns=meta["start_time_ns"],
-                        end_time_ns=meta["end_time_ns"],
-                        episode=preloaded_episode,
-                        accumulator=accumulator,
-                        shard_idx=shard_idx,
-                    )
-                except Exception as exc:
-                    _record_skip(
-                        accumulator=accumulator, meta=meta, exc=exc, stage="drain",
-                        shard_idx=shard_idx,
-                    )
-                    _safe_discard_episode(writer)
+                _drain(meta, preloaded_episode)
                 continue
             while (
                 next_to_submit < len(pool_tasks)
                 and len(submitted) < max_in_flight
             ):
                 t = pool_tasks[next_to_submit]
-                submitted[t.event_idx] = pool.submit(
-                    _worker_build_episode, t,
-                )
+                try:
+                    submitted[t.event_idx] = pool.submit(
+                        _worker_build_episode, t,
+                    )
+                except BrokenProcessPool as exc:
+                    raise _infrastructure_failure(exc, t._asdict(), shard_idx) from exc
                 next_to_submit += 1
-            # Two failure surfaces, two except blocks: a worker-side raise
-            # surfaces here at ``.result()`` and leaves the writer clean (no
-            # discard needed); a drain-side raise happens inside
-            # ``_drain_one_episode`` after frames have already been pushed
-            # into the writer's buffer, so a ``discard_episode`` is required
-            # before the next event can be saved.
+            # ``.result()`` raises a worker's exception before any of the
+            # event's frames reach the writer, so skipping the event here
+            # needs no discard. A failure after frames reach the writer is
+            # handled, and discarded, by ``_drain``.
             try:
                 episode = submitted.pop(event_idx).result()
+            except _INFRASTRUCTURE_ERRORS as exc:
+                raise _infrastructure_failure(exc, meta, shard_idx) from exc
             except Exception as exc:
                 _record_skip(
                     accumulator=accumulator, meta=meta, exc=exc, stage="worker",
                     shard_idx=shard_idx,
                 )
                 continue
-            try:
-                _drain_one_episode(
-                    writer=writer,
-                    video_specs_by_key=video_specs_by_key,
-                    src_ds_id=meta["src_ds_id"],
-                    event_id=meta["event_id"],
-                    start_time_ns=meta["start_time_ns"],
-                    end_time_ns=meta["end_time_ns"],
-                    episode=episode,
-                    accumulator=accumulator,
-                    shard_idx=shard_idx,
-                )
-            except Exception as exc:
-                _record_skip(
-                    accumulator=accumulator, meta=meta, exc=exc, stage="drain",
-                    shard_idx=shard_idx,
-                )
-                _safe_discard_episode(writer)
+            _drain(meta, episode)
     except BaseException:
         # ``cancel_futures=True`` drops pending tasks immediately rather
         # than waiting for in-flight ones; ``wait=False`` lets the process
@@ -679,6 +851,57 @@ def _partition_shards(
     return chunks_drain, chunks_tasks
 
 
+class _DatasetPerEpisodeWriter:
+    """Writer that puts every episode in its own one-episode dataset.
+
+    An episode's first frame creates a ``LeRobotWriter`` at
+    ``<root>/episode-NNNN``; :meth:`finish_episode` finalizes that dataset
+    after its episode is saved and returns its root. Each dataset gets the
+    calls (create, frames, save, finalize) a writer converting only that
+    episode would get, so its files are the same.
+    """
+
+    def __init__(self, root: Path, writer_kwargs: dict[str, Any]) -> None:
+        self._root = root
+        self._writer_kwargs = writer_kwargs
+        self._count = 0
+        self._writer: LeRobotWriter | None = None
+        self._episode_root = root
+
+    def add_frame(self, frame: dict[str, Any], task: str) -> None:
+        if self._writer is None:
+            self._episode_root = self._root / f"episode-{self._count:04d}"
+            self._count += 1
+            self._writer = LeRobotWriter.create(
+                repo_id=self._episode_root.name, root=self._episode_root, **self._writer_kwargs,
+            )
+        self._writer.add_frame(frame, task=task)
+
+    def save_episode(self) -> None:
+        self._writer.save_episode()
+
+    def discard_episode(self) -> None:
+        """Drop the current episode, close its writer and delete its dataset, if it has one.
+
+        Closing the writer stops its image-writer threads, which would
+        otherwise run until the shard process exits.
+        """
+        if self._writer is None:
+            return
+        writer, self._writer = self._writer, None
+        writer.discard_episode()
+        writer.finalize()
+        shutil.rmtree(self._episode_root, ignore_errors=True)
+
+    def finish_episode(self) -> Path:
+        writer, self._writer = self._writer, None
+        writer.finalize()
+        return self._episode_root
+
+    def finalize(self) -> None:
+        """Nothing to do: :meth:`finish_episode` finalized every dataset."""
+
+
 def _run_shard_subprocess(
     *,
     shard_idx: int,
@@ -696,6 +919,7 @@ def _run_shard_subprocess(
     pool_tasks: list,
     drain_order: list,
     result_path: str,
+    episode_conn: Connection | None = None,
 ) -> None:
     """Entrypoint for a single shard process.
 
@@ -706,6 +930,13 @@ def _run_shard_subprocess(
     The main process reads the summary back to assemble the manifest and
     drives :func:`lerobot.datasets.aggregate.aggregate_datasets` to merge
     every shard into the final destination.
+
+    With ``episode_conn``, the shard instead writes each episode as its own
+    one-episode dataset under ``shard_root`` and, as soon as one is
+    finalized, sends ``{"event_idx", "root", "episode"}`` on
+    ``episode_conn``, where ``episode`` is its ``episode_to_event`` entry.
+    One process and one worker pool still convert all of the shard's events;
+    only the output is split by episode.
 
     Path/repo arguments are strings rather than ``Path`` objects to keep
     the kwargs cheaply picklable across spawn.
@@ -731,19 +962,31 @@ def _run_shard_subprocess(
             "Shard %d: writer root=%s, events=%d, pool_size=%d, encoder_threads=%d",
             shard_idx, shard_root_p, len(drain_order), pool_size, encoder_threads,
         )
-        writer = LeRobotWriter.create(
-            repo_id=repo_id,
-            fps=fps,
-            features=features,
-            root=shard_root_p,
-            robot_type=robot_type,
-            image_writer_threads=_IMAGE_WRITER_THREADS,
-            batch_encoding_size=_BATCH_ENCODING_SIZE,
-            streaming_encoding=_STREAMING_ENCODING,
-            encoder_threads=encoder_threads,
-            encoder_queue_maxsize=_ENCODER_QUEUE_MAXSIZE,
-        )
+        writer_kwargs = {
+            "fps": fps,
+            "features": features,
+            "robot_type": robot_type,
+            "image_writer_threads": _IMAGE_WRITER_THREADS,
+            "batch_encoding_size": _BATCH_ENCODING_SIZE,
+            "streaming_encoding": _STREAMING_ENCODING,
+            "encoder_threads": encoder_threads,
+            "encoder_queue_maxsize": _ENCODER_QUEUE_MAXSIZE,
+        }
         accumulator = _DrainAccum()
+        on_episode_saved = None
+        if episode_conn is None:
+            writer = LeRobotWriter.create(repo_id=repo_id, root=shard_root_p, **writer_kwargs)
+        else:
+            writer = _DatasetPerEpisodeWriter(shard_root_p, writer_kwargs)
+
+            def on_episode_saved(meta: dict) -> None:
+                # ``_drain_one_episode`` appended the saved episode's entry last.
+                episode_conn.send({
+                    "event_idx": meta["event_idx"],
+                    "root": str(writer.finish_episode()),
+                    "episode": accumulator.episode_to_event[-1],
+                })
+
         _run_pool_drain(
             writer=writer,
             video_specs_by_key=video_specs_by_key,
@@ -754,6 +997,7 @@ def _run_shard_subprocess(
             pool_size=pool_size,
             accumulator=accumulator,
             shard_idx=shard_idx,
+            on_episode_saved=on_episode_saved,
         )
         writer.finalize()
         result.update({
@@ -793,8 +1037,21 @@ def _spawn_shards(
     descriptors_by_ds: dict,
     contracts_by_ds: dict,
     log_level: int,
+    on_episodes: Callable[[list[dict]], None] | None = None,
 ) -> list[dict]:
     """Spawn one process per shard, wait for all, return per-shard results.
+
+    Each shard receives the topic descriptors and contracts of only the
+    datasets its events come from. Spawn pickles them into the shard
+    process and again into each of its pool workers, so a shard does not
+    carry the topic records of datasets it never reads.
+
+    With ``on_episodes``, every shard writes each episode as its own
+    one-episode dataset (see :func:`_run_shard_subprocess`) and reports it
+    once finalized. ``on_episodes`` receives the reports in batches while
+    the shards run. An exception it raises is logged and does not stop the
+    shards; the ``RuntimeError`` described below lists it once every shard
+    has exited.
 
     Failures (non-zero exit, missing result file, ``status != "ok"``) are
     collected and surfaced as a single ``RuntimeError`` so the operator
@@ -804,15 +1061,36 @@ def _spawn_shards(
     """
     shard_count = len(chunks_drain)
     ctx = mp.get_context("spawn")
-    processes: list[mp.Process] = []
+    running: list[mp.Process] = []
+    readers: list[Connection] = []
+    failures: list[str] = []
     result_paths: list[Path] = []
     shard_roots: list[Path] = []
+
+    def _collect_reports(ready: list) -> None:
+        reports: list[dict] = []
+        for reader in [r for r in readers if r in ready]:
+            try:
+                while reader.poll():
+                    reports.append(reader.recv())
+            except EOFError:
+                readers.remove(reader)
+                reader.close()
+        if reports:
+            try:
+                on_episodes(reports)
+            except Exception as exc:
+                logger.exception("Handling %d finished episode(s) failed", len(reports))
+                failures.append(f"on_episodes {exc.__class__.__name__}: {exc}")
+
     shard_workdir.mkdir(parents=True, exist_ok=True)
     for i in range(shard_count):
+        shard_ds_ids = {t.src_ds_id for t in chunks_tasks[i]}
         shard_root = shard_workdir / f"shard-{i:03d}"
         result_path = shard_workdir / f"shard-{i:03d}.result.json"
         shard_roots.append(shard_root)
         result_paths.append(result_path)
+        reader, episode_conn = ctx.Pipe(duplex=False) if on_episodes else (None, None)
         p = ctx.Process(
             target=_run_shard_subprocess,
             kwargs={
@@ -826,24 +1104,35 @@ def _spawn_shards(
                 "encoder_threads": encoder_threads,
                 "pool_size": pool_size,
                 "video_specs_by_key": video_specs_by_key,
-                "descriptors_by_ds": descriptors_by_ds,
-                "contracts_by_ds": contracts_by_ds,
+                "descriptors_by_ds": {ds: descriptors_by_ds[ds] for ds in shard_ds_ids},
+                "contracts_by_ds": {ds: contracts_by_ds[ds] for ds in shard_ds_ids},
                 "pool_tasks": chunks_tasks[i],
                 "drain_order": chunks_drain[i],
                 "result_path": str(result_path),
+                "episode_conn": episode_conn,
             },
             name=f"shard-{i:03d}",
         )
         p.start()
-        processes.append(p)
+        running.append(p)
+        if reader is not None:
+            # Only the shard keeps the sending end, so the reader reaches
+            # EOF when the shard exits.
+            episode_conn.close()
+            readers.append(reader)
 
     # Join every shard before raising — partial joins leak orphaned shard
     # children, and we want a clean shutdown either way.
-    failures: list[str] = []
-    for i, p in enumerate(processes):
-        p.join()
-        if p.exitcode != 0:
-            failures.append(f"shard-{i:03d} exit={p.exitcode}")
+    while running:
+        ready = _wait_for_processes([p.sentinel for p in running] + readers)
+        _collect_reports(ready)
+        for p in [p for p in running if p.exitcode is not None]:
+            p.join()
+            running.remove(p)
+            if p.exitcode != 0:
+                failures.append(f"{p.name} exit={p.exitcode}")
+    # Read the reports that were still in a pipe when the last shard exited.
+    _collect_reports(list(readers))
 
     results: list[dict] = []
     for i, rp in enumerate(result_paths):
@@ -865,6 +1154,10 @@ def _spawn_shards(
         raise RuntimeError(
             f"Shards failed: process_failures={failures} "
             f"bad_results={[r.get('shard_idx') for r in bad]}"
+            + "".join(
+                f"\nshard {r.get('shard_idx')}: {r.get('error_class')}: {r.get('error_message')}"
+                for r in bad
+            )
         )
 
     results.sort(key=lambda r: r["shard_idx"])
@@ -874,15 +1167,16 @@ def _spawn_shards(
 
 
 def _shard_path_supported() -> bool:
-    """Whether the embedded lerobot exposes the sharded path's merge API.
+    """Whether the embedded lerobot has ``lerobot.datasets.aggregate.aggregate_datasets``.
 
-    ``lerobot.datasets.aggregate.aggregate_datasets`` does not exist in 0.3.x.
-    ``pyproject.toml`` allows ``lerobot >= 0.3.3, < 0.7`` and the Dockerfile
-    pins ``LEROBOT_VERSION`` at build time, so a 0.3.x image (the v2_1
-    variant) has no merge API and cannot shard. Probed before any shard
-    subprocess is spawned; the alternative is an opaque
-    ``ModuleNotFoundError`` raised inside ``_aggregate_shards`` after every
-    shard has already done its full conversion work.
+    lerobot 0.6 and later have it; 0.3.x does not. ``pyproject.toml`` allows
+    ``lerobot >= 0.3.3, < 0.8`` without 0.4 and 0.5 and the Dockerfile pins ``LEROBOT_VERSION``
+    at build time, so this tells the v3_0 variant from the v2_1 variant,
+    whose 0.3.x writes LeRobot 2.1 and cannot shard. ``main`` probes it
+    before spawning any shard subprocess, so that a v2_1 image ignores
+    ``shard_count`` instead of raising ``ModuleNotFoundError`` in
+    ``_aggregate_shards`` after every shard has converted its events.
+    ``_convert_with_episode_cache`` uses it to choose the v3.0 or v2.1 merge.
     """
     try:
         from lerobot.datasets.aggregate import aggregate_datasets  # noqa: F401
@@ -899,7 +1193,9 @@ def _aggregate_shards(
 
     ``aggregate_datasets`` uses stream-copy concatenation
     (``concatenate_video_files`` → ffmpeg's concat demuxer in copy mode)
-    so the merge cost is proportional to disk I/O, not video re-encode.
+    so the merge cost is proportional to disk I/O, not to re-encoding video.
+    :func:`_restat_numbering` then corrects the ``stats.json`` entries of
+    the columns the merge renumbers.
     """
     from lerobot.datasets.aggregate import aggregate_datasets
 
@@ -915,6 +1211,297 @@ def _aggregate_shards(
         roots=roots,
         aggr_root=dataset_root,
     )
+    _restat_numbering(dataset_root)
+
+
+def _restat_numbering(dataset_root: Path) -> None:
+    """Recompute the ``stats.json`` entries of ``episode_index``, ``index`` and ``task_index`` after a merge.
+
+    lerobot's merge renumbers these columns in the data and in each
+    episode's stats. Its ``finalize_aggregation``, however, builds
+    ``stats.json`` by combining the sources' own ``stats.json`` files, which
+    describe each source's numbering from 0: a merge of one-episode
+    datasets gets an ``episode_index`` maximum of 0.
+
+    A writer that saves every episode into one dataset instead combines its
+    stats so far with each episode's stats as it saves that episode
+    (``aggregate_stats([stats, episode_stats])``). This function repeats
+    those steps with lerobot's functions, over the merged data in episode
+    order, so the three entries equal those that such a writer produces for
+    the merged episodes. Every other entry is left as it is.
+
+    lerobot-merge keeps a copy of this function for lerobot 0.5, whose
+    ``load_info`` returns a dict; the two packages are deployed separately
+    and cannot import each other.
+    """
+    from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
+    from lerobot.datasets.io_utils import load_info, load_stats, write_stats
+
+    columns = ["episode_index", "index", "task_index"]
+    features = load_info(dataset_root).features
+    stats = None
+    # Each data file holds whole episodes, and the files are numbered in
+    # episode order, so the sorted paths list the episodes in order.
+    for path in sorted((dataset_root / "data").glob("*/*.parquet")):
+        for _, episode in pd.read_parquet(path, columns=columns).groupby("episode_index", sort=True):
+            episode_stats = compute_episode_stats({c: episode[c].to_numpy() for c in columns}, features)
+            stats = episode_stats if stats is None else aggregate_stats([stats, episode_stats])
+    write_stats({**load_stats(dataset_root), **stats}, dataset_root)
+
+
+def _merge_entries(parts: list[dict], dataset_root: Path) -> None:
+    """Merge the one-episode datasets at ``part["root"]``, in order, into ``dataset_root``.
+
+    Numbers the episodes in the order of ``parts`` and packs their data and
+    video files in that order up to lerobot's default size limits, as
+    lerobot's writer packs the episodes of one conversion. Runs the loop of
+    ``aggregate_datasets`` with lerobot's helpers for it
+    (``validate_all_metadata``, ``merge_video_feature_info_for_aggregate``,
+    ``aggregate_data``, ``update_meta_data`` and ``finalize_aggregation``,
+    which lerobot does not document as public API), but not its video step
+    or its episode metadata writes. ``aggregate_datasets`` appends each
+    source video to the current packed file by rewriting that file, and
+    appends each source's episode metadata by rewriting the metadata file.
+    Here, :func:`_place_videos` first chooses the packed file of every
+    source video and its offset in that file, so that each packed video
+    file and the episode metadata are written once.
+    """
+    from lerobot.datasets import aggregate
+    from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+
+    logger.info("Merging %d episodes into %s...", len(parts), dataset_root)
+    with ThreadPoolExecutor(_MERGE_THREADS) as pool:
+        metas = list(pool.map(_load_entry_metadata, [Path(p["root"]) for p in parts]))
+        fps, robot_type, _ = aggregate.validate_all_metadata(metas)
+        features = aggregate.merge_video_feature_info_for_aggregate(metas)
+        video_keys = [k for k, f in features.items() if f["dtype"] == "video"]
+        # The limits ``aggregate_datasets`` applies when given none.
+        dst = LeRobotDatasetMetadata.create(
+            repo_id=dataset_root.name,
+            fps=fps,
+            robot_type=robot_type,
+            features=features,
+            root=dataset_root,
+            use_videos=bool(video_keys),
+            chunks_size=aggregate.DEFAULT_CHUNK_SIZE,
+            data_files_size_in_mb=aggregate.DEFAULT_DATA_FILE_SIZE_IN_MB,
+            video_files_size_in_mb=aggregate.DEFAULT_VIDEO_FILE_SIZE_IN_MB,
+        )
+        tasks = pd.concat([m.tasks for m in metas]).index.unique()
+        dst.tasks = pd.DataFrame({"task_index": range(len(tasks))}, index=pd.Index(tasks, name="task"))
+        videos_idx, packed = _place_videos(metas, video_keys, dst.video_files_size_in_mb, dst.chunks_size, pool)
+        _merge_data_and_metadata(dataset_root, metas, videos_idx, dst)
+        staging = dataset_root / "_packing"
+        staging.mkdir()
+        with _temp_dir(staging):
+            list(pool.map(lambda job: _write_video(dataset_root / job[0], job[1]), packed))
+        staging.rmdir()
+
+
+def _load_entry_metadata(root: Path) -> LeRobotDatasetMetadata:
+    """Load the metadata of the one-episode dataset at ``root`` as a ``LeRobotDatasetMetadata``.
+
+    Sets ``repo_id``, ``root`` and ``revision`` and loads ``info``,
+    ``tasks``, ``stats`` and ``episodes`` without calling the constructor.
+    The constructor loads the episode metadata as a Hugging Face
+    ``Dataset``, which in pure Python takes most of the time loading a
+    one-episode dataset's metadata takes, and drops its ``stats/`` columns.
+    Pandas reads every column, so the merged episode metadata keeps each
+    episode's stats.
+    """
+    from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+    from lerobot.datasets.io_utils import load_info, load_stats, load_tasks
+
+    meta = LeRobotDatasetMetadata.__new__(LeRobotDatasetMetadata)
+    meta.repo_id, meta.root, meta.revision = root.name, root, None
+    meta.info, meta.tasks, meta.stats = load_info(root), load_tasks(root), load_stats(root)
+    meta.episodes = pd.concat(
+        [pd.read_parquet(p) for p in sorted((root / "meta" / "episodes").glob("*/*.parquet"))], ignore_index=True,
+    )
+    return meta
+
+
+def _merge_data_and_metadata(
+    dataset_root: Path, metas: list[LeRobotDatasetMetadata], videos_idx: list[dict], dst: LeRobotDatasetMetadata,
+) -> None:
+    """Write the data, tasks, info, stats and episode metadata of the merge into ``dst``.
+
+    Runs the loop of ``aggregate_datasets`` without its video step:
+    ``aggregate_data`` writes each source's data to a file of its own, which
+    :func:`_pack_data` then joins, and ``update_meta_data`` points each
+    source's episodes at their packed video files and offsets in
+    ``videos_idx``. The episode metadata is written once, after the data
+    files are packed, and always to one file; lerobot's writer and
+    ``aggregate_datasets`` start a new file when it reaches the data file
+    size limit (100 MB, tens of thousands of episodes).
+    """
+    from lerobot.datasets import aggregate
+    from lerobot.datasets.utils import DEFAULT_EPISODES_PATH
+
+    data_idx: dict[str, Any] = {"chunk": 0, "file": 0}
+    meta_idx = {"chunk": 0, "file": 0}
+    episodes = []
+    for src, src_videos_idx in zip(metas, videos_idx, strict=True):
+        data_idx = aggregate.aggregate_data(
+            src, dst, data_idx, dst.data_files_size_in_mb, dst.chunks_size, concatenate_data=False,
+        )
+        episodes.append(aggregate.update_meta_data(src.episodes.copy(), dst, meta_idx, data_idx, src_videos_idx))
+        data_idx.pop("src_to_dst", None)
+        dst.info.total_episodes += src.total_episodes
+        dst.info.total_frames += src.total_frames
+    episodes_df = pd.concat(episodes, ignore_index=True)
+    _pack_data(dataset_root, episodes_df, dst)
+    episodes_path = dataset_root / DEFAULT_EPISODES_PATH.format(chunk_index=0, file_index=0)
+    episodes_path.parent.mkdir(parents=True, exist_ok=True)
+    episodes_df.to_parquet(episodes_path)
+    aggregate.finalize_aggregation(dst, metas)
+    _restat_numbering(dataset_root)
+
+
+@contextmanager
+def _temp_dir(path: Path):
+    """Make ``tempfile`` create its files under ``path``.
+
+    ``concatenate_video_files`` writes each output to a temporary file and
+    then moves it into place; under the dataset's own disk the move is a
+    rename, and the file does not fill a small ``/tmp``.
+    """
+    previous = tempfile.tempdir
+    tempfile.tempdir = str(path)
+    try:
+        yield
+    finally:
+        tempfile.tempdir = previous
+
+
+def _pack_groups(
+    sources: list[Any], sizes_mb: list[float], max_mb: float, chunks_size: int,
+) -> list[tuple[tuple[int, int], list[Any]]]:
+    """Split ``sources``, files in episode order, into packed files.
+
+    Returns ``(destination, sources)`` pairs numbered from file 0 of chunk 0.
+    A file is closed before the source that would bring its summed size to
+    ``max_mb``, the rule lerobot's writer and ``aggregate_datasets`` apply.
+    """
+    from lerobot.datasets.utils import update_chunk_file_indices
+
+    groups: list[tuple[tuple[int, int], list[Any]]] = []
+    total = 0.0
+    for source, size in zip(sources, sizes_mb, strict=True):
+        if not groups or total + size >= max_mb:
+            dst = update_chunk_file_indices(*groups[-1][0], chunks_size) if groups else (0, 0)
+            groups.append((dst, []))
+            total = 0.0
+        groups[-1][1].append(source)
+        total += size
+    return groups
+
+
+def _place_videos(
+    metas: list[LeRobotDatasetMetadata], video_keys: list[str], max_mb: float, chunks_size: int,
+    pool: ThreadPoolExecutor,
+) -> tuple[list[dict], list[tuple[str, list[Path]]]]:
+    """Choose the packed file of every source video file, and its offset in that file.
+
+    Returns, per source dataset, the ``videos_idx`` that lerobot's
+    ``update_meta_data`` takes to point the source's episodes at their packed
+    files, and, per packed file, its path relative to the dataset root and
+    its source files in order. A source's frames start at the summed
+    durations of the sources before it in its packed file, the duration
+    lerobot's writer uses to place an episode.
+    """
+    from lerobot.datasets.io_utils import get_file_size_in_mb
+    from lerobot.datasets.utils import DEFAULT_VIDEO_PATH
+    from lerobot.datasets.video_utils import get_video_duration_in_s
+
+    videos_idx: list[dict] = [{} for _ in metas]
+    packed: list[tuple[str, list[Path]]] = []
+    for key in video_keys:
+        sources = [
+            (i, int(chunk), int(file))
+            for i, meta in enumerate(metas)
+            for chunk, file in sorted(set(zip(
+                meta.episodes[f"videos/{key}/chunk_index"], meta.episodes[f"videos/{key}/file_index"], strict=True,
+            )))
+        ]
+        paths = [
+            metas[i].root / DEFAULT_VIDEO_PATH.format(video_key=key, chunk_index=chunk, file_index=file)
+            for i, chunk, file in sources
+        ]
+        durations = list(pool.map(get_video_duration_in_s, paths))
+        for idx in videos_idx:
+            # ``update_meta_data`` reads ``chunk`` and ``file`` as the default for a
+            # file missing from ``src_to_dst``, even though every file is in it.
+            idx[key] = {"chunk": 0, "file": 0, "src_to_dst": {}, "src_to_offset": {}}
+        for dst, group in _pack_groups(
+            list(range(len(sources))), [get_file_size_in_mb(p) for p in paths], max_mb, chunks_size,
+        ):
+            elapsed = 0.0
+            for s in group:
+                i, chunk, file = sources[s]
+                videos_idx[i][key]["src_to_dst"][(chunk, file)] = dst
+                videos_idx[i][key]["src_to_offset"][(chunk, file)] = elapsed
+                elapsed += durations[s]
+            rel = DEFAULT_VIDEO_PATH.format(video_key=key, chunk_index=dst[0], file_index=dst[1])
+            packed.append((rel, [paths[s] for s in group]))
+    return videos_idx, packed
+
+
+def _write_video(out: Path, sources: list[Path]) -> None:
+    """Write the packed video file ``out`` from ``sources``, stream-copying their packets.
+
+    A file packed alone is hard-linked, or copied where the link fails.
+    """
+    from lerobot.datasets.video_utils import concatenate_video_files
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if len(sources) > 1:
+        concatenate_video_files(sources, out)
+        return
+    try:
+        os.link(sources[0], out)
+    except OSError:
+        shutil.copyfile(sources[0], out)
+
+
+def _pack_data(root: Path, episodes: pd.DataFrame, meta: LeRobotDatasetMetadata) -> None:
+    """Join the data files of ``root``, in episode order, up to the dataset's size limit.
+
+    Sizes are uncompressed parquet sizes, which ``aggregate_datasets`` also
+    compares. Rewrites ``data/{chunk,file}_index`` of the episode metadata
+    ``episodes`` to match. A file packed alone is moved unchanged.
+    """
+    from lerobot.datasets.io_utils import (
+        get_parquet_file_size_in_mb,
+        to_parquet_one_row_group_per_episode,
+    )
+
+    def path(location: tuple[int, int]) -> Path:
+        return root / meta.data_path.format(chunk_index=location[0], file_index=location[1])
+
+    pairs = zip(episodes["data/chunk_index"], episodes["data/file_index"], strict=True)
+    located = [(int(c), int(f)) for c, f in pairs]
+    sources = list(dict.fromkeys(located))
+    staging = root / "_packing" / "data"
+    location: dict[tuple[int, int], tuple[int, int]] = {}
+    for dst, group in _pack_groups(
+        sources, [get_parquet_file_size_in_mb(path(s)) for s in sources],
+        meta.data_files_size_in_mb, meta.chunks_size,
+    ):
+        out = staging / path(dst).relative_to(root / "data")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if len(group) == 1:
+            path(group[0]).rename(out)
+        else:
+            to_parquet_one_row_group_per_episode(
+                pd.concat([pd.read_parquet(path(s)) for s in group], ignore_index=True), out,
+            )
+        location.update(dict.fromkeys(group, dst))
+    shutil.rmtree(root / "data")
+    staging.rename(root / "data")
+    staging.parent.rmdir()
+    episodes["data/chunk_index"] = [location[s][0] for s in located]
+    episodes["data/file_index"] = [location[s][1] for s in located]
 
 
 def _drop_empty_shards(shard_results: list[dict]) -> list[dict]:
@@ -981,6 +1568,205 @@ def _renumber_episode_to_event(shard_results: list[dict]) -> list[dict]:
             flat.append({**entry, "episode_index": offset + int(entry["episode_index"])})
         offset += int(r["total_episodes"])
     return flat
+
+
+def _convert_with_episode_cache(
+    *,
+    cache: EpisodeCache,
+    recipe: str,
+    matched: list,
+    matched_events: list,
+    topics_by_ds: dict,
+    contracts_by_ds: dict,
+    buffer_ns: int,
+    action_lead_ns: int,
+    dataset_root: Path,
+    workdir: Path,
+    max_parallel: int,
+    accumulator: _DrainAccum,
+    **spawn_kwargs: Any,
+) -> None:
+    """Build ``dataset_root`` from cached one-episode datasets plus new ones.
+
+    Keys every matched event and downloads the entries the cache already
+    holds. The remaining distinct keys are split across at most
+    ``max_parallel`` shard processes, each converting its events one after
+    another into one-episode datasets. Every entry is uploaded as soon as
+    its shard reports it, so it stays in the cache when a later event or
+    shard fails the export. Then merges every
+    entry in ``matched`` order, the order a single-writer conversion writes.
+    Fills ``accumulator`` like the other paths, adding to each episode its
+    ``episode_key`` and whether it was a ``cache_hit``.
+
+    ``spawn_kwargs`` are forwarded to :func:`_spawn_shards`.
+    """
+    keys = [
+        episode_key(
+            event_id=getattr(ev, "event_id", None),
+            src_ds_id=src_ds_id,
+            start_time_ns=int(ev.start_time),
+            end_time_ns=int(ev.end_time),
+            task_label=task_label,
+            buffer_ns=buffer_ns,
+            action_lead_ns=action_lead_ns,
+            contract=contracts_by_ds[src_ds_id],
+            topics=topics_by_ds[src_ds_id],
+        )
+        for (_, src_ds_id, task_label, _), ev in zip(matched, matched_events, strict=True)
+    ]
+    hits = cache.fetch(recipe, sorted(set(keys)), workdir)
+
+    # One conversion per distinct key, at the slot where it first appears.
+    miss_slots: dict[str, int] = {}
+    for slot, key in enumerate(keys):
+        if key not in hits:
+            miss_slots.setdefault(key, slot)
+    converted: set[str] = set()
+    if miss_slots:
+        slots = list(miss_slots.values())
+        key_by_event_idx = {matched[s][0]: k for k, s in miss_slots.items()}
+
+        def _store(reports: list[dict]) -> None:
+            keys_done = []
+            for report in reports:
+                key = key_by_event_idx[report["event_idx"]]
+                entry = workdir / entry_path(recipe, key)
+                entry.parent.mkdir(parents=True, exist_ok=True)
+                Path(report["root"]).rename(entry)
+                # The index within the shard; the merge numbers the episodes again.
+                summary = {k: v for k, v in report["episode"].items() if k != "episode_index"}
+                (entry / MARKER_NAME).write_text(json.dumps(summary, default=str))
+                keys_done.append(key)
+            cache.upload(recipe, workdir, keys_done)
+            converted.update(keys_done)
+
+        chunks_drain, chunks_tasks = _partition_shards(
+            [matched[s] for s in slots],
+            [matched_events[s] for s in slots],
+            shard_count=max_parallel,
+            buffer_ns=buffer_ns,
+            action_lead_ns=action_lead_ns,
+        )
+        results = _spawn_shards(
+            chunks_drain=chunks_drain,
+            chunks_tasks=chunks_tasks,
+            shard_workdir=workdir / "_shards",
+            contracts_by_ds=contracts_by_ds,
+            on_episodes=_store,
+            **spawn_kwargs,
+        )
+        for r in results:
+            accumulator.skipped_events.extend(r.get("skipped_events", []))
+
+    order = [s for s, key in enumerate(keys) if key in hits or key in converted]
+    if not order:
+        raise RuntimeError(
+            "Conversion produced 0 episodes; nothing was written. "
+            f"Dropped events: {_summarize_skip_reasons(accumulator.skipped_events)}"
+        )
+    # lerobot 0.3.x writes v2.1, one file per episode, and has no merge API.
+    merge = _merge_entries if _shard_path_supported() else merge_v21_entries
+    merge(
+        [{"repo_id": keys[s], "root": str(workdir / entry_path(recipe, keys[s]))} for s in order],
+        dataset_root,
+    )
+
+    for episode_index, slot in enumerate(order):
+        key = keys[slot]
+        summary = episode_summary(workdir / entry_path(recipe, key))
+        accumulator.episode_to_event.append({
+            "episode_index": episode_index, **summary, "episode_key": key, "cache_hit": key in hits,
+        })
+        accumulator.total_frames += int(summary["n_frames"])
+        accumulator.per_dataset_counts[summary["source_dataset_id"]] += 1
+    accumulator.total_episodes = len(order)
+    logger.info(
+        "Episode cache: %d episodes, %d hits, %d converted (recipe %s).",
+        len(order), sum(keys[s] in hits for s in order), len(converted), recipe,
+    )
+    # The runtime uploads everything left under the output directory, and
+    # ``workdir`` lies inside it; only ``dataset_root`` should be uploaded.
+    try:
+        shutil.rmtree(workdir)
+    except OSError as e:
+        logger.warning("Could not remove episode cache workdir %s: %s", workdir, e)
+
+
+def _write_lineage(dataset_root: Path, run: dict, episodes: list[dict]) -> None:
+    """Record in ``dataset_root/meta`` where the dataset and each of its episodes came from.
+
+    ``run`` describes the export and must have a ``recipe_hash``.
+    ``episodes`` are the manifest's ``episode_to_event`` entries, numbered
+    as in the dataset.
+
+    Writes ``run`` to ``meta/roboto_lineage.json`` with, per episode, its
+    index, event, source dataset, bounds, whether it came from the episode
+    cache and, when the cache was on, its ``episode_key``. Then appends a
+    ``roboto/<field>`` column for each field of ``_LINEAGE_COLUMNS`` to every
+    episode metadata file, ``meta/episodes/*/*.parquet``. A v2.1 dataset
+    keeps its episode metadata in ``meta/episodes.jsonl`` instead, so it
+    gets only the JSON file.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rows = [
+        {
+            "episode_index": int(e["episode_index"]),
+            "event_id": e["event_id"],
+            "source_dataset_id": e["source_dataset_id"],
+            "start_time_ns": int(e["start_time_ns"]),
+            "end_time_ns": int(e["end_time_ns"]),
+            "cache_hit": bool(e.get("cache_hit", False)),
+            **({"episode_key": e["episode_key"]} if "episode_key" in e else {}),
+        }
+        for e in episodes
+    ]
+    meta = dataset_root / "meta"
+    (meta / _LINEAGE_NAME).write_text(json.dumps({**run, "episodes": rows}, indent=2))
+    by_index = {r["episode_index"]: {**r, "recipe_hash": run["recipe_hash"]} for r in rows}
+    for path in sorted((meta / "episodes").glob("*/*.parquet")):
+        table = pq.read_table(path)
+        indices = table.column("episode_index").to_pylist()
+        for field, dtype in _LINEAGE_COLUMNS.items():
+            values = [by_index[i][field] for i in indices]
+            table = table.append_column(f"roboto/{field}", pa.array(values, type=dtype))
+        pq.write_table(table, path)
+
+
+def _lance_convert(root: str, out: str) -> int:
+    """Convert the LeRobot dataset at ``root`` to the Lance layout at ``out``.
+
+    Runs in the process :func:`_write_lance` starts for it, and returns that
+    process's peak resident memory in KiB (``ru_maxrss`` on Linux).
+    """
+    from lerobot_lancedb.convert import convert
+
+    convert(Path(out), root=Path(root))
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+
+def _write_lance(dataset_root: Path, out: Path, *, keep_lerobot: bool) -> None:
+    """Write the Lance layout of the LeRobot dataset at ``dataset_root`` to ``out``.
+
+    Then removes ``dataset_root``, unless ``keep_lerobot``. The converter,
+    ``lerobot_lancedb.convert.convert``, copies ``meta/`` (and the lineage
+    in it) and stores the frames in one Lance table and the bytes of every
+    video file, unchanged, in another. It runs in a spawned process of its
+    own, so that its memory returns to the system when the process exits
+    and its peak can be logged. A converter error propagates and leaves
+    ``dataset_root`` in place.
+    """
+    started = time.monotonic()
+    with ProcessPoolExecutor(1, mp_context=mp.get_context("spawn")) as pool:
+        peak_kib = pool.submit(_lance_convert, str(dataset_root), str(out)).result()
+    size = sum(p.stat().st_size for p in out.rglob("*") if p.is_file())
+    logger.info(
+        "Lance dataset written to %s in %.0f s: %.2f GB; converter peak memory %.2f GB.",
+        out, time.monotonic() - started, size / 1e9, peak_kib * 1024 / 1e9,
+    )
+    if not keep_lerobot:
+        shutil.rmtree(dataset_root)
 
 
 def _warn_oversubscription(
@@ -1051,7 +1837,9 @@ def main(context: roboto.InvocationContext) -> None:
     if not collection_id:
         raise ValueError("collection_id must be a non-empty string")
 
+    output_format = _resolve_output_format(context.get_optional_parameter("output_format"))
     contract, contract_rel_path, contract_sha256 = _load_contract_from_context(context)
+    episode_cache = _open_episode_cache(context)
 
     fps = int(contract.fps)
     time_step_ns = fps_to_time_step_ns(contract.fps)
@@ -1216,9 +2004,9 @@ def main(context: roboto.InvocationContext) -> None:
     # resolved contract.
     video_specs_by_key = {v.key: v for v in contract.videos}
 
-    # Build per-dataset payloads for ``_worker_init``: descriptor lists so
-    # each worker can rehydrate Topic objects via ``Topic.from_id`` against
-    # its own RobotoClient.
+    # Build the per-dataset arguments of ``_worker_init``: the records of the
+    # contract topics, from which each worker builds its own Topic objects
+    # without an API call, and the resolved contract.
     descriptors_by_ds: dict[str, dict[str, list]] = {}
     contracts_by_ds: dict[str, Contract] = {}
     for ds_id, (_, resolved_ds, topics_dict) in prepared.items():
@@ -1228,11 +2016,13 @@ def main(context: roboto.InvocationContext) -> None:
     shard_count = _resolve_shard_count(
         context.get_optional_parameter("shard_count"),
     )
-    if shard_count > 1 and not _shard_path_supported():
-        # Both v3-only knobs behave the same way on a lerobot 0.3.x image:
-        # accepted and ignored, never fatal. action.json is shared by both
-        # deployed variants and defaults shard_count to 3 for v3_0's benefit,
-        # so failing here would break every default invocation of v2_1.
+    if shard_count > 1 and episode_cache is None and not _shard_path_supported():
+        # A v3-only knob on a lerobot 0.3.x image: accepted and ignored,
+        # never fatal. With the episode cache, the shard count bounds the
+        # processes that convert cache misses on either variant, so it is
+        # kept. action.json is shared by both deployed variants and
+        # defaults shard_count to 3 for v3_0's benefit, so failing here
+        # would break every default invocation of v2_1.
         # Clamped before pool_size resolves so auto-sizing divides the vCPU
         # budget by the shard count actually used, not the one requested.
         # ``_pkg_version`` is ``importlib.metadata.version``, which raises
@@ -1243,7 +2033,7 @@ def main(context: roboto.InvocationContext) -> None:
         except Exception:
             embedded = "not installed"
         logger.warning(
-            "shard_count=%d ignored: sharded writing requires lerobot 0.6.x "
+            "shard_count=%d ignored: sharded writing requires lerobot 0.6 or later "
             "(lerobot.datasets.aggregate.aggregate_datasets is missing) and "
             "the embedded lerobot is %s. Falling back to the single-writer "
             "path (shard_count=1).",
@@ -1262,8 +2052,39 @@ def main(context: roboto.InvocationContext) -> None:
     )
 
     accumulator = _DrainAccum()
+    recipe = recipe_hash(
+        contract_path=context.input_dir / contract_rel_path,
+        features=features,
+        streaming_encoding=_STREAMING_ENCODING,
+    )
 
-    if shard_count == 1:
+    if episode_cache is not None:
+        # Every episode is written by a shard process, so the
+        # preloaded first event is only needed for feature discovery.
+        del first_data
+        _convert_with_episode_cache(
+            cache=episode_cache,
+            recipe=recipe,
+            matched=matched,
+            matched_events=matched_events,
+            topics_by_ds={ds_id: topics for ds_id, (_, _, topics) in prepared.items()},
+            contracts_by_ds=contracts_by_ds,
+            buffer_ns=buffer_ns,
+            action_lead_ns=action_lead_ns,
+            dataset_root=dataset_root,
+            workdir=subfolder / "_episode_cache",
+            max_parallel=shard_count,
+            accumulator=accumulator,
+            fps=fps,
+            features=features,
+            robot_type=contract.robot_type or "unknown",
+            encoder_threads=encoder_threads,
+            pool_size=pool_size,
+            video_specs_by_key=video_specs_by_key,
+            descriptors_by_ds=descriptors_by_ds,
+            log_level=context.log_level,
+        )
+    elif shard_count == 1:
         # Single-writer path — keep the preloaded-event optimisation: the
         # ``DataCollection`` we already paid for feature discovery feeds
         # the first episode inline, no extra fetch round-trip.
@@ -1324,41 +2145,15 @@ def main(context: roboto.InvocationContext) -> None:
              for i in range(preloaded_num_frames)],
             name="timestamp",
         )
-        try:
-            resolved_preloaded_task = resolve_task_label(
-                contract=first_resolved,
-                episode_data=first_data,
-                start_time_ns=int(preloaded_event.start_time),
-                end_time_ns=int(preloaded_event.end_time),
-                metadata_task=preloaded_task,
-            )
-            preloaded_frames = list(generate_frames(
-                first_resolved, first_data, preloaded_ref_ts, task=resolved_preloaded_task,
-            ))
-            preloaded_episode = WorkerEpisode(
-                event_idx=preloaded_event_idx,
-                task_label=resolved_preloaded_task,
-                frames=preloaded_frames,
-            )
-        except Exception as exc:
-            # Demote the failed event to a pool task instead of dropping it
-            # outright: the pool-stage retry exercises the same code path
-            # every other event runs, so a deterministic preload bug shows
-            # up as a second skip entry with stage="worker" and the
-            # operator gets symmetric diagnostics.
-            _record_skip(
-                accumulator=accumulator,
-                meta={
-                    "event_idx": preloaded_event_idx,
-                    "event_id": getattr(preloaded_event, "event_id", None),
-                    "src_ds_id": matched[preloaded_idx][1],
-                    "start_time_ns": int(preloaded_event.start_time),
-                    "end_time_ns": int(preloaded_event.end_time),
-                    "task_label": preloaded_task,
-                },
-                exc=exc,
-                stage="preload",
-            )
+        preloaded_episode = _preload_episode(
+            contract=first_resolved,
+            episode_data=first_data,
+            event=preloaded_event,
+            event_idx=preloaded_event_idx,
+            metadata_task=preloaded_task,
+            ref_ts=preloaded_ref_ts,
+        )
+        if preloaded_episode is None:
             pool_tasks.append(EventTask(
                 event_idx=preloaded_event_idx,
                 event_id=getattr(preloaded_event, "event_id", None),
@@ -1371,7 +2166,6 @@ def main(context: roboto.InvocationContext) -> None:
                 action_lead_ns=action_lead_ns,
             ))
             preloaded_event_idx = None
-            preloaded_episode = None
 
         logger.info(
             "Single-writer drain: %d pool events + 1 preloaded (slot=%d), "
@@ -1505,6 +2299,21 @@ def main(context: roboto.InvocationContext) -> None:
     logger.info("Contract archived: %s", archived_contract_path)
 
     lerobot_version = _pkg_version("lerobot")
+    _write_lineage(
+        dataset_root,
+        run={
+            "invocation_id": context.invocation_id,
+            "collection_id": collection_id,
+            "collection_version": collection_version,
+            "contract": {"name": contract.name, "version": contract.version, "sha256": contract_sha256},
+            "lerobot_version": lerobot_version,
+            "recipe_hash": recipe,
+        },
+        episodes=episode_to_event,
+    )
+    # After ``_write_lineage``, so the Lance layout's copy of ``meta/`` has the lineage.
+    if output_format != "lerobot":
+        _write_lance(dataset_root, subfolder / "lance", keep_lerobot=output_format == "both")
 
     # Flatten per-dataset dedup reports; each entry carries enough context
     # (dataset_id + per-file file_ids/paths) to find the source upload.
@@ -1551,6 +2360,7 @@ def main(context: roboto.InvocationContext) -> None:
         "codebase": {
             "lerobot": lerobot_version,
         },
+        "output_format": output_format,
         "generated_at": datetime.now(UTC).isoformat(),
     }
     (subfolder / "manifest.json").write_text(json.dumps(manifest, indent=2))
