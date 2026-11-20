@@ -149,6 +149,7 @@ _LINEAGE_NAME = "roboto_lineage.json"
 # ``aggregate_datasets`` and the Lance converter keep the columns.
 _LINEAGE_COLUMNS: dict[str, str] = {
     "event_id": "string",
+    "session_id": "string",
     "source_dataset_id": "string",
     "start_time_ns": "int64",
     "end_time_ns": "int64",
@@ -1705,8 +1706,9 @@ def _write_lineage(dataset_root: Path, run: dict, episodes: list[dict]) -> None:
     as in the dataset.
 
     Writes ``run`` to ``meta/roboto_lineage.json`` with, per episode, its
-    index, event, source dataset, bounds, whether it came from the episode
-    cache and, when the cache was on, its ``episode_key``. Then appends a
+    index, its event or its session (the other id is null), source dataset,
+    bounds, whether it came from the episode cache and, when the cache was
+    on, its ``episode_key``. Then appends a
     ``roboto/<field>`` column for each field of ``_LINEAGE_COLUMNS`` to every
     episode metadata file, ``meta/episodes/*/*.parquet``. A v2.1 dataset
     keeps its episode metadata in ``meta/episodes.jsonl`` instead, so it
@@ -1719,6 +1721,7 @@ def _write_lineage(dataset_root: Path, run: dict, episodes: list[dict]) -> None:
         {
             "episode_index": int(e["episode_index"]),
             "event_id": e["event_id"],
+            "session_id": e.get("session_id"),
             "source_dataset_id": e["source_dataset_id"],
             "start_time_ns": int(e["start_time_ns"]),
             "end_time_ns": int(e["end_time_ns"]),
@@ -2240,6 +2243,7 @@ def main(context: roboto.InvocationContext) -> None:
             "invocation_id": context.invocation_id,
             "collection_id": collection_id,
             "collection_version": collection_version,
+            "collection_resource_type": collection_resource_type,
             "contract": {"name": contract.name, "version": contract.version, "sha256": contract_sha256},
             "lerobot_version": lerobot_version,
             "recipe_hash": recipe,
