@@ -268,11 +268,12 @@ by their names in `selector.names`; the other columns pass through unchanged.
 `columns` must keep the number of rows and columns it is given, so
 `resample_uniform` cannot take them.
 
-A `post` transform runs on the frames its stream has a sample for: frames
-where the stream has a gap longer than its tolerance are dropped, and the
-frames on either side of the gap reach the transform as neighbours. That
-matters only for transforms that look at neighbouring frames
-(`finite_difference` and the Butterworth filters).
+Frames where a stream has a gap longer than its tolerance are dropped. A
+`post` transform runs separately on each unbroken run of the remaining
+frames, so `finite_difference` and the Butterworth filters never treat the
+two sides of a gap as neighbours. A run too short for a filter's usual edge
+padding is filtered with as much padding as it allows, and a single frame's
+`finite_difference` is zero.
 
 ### Built-in transforms
 

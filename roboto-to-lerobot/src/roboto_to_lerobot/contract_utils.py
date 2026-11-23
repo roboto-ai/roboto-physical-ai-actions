@@ -23,7 +23,7 @@ License text: ``runtime/LICENSE-rosetta``.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
@@ -1232,12 +1232,7 @@ class DataCollection:
                 all_timestamps = []
                 all_values = []
 
-                # Take each timestamp from the int64 column, not from the row:
-                # ``iterrows`` returns a float64 row when every field is
-                # numeric, and a float64 timestamp cannot hold a nanosecond
-                # time exactly and makes ``merge_asof`` raise against the
-                # int64 timeline.
-                for timestamp, (_, row) in zip(raw_df["timestamp"].tolist(), raw_df.iterrows(), strict=True):
+                for row in _message_rows(raw_df):
                     decoded = decode_value(row, action)
 
                     # Check if decoder returned flattened structure (e.g., JointTrajectory)
@@ -1247,7 +1242,7 @@ class DataCollection:
                         all_values.extend(decoded['values'])
                     else:
                         # Regular decoder - one value per message
-                        all_timestamps.append(timestamp)
+                        all_timestamps.append(row["timestamp"])
                         all_values.append(decoded)
 
                 # Create DataFrame with timestamp + values columns
@@ -1326,13 +1321,11 @@ class DataCollection:
 
                 # Each row is one message, with columns such as "name" and
                 # "position", which the decoder reads like a message object.
-                decoded_values = [decode_value(row, observation) for _, row in raw_df.iterrows()]
+                decoded_values = [decode_value(row, observation) for row in _message_rows(raw_df)]
 
                 # Single ``values`` column of per-row numpy arrays — matches
                 # what ``lerobot.generate_frames`` expects when it stacks /
-                # merges array streams onto the reference timeline. Timestamps
-                # come from the int64 column, not the rows; see the same note
-                # in ``_load_actions``.
+                # merges array streams onto the reference timeline.
                 result = pd.DataFrame({
                     "timestamp": raw_df["timestamp"].to_numpy(),
                     "values": decoded_values,
@@ -1690,6 +1683,20 @@ def _as_qos(it: dict[str, Any]) -> QosSpec | None:
         history=str(blk.get("history", "KEEP_LAST")).upper(),
         depth=int(blk.get("depth", 1)),
     )
+
+
+def _message_rows(raw_df: pd.DataFrame) -> Iterator[pd.Series]:
+    """Yield each message of a fetched topic as a row of its fields, each keeping its own type.
+
+    ``iterrows`` gives every field of a row the type all the columns share,
+    so on a topic whose fields are all numbers each field, the timestamp
+    included, arrives as float64: an integer above 2**53, such as a time in
+    nanoseconds, is rounded, and ``merge_asof`` refuses the float timestamps
+    against the int64 timeline. Rows taken from the frame cast to ``object``
+    keep each field as it was fetched.
+    """
+    for _, row in raw_df.astype(object).iterrows():
+        yield row
 
 
 def _parse_transforms(it: dict[str, Any]) -> list[TransformSpec] | None:

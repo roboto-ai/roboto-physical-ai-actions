@@ -11,6 +11,7 @@ from textwrap import dedent
 
 import numpy as np
 import pandas as pd
+import pytest
 from roboto_to_lerobot.contract_utils import (
     DataCollection,
     fps_to_time_step_ns,
@@ -135,11 +136,11 @@ def test_polar_vector_interpolates_in_cartesian(tmp_path):
     np.testing.assert_allclose(values[:, 0], np.interp(_REFERENCE_S, _SOURCE_S, depth), atol=1e-5)
 
 
-def test_post_transform_on_a_stream_with_a_gap_drops_only_the_gap(tmp_path):
-    """A stream with a hole longer than its tolerance loses the frames in the hole; the post
-    transform still applies to the rest."""
-    # Arrange: drop the samples between 0.75 s and 1.35 s.
-    df = _topic_df({"yaw": np.full(len(_SOURCE_S), 4.0)})
+def test_post_transform_does_not_treat_the_sides_of_a_gap_as_neighbours(tmp_path):
+    """A stream with a hole longer than its tolerance loses the frames in the hole, and a
+    frame-to-frame difference on the rest never spans the hole."""
+    # Arrange: a ramp of 1 per second, without its samples between 0.75 s and 1.35 s.
+    df = _topic_df({"px": _SOURCE_S.copy()})
     df = df[(_SOURCE_S < 0.75) | (_SOURCE_S > 1.35)].reset_index(drop=True)
 
     # Act
@@ -147,15 +148,47 @@ def test_post_transform_on_a_stream_with_a_gap_drops_only_the_gap(tmp_path):
         - key: observation.state
           topic: /pose
           type: string_typed_msg
-          selector: {names: [yaw]}
+          selector: {names: [px]}
           align: {method: linear, tolerance_ms: 150}
           transforms:
-            - {type: wrap_angle}
+            - {type: finite_difference}
+    """, df=df)
+
+    # Assert: no frame's difference exceeds one frame's rise. Frames just past
+    # a run's last sample repeat it (align: linear), so theirs is zero.
+    step = _STEP_NS / 1e9
+    assert 0 < len(values) < len(_REFERENCE_S)
+    assert values[:, 0].max() < step * 1.001
+    assert np.median(values[:, 0]) == pytest.approx(step, rel=1e-4)
+
+
+@pytest.mark.parametrize(
+    ("transform", "expected"),
+    [
+        pytest.param("{type: finite_difference}", 0.0, id="finite_difference"),
+        pytest.param("{type: butterworth_lowpass, cutoff_hz: 5}", 4.0, id="butterworth_lowpass"),
+    ],
+)
+def test_post_transform_converts_a_short_run_between_gaps(tmp_path, transform, expected):
+    """A few frames left between two holes in a stream are converted, however short the run."""
+    # Arrange: a constant stream with samples only at 0-0.5 s, 1.0 s and 1.5-2 s.
+    keep = (_SOURCE_S < 0.55) | np.isclose(_SOURCE_S, 1.0) | (_SOURCE_S > 1.45)
+    df = _topic_df({"px": np.full(len(_SOURCE_S), 4.0)})[keep].reset_index(drop=True)
+
+    # Act
+    values = _convert(tmp_path, stream=f"""
+        - key: observation.state
+          topic: /pose
+          type: string_typed_msg
+          selector: {{names: [px]}}
+          align: {{method: hold, tolerance_ms: 40}}
+          transforms:
+            - {transform}
     """, df=df)
 
     # Assert
     assert 0 < len(values) < len(_REFERENCE_S)
-    np.testing.assert_allclose(values[:, 0], 4.0 - 2 * np.pi, atol=1e-6)
+    np.testing.assert_allclose(values[:, 0], expected, atol=1e-5)
 
 
 def test_topic_with_only_numeric_fields_aligns(tmp_path):

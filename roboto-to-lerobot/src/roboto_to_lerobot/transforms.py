@@ -130,8 +130,11 @@ def _finite_difference(
     out[i] = in[i+1] - in[i]
 
     Last row is set to repeat the second-to-last value so that the output
-    shape matches the input.
+    shape matches the input. A single frame has no neighbour to differ from,
+    so its difference is zero.
     """
+    if len(data) < 2:
+        return np.zeros_like(data, dtype=np.float64)
     out = np.empty_like(data, dtype=np.float64)
     out[:-1] = np.diff(data, axis=0)
     out[-1] = out[-2]
@@ -190,7 +193,12 @@ def _butterworth_lowpass(
     order = params.get("order", 2)
     _validate_cutoff_hz("butterworth_lowpass", cutoff_hz, fps)
     sos = butter(order, cutoff_hz, btype="low", output="sos", fs=fps)
-    return sosfiltfilt(sos, data, axis=0)
+    # sosfiltfilt pads each end with this many reflected samples (its own
+    # default) and refuses input no longer than that, as a short run of
+    # frames between two gaps can be; such input gets as much padding as it
+    # can take, and longer input is filtered exactly as before.
+    padlen = 3 * (2 * len(sos) + 1 - min((sos[:, 2] == 0).sum(), (sos[:, 5] == 0).sum()))
+    return sosfiltfilt(sos, data, axis=0, padlen=min(padlen, len(data) - 1))
 
 
 @register_transform("butterworth_lowpass_causal")

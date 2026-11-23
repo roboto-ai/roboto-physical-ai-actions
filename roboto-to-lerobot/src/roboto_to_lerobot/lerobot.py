@@ -315,14 +315,15 @@ def generate_frames(
         col = array_keys.get(spec.unique_key)
         if col is None:
             continue
-        # Frames the stream has no sample for hold NaN; they are dropped
-        # below, so transform only the frames that have one.
-        matched = merged_df[col].notna()
-        if not matched.any():
-            continue
-        stacked = np.stack(merged_df.loc[matched, col].values)  # (T, N)
-        stacked = apply_transforms(stacked, post_specs, contract.fps)
-        merged_df.loc[matched, col] = pd.Series(list(stacked), index=merged_df.index[matched])
+        # Frames the stream has no sample for hold NaN and are dropped
+        # below. Transform each unbroken run of the other frames on its own,
+        # so a transform that reads neighbouring frames (a difference, a
+        # filter) never treats the two sides of a gap as neighbours.
+        for run in _runs_of_matched_frames(merged_df[col].notna().to_numpy()):
+            rows = merged_df.index[run]
+            stacked = np.stack(merged_df.loc[rows, col].values)  # (T, N)
+            stacked = apply_transforms(stacked, post_specs, contract.fps)
+            merged_df.loc[rows, col] = pd.Series(list(stacked), index=rows)
 
     rows_before = len(merged_df)
     if dropped_frames is not None:
@@ -440,3 +441,10 @@ def generate_frames(
         yield frame_dict
 
     logger.info("Generated %d frames", frame_count)
+
+
+def _runs_of_matched_frames(matched: np.ndarray) -> list[slice]:
+    """Return the position ranges of the unbroken runs of ``True`` in ``matched``, in order."""
+    edges = np.diff(np.concatenate([[False], matched, [False]]).astype(np.int8))
+    starts, stops = np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
+    return [slice(start, stop) for start, stop in zip(starts, stops, strict=True)]
