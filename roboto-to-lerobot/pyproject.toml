@@ -17,6 +17,14 @@ dependencies = [
     # fields. >= 0.63.0 for ``Session.list_events``, which sub-tasks are read
     # from.
     "roboto[video] >= 0.63.0",
+    # The SDK reads a topic Roboto stores as Parquet (a derived topic, for
+    # one) over HTTP with fsspec's HTTP filesystem, which needs aiohttp. Its
+    # [analytics] extra declares this, but also pulls in stumpy and numba,
+    # which nothing here uses; lerobot 0.6.1 and 0.3.3 pulled aiohttp in by
+    # chance, lerobot 0.7.0 does not. No version floor: the extra's
+    # (2025.5.1) is above the fsspec <= 2025.3.0 that lerobot 0.3.3's
+    # datasets requires, and the Parquet read works with that version.
+    "fsspec[http]",
     # 0.6 moved datasets/pyarrow/av/torchcodec into the [dataset] extra;
     # 0.3.x has no such extra and lists them as core deps. The Dockerfile and
     # scripts/setup.sh pin the exact version per variant (scripts/variants.sh).
