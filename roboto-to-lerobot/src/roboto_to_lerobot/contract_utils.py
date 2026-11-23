@@ -1232,10 +1232,11 @@ class DataCollection:
                 all_timestamps = []
                 all_values = []
 
-                # Timestamps come from the int64 column: ``iterrows`` turns a
-                # row whose fields are all numeric into float64, which
-                # ``merge_asof`` refuses against the int64 timeline and which
-                # cannot hold a nanosecond time exactly.
+                # Take each timestamp from the int64 column, not from the row:
+                # ``iterrows`` returns a float64 row when every field is
+                # numeric, and a float64 timestamp cannot hold a nanosecond
+                # time exactly and makes ``merge_asof`` raise against the
+                # int64 timeline.
                 for timestamp, (_, row) in zip(raw_df["timestamp"].tolist(), raw_df.iterrows(), strict=True):
                     decoded = decode_value(row, action)
 
@@ -1323,25 +1324,18 @@ class DataCollection:
                     self.observations[unique_key] = pd.DataFrame({"timestamp": []})
                     continue
 
-                # Apply decoder to each message
-                timestamps = []
-                decoded_values = []
-
-                # Timestamps come from the int64 column; see the same loop in
-                # ``_load_actions``.
-                for timestamp, (_, row) in zip(raw_df["timestamp"].tolist(), raw_df.iterrows(), strict=True):
-                    # The decoder expects the row as a message-like object
-                    # Roboto returns rows with columns like "name", "position", etc.
-                    decoded = decode_value(row, observation)
-                    timestamps.append(timestamp)
-                    decoded_values.append(decoded)
+                # Each row is one message, with columns such as "name" and
+                # "position", which the decoder reads like a message object.
+                decoded_values = [decode_value(row, observation) for _, row in raw_df.iterrows()]
 
                 # Single ``values`` column of per-row numpy arrays — matches
                 # what ``lerobot.generate_frames`` expects when it stacks /
-                # merges array streams onto the reference timeline.
+                # merges array streams onto the reference timeline. Timestamps
+                # come from the int64 column, not the rows; see the same note
+                # in ``_load_actions``.
                 result = pd.DataFrame({
-                    "timestamp": timestamps,
-                    "values": decoded_values,  # List of numpy arrays
+                    "timestamp": raw_df["timestamp"].to_numpy(),
+                    "values": decoded_values,
                 })
 
                 # Populate resolved_features with LeRobot-facing names
@@ -1699,12 +1693,20 @@ def _as_qos(it: dict[str, Any]) -> QosSpec | None:
 
 
 def _parse_transforms(it: dict[str, Any]) -> list[TransformSpec] | None:
-    """Extract and parse ``transforms`` from a spec block."""
+    """Parse a spec block's ``transforms``, or return ``None`` when it has none.
+
+    Converts each transform's ``columns`` names to their positions in
+    ``selector.names``. Raises ``ValueError`` for a ``stage`` other than
+    ``pre`` or ``post``, for ``columns`` that is not a non-empty list of
+    distinct names, and for a column name that ``selector.names`` lacks, so a
+    mistyped contract fails when it loads rather than after its data is
+    fetched.
+    """
     raw = it.get("transforms")
     if not raw:
         return None
     names = list((it.get("selector") or {}).get("names") or [])
-    specs = []
+    specs: list[TransformSpec] = []
     for t in raw:
         where = f"Stream '{it.get('key', '?')}': transform '{t['type']}'"
         stage = t.get("stage", "post")
@@ -1712,10 +1714,13 @@ def _parse_transforms(it: dict[str, Any]) -> list[TransformSpec] | None:
             raise ValueError(f"{where} has stage {stage!r}; use 'pre' or 'post'.")
         columns = None
         if "columns" in t:
-            unknown = [c for c in t["columns"] if c not in names]
+            listed = t["columns"]
+            if not isinstance(listed, list) or not listed or len(set(listed)) != len(listed):
+                raise ValueError(f"{where} needs 'columns' as a list of distinct names, got {listed!r}.")
+            unknown = [c for c in listed if c not in names]
             if unknown:
                 raise ValueError(f"{where} names columns {unknown} that are not in selector.names {names}.")
-            columns = tuple(names.index(c) for c in t["columns"])
+            columns = tuple(names.index(c) for c in listed)
         specs.append(TransformSpec(
             type=t["type"],
             params={k: v for k, v in t.items() if k not in ("type", "stage", "columns")},

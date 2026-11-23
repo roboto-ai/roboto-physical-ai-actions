@@ -263,9 +263,16 @@ Any other `stage` fails when the contract loads.
 
 A transform applies to every column of its stream unless it lists `columns`,
 by their names in `selector.names`; the other columns pass through unchanged.
-A name that is not in `selector.names` fails when the contract loads. A
-transform given `columns` must keep the number of rows and columns it is
-given, so `resample_uniform` cannot take them.
+`columns` must be a non-empty list of distinct names, each in
+`selector.names`, or the contract fails when it loads. A transform given
+`columns` must keep the number of rows and columns it is given, so
+`resample_uniform` cannot take them.
+
+A `post` transform runs on the frames its stream has a sample for: frames
+where the stream has a gap longer than its tolerance are dropped, and the
+frames on either side of the gap reach the transform as neighbours. That
+matters only for transforms that look at neighbouring frames
+(`finite_difference` and the Butterworth filters).
 
 ### Built-in transforms
 
@@ -275,7 +282,7 @@ given, so `resample_uniform` cannot take them.
 | `butterworth_lowpass`   | any       | `cutoff_hz` (required), `order` (default `2`)     | Zero-phase Butterworth low-pass filter (uses scipy `sosfiltfilt`).                                                       |
 | `butterworth_lowpass_causal` | any  | `cutoff_hz` (required), `order` (default `2`), `fs_hz` (optional) | Causal (forward-only) Butterworth low-pass filter (uses scipy `sosfilt`, seeded with `sosfilt_zi` to avoid a startup transient). |
 | `finite_difference`     | any       | —                                                 | Frame-to-frame difference (`out[i] = in[i+1] - in[i]`). Last row is repeated to keep the shape constant.                  |
-| `quaternion_continuity` | `pre`     | —                                                 | Takes 4 quaternion columns, in any order. Negates each quaternion that points away from the one before it, so the stream never jumps from q to -q. |
+| `quaternion_continuity` | `pre`     | —                                                 | Takes 4 quaternion columns, in any order. Negates each quaternion whose dot product with the one before it is negative, so the stream never jumps from q to -q. |
 | `quaternion_normalize`  | `post`    | —                                                 | Takes 4 quaternion columns. Scales each quaternion to unit length; raises if one has norm below 0.7, which means `quaternion_continuity` is missing. |
 | `unwrap_angle`          | `pre`     | `degrees` (default `false`)                       | Removes the full-turn jumps where an angle wraps, so it changes continuously. Assumes less than half a turn between samples. |
 | `wrap_angle`            | `post`    | `degrees` (default `false`)                       | Brings an angle back into [-π, π) radians or [-180, 180) degrees.                                                        |
@@ -316,8 +323,8 @@ runtime (`roboto_to_lerobot.runtime.live_adapter.LiveAdapter`) —
 `butterworth_lowpass` needs future
 samples and can never run online, so `gen-node` and the live adapter both
 refuse it (and `resample_uniform`, and every other transform) unconditionally.
-Both also refuse `butterworth_lowpass_causal` with `columns`, since the live
-filter applies to every column of a stream.
+Both also refuse `butterworth_lowpass_causal` with `columns` on an
+observation, since the live filter applies to every column of a stream.
 On observations, the causal filter runs for real: a `stage: pre` instance
 filters each decoded message before it enters the alignment buffer (so it
 must declare `fs_hz`, per above), and a `stage: post` instance filters at

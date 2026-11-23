@@ -367,12 +367,14 @@ def test_missing_type_field_in_action_raises_indexed_valueerror_with_key(tmp_pat
     ("transform", "message"),
     [
         pytest.param("{type: wrap_angle, columns: [yaw]}", "not in selector.names", id="unknown_column"),
+        pytest.param("{type: wrap_angle, columns: heading}", "list of distinct names", id="columns_not_a_list"),
         pytest.param("{type: wrap_angle, stage: during}", "use 'pre' or 'post'", id="unknown_stage"),
     ],
 )
 def test_transform_with_unknown_column_or_stage_fails_at_load(tmp_path, transform, message):
-    """A transform naming a column the stream does not select, or a stage that does not exist,
-    fails when the contract loads rather than after data is fetched."""
+    """A transform naming a column the stream does not select, giving ``columns`` as anything but
+    a list, or naming a stage that does not exist, fails when the contract loads rather than after
+    data is fetched."""
     path = _write(tmp_path, f"""
         name: t
         version: 1

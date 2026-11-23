@@ -143,6 +143,8 @@ class LiveAdapter:
             transforms always run on the contract-fps reference timeline,
             so a differing ``fs_hz`` is a contradiction in the contract —
             refuse it rather than silently pick one interpretation.
+          - no ``columns``: the live filter runs on every column of the
+            decoded value.
 
         Actions accept ``butterworth_lowpass_causal`` unconditionally, with
         no ``fs_hz`` requirement: :meth:`encode_action` never re-applies
@@ -187,7 +189,8 @@ class LiveAdapter:
                     f"Spec key={spec.key!r} topic={spec.topic!r} limits "
                     f"{_LIVE_TRANSFORM!r} to some columns, which the live "
                     "runtime cannot do: it filters every column of a stream. "
-                    "Drop 'columns', or split the stream."
+                    "Drop 'columns', or select those columns in a stream of "
+                    "their own."
                 )
             if transform.stage == "pre" and "fs_hz" not in transform.params:
                 raise ValueError(

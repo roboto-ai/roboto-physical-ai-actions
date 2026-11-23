@@ -1,8 +1,9 @@
 # roboto_to_lerobot/transforms.py
 # -----------------------------------------------------------------------------
 # Registry of transforms applied to observation/action timeseries.
-# Each transform operates on the full episode stacked as an (T, N)
-# ndarray.  Transforms may optionally receive and return timestamps.
+# Each transform operates on the full episode stacked as a (T, N) ndarray:
+# every column of the stream, or the ``columns`` its spec lists.
+# Transforms may optionally receive and return timestamps.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -62,6 +63,11 @@ def apply_transforms(
     fps + timestamps pair, then used as ``fps = ts_scale / median(diff(new_ts))``
     after any transform that modifies the time axis.
 
+    A spec that lists ``columns`` gives its transform only those columns and
+    writes the result back in their place; the other columns pass through
+    unchanged. Such a transform must return the shape it was given, so one
+    that changes the time axis or the column count raises ``ValueError``.
+
     Returns:
         If *timestamps* was ``None``: the transformed data array.
         If *timestamps* was provided: ``(data, timestamps)`` tuple (timestamps
@@ -91,6 +97,8 @@ def apply_transforms(
                     f"Transform '{spec.type}' cannot take 'columns': it changes "
                     "the number of rows or columns it is given."
                 )
+            # A float64 copy: an integer stream would truncate the result,
+            # and the caller's array stays unchanged.
             data = np.array(data, dtype=np.float64)
             data[:, spec.columns] = result
             result = data
@@ -312,7 +320,7 @@ def _resample_uniform(
 # wraps, and a polar vector's angle wraps too. Each pre-stage transform below
 # puts a stream into a form that ``align: linear`` interpolates correctly;
 # the matching post-stage transform, where there is one, restores the
-# recorded form. Pass ``columns`` to apply one to part of a stream.
+# recorded form. List ``columns`` to apply one to part of a stream.
 # ---------------------------------------------------------------------------
 
 
@@ -331,10 +339,12 @@ def _require_width(name: str, data: np.ndarray, width: int) -> None:
 
 @register_transform("quaternion_continuity")
 def _quaternion_continuity(data: np.ndarray, params: dict, fps: float, **kwargs: object) -> np.ndarray:
-    """Negate each quaternion that points away from the one before it, so the stream never jumps from q to -q.
+    """Negate each quaternion whose dot product with the one before it is negative.
 
-    Use at ``stage: pre`` before ``align: linear``, followed by a post-stage
-    ``quaternion_normalize``. Takes the 4 quaternion components in any order.
+    q and -q are the same rotation, so no rotation changes, and the stream
+    never jumps from q to -q. Use at ``stage: pre`` before ``align: linear``,
+    followed by a post-stage ``quaternion_normalize``. Takes the 4 quaternion
+    components in any order.
     """
     _require_width("quaternion_continuity", data, 4)
     dots = np.einsum("ij,ij->i", data[1:], data[:-1])
@@ -347,8 +357,11 @@ def _quaternion_normalize(data: np.ndarray, params: dict, fps: float, **kwargs: 
     """Scale each quaternion to unit length.
 
     After ``quaternion_continuity`` and ``align: linear`` this gives normalized
-    linear interpolation, which follows the same path as SLERP. A norm below
-    0.7 means two blended samples were not made continuous first, so it raises.
+    linear interpolation, which follows the same path as SLERP. Two unit
+    quaternions whose dot product is not negative are at most 90° apart as
+    4-vectors, so a linear blend of the two has norm at least cos 45° ≈ 0.707.
+    A norm below 0.7 means two opposite samples were blended, so the transform
+    raises rather than return an arbitrary rotation.
     """
     _require_width("quaternion_normalize", data, 4)
     norm = np.linalg.norm(data, axis=1, keepdims=True)
@@ -365,8 +378,8 @@ def _quaternion_normalize(data: np.ndarray, params: dict, fps: float, **kwargs: 
 def _unwrap_angle(data: np.ndarray, params: dict, fps: float, **kwargs: object) -> np.ndarray:
     """Remove the full-turn jumps where each angle column wraps, so it changes continuously.
 
-    Use at ``stage: pre``; ``degrees: true`` for angles in degrees. Assumes an
-    angle turns less than half a turn between samples.
+    Use at ``stage: pre``, and set ``degrees: true`` for angles in degrees.
+    Assumes an angle turns less than half a turn between samples.
     """
     return np.unwrap(data, axis=0, period=_angle_period(params))
 
@@ -380,7 +393,10 @@ def _wrap_angle(data: np.ndarray, params: dict, fps: float, **kwargs: object) ->
 
 @register_transform("polar_to_cartesian")
 def _polar_to_cartesian(data: np.ndarray, params: dict, fps: float, **kwargs: object) -> np.ndarray:
-    """Turn ``[r, theta]``, theta measured from +x towards +y, into ``[x, y]``."""
+    """Turn ``[r, theta]``, theta measured from +x towards +y, into ``[x, y]``.
+
+    Set ``degrees: true`` for theta in degrees.
+    """
     _require_width("polar_to_cartesian", data, 2)
     r, theta = data[:, 0], _radians(data[:, 1], params)
     return np.stack([r * np.cos(theta), r * np.sin(theta)], axis=1)
@@ -391,10 +407,11 @@ def _spherical_to_cartesian(data: np.ndarray, params: dict, fps: float, **kwargs
     """Turn ``[r, theta, phi]`` into ``[x, y, z]``.
 
     theta is the inclination, measured from +z; phi is the azimuth, measured
-    from +x towards +y.
+    from +x towards +y. Set ``degrees: true`` for angles in degrees.
     """
     _require_width("spherical_to_cartesian", data, 3)
     r, theta, phi = data[:, 0], _radians(data[:, 1], params), _radians(data[:, 2], params)
     return np.stack(
-        [r * np.sin(theta) * np.cos(phi), r * np.sin(theta) * np.sin(phi), r * np.cos(theta)], axis=1,
+        [r * np.sin(theta) * np.cos(phi), r * np.sin(theta) * np.sin(phi), r * np.cos(theta)],
+        axis=1,
     )
