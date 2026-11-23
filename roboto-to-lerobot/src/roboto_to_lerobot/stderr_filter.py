@@ -20,6 +20,7 @@ are filtered as known-benign — see ``_SVT_BENIGN_WARN``.
 
 from __future__ import annotations
 
+import atexit
 import os
 import re
 import sys
@@ -59,6 +60,10 @@ _SVT_BENIGN_WARN = re.compile(
 _INSTALLED = False
 
 
+# How long exiting waits for the filter thread to forward the last lines.
+_DRAIN_TIMEOUT_S = 2.0
+
+
 def install_svt_stderr_filter() -> None:
     """Reroute fd 2 through a pipe + SVT-noise filter thread.
 
@@ -81,6 +86,7 @@ def install_svt_stderr_filter() -> None:
 
     read_fd, write_fd = os.pipe()
     saved_stderr_fd = os.dup(2)
+    restore_fd = os.dup(saved_stderr_fd)
     os.dup2(write_fd, 2)
     os.close(write_fd)
 
@@ -112,9 +118,22 @@ def install_svt_stderr_filter() -> None:
                     except Exception:
                         return
 
-    threading.Thread(
-        target=pump, name="svt-stderr-filter", daemon=True,
-    ).start()
+    thread = threading.Thread(target=pump, name="svt-stderr-filter", daemon=True)
+    thread.start()
+
+    def drain() -> None:
+        # Python writes an uncaught exception's traceback to stderr just
+        # before it exits, and exiting stops the filter thread. Point fd 2
+        # back at the real stderr and let the thread forward what the pipe
+        # still holds, so the run's last lines reach the log.
+        try:
+            sys.stderr.flush()
+            os.dup2(restore_fd, 2)
+        except (OSError, ValueError):
+            return
+        thread.join(timeout=_DRAIN_TIMEOUT_S)
+
+    atexit.register(drain)
 
 
 def set_libav_log_level() -> None:
