@@ -40,6 +40,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -50,7 +51,6 @@ from roboto.exceptions import RobotoNotFoundException
 
 from .contract_utils import Contract, _topic_intersects_window
 from .logger import logger
-from .writers.v3_0 import _VCODEC
 
 CACHE_PREFIX = ".lerobot-cache"
 # Uploaded after every other file of its entry. It holds the episode's
@@ -86,7 +86,9 @@ def _source_digest() -> str:
     return digest.hexdigest()
 
 
-def recipe_hash(*, contract_path: Path, features: dict, streaming_encoding: bool) -> str:
+def recipe_hash(
+    *, contract_path: Path, features: dict, streaming_encoding: bool, video_encoding: Mapping[str, Any],
+) -> str:
     """Hash the settings that every entry merged into one export must share.
 
     The contract is hashed as parsed YAML, so comments, whitespace, key
@@ -105,7 +107,7 @@ def recipe_hash(*, contract_path: Path, features: dict, streaming_encoding: bool
         "source": _source_digest(),
         "lerobot": _pkg_version("lerobot"),
         "codebase_version": CODEBASE_VERSION,
-        "vcodec": _VCODEC,
+        "video_encoding": dict(video_encoding),
         "streaming_encoding": streaming_encoding,
         "features": features,
     })

@@ -47,6 +47,7 @@ from roboto_to_lerobot.episode_cache import (
     recipe_hash,
 )
 from roboto_to_lerobot.main import _STREAMING_ENCODING, _DrainAccum, _open_episode_cache
+from roboto_to_lerobot.writers import LeRobotWriter
 from test_sharded import _SyncPool
 
 main_mod = sys.modules["roboto_to_lerobot.main"]
@@ -237,8 +238,13 @@ class _Harness:
             matched_events.append(SimpleNamespace(event_id=event_id, start_time=start, end_time=end))
         return matched, matched_events
 
-    def export(self, events: list[tuple], max_parallel: int = 2) -> Path:
-        """Export ``events`` (chronological) through the cache; return the dataset root."""
+    def export(self, events: list[tuple], max_parallel: int = 2, video_overrides: dict | None = None) -> Path:
+        """Export ``events`` (chronological) through the cache; return the dataset root.
+
+        ``video_overrides`` are the video parameters' encoder settings, as
+        ``main`` passes them to the writer.
+        """
+        video_encoding = LeRobotWriter.resolve_video_encoding(video_overrides or {})
         self._runs += 1
         self.converted.append([])
         contract = load_contract(self.contract_path)
@@ -248,6 +254,7 @@ class _Harness:
         out = self.tmp_path / f"run-{self._runs}"
         recipe = recipe_hash(
             contract_path=self.contract_path, features=features, streaming_encoding=_STREAMING_ENCODING,
+            video_encoding=video_encoding,
         )
         accumulator = _DrainAccum()
         main_mod._convert_with_episode_cache(
@@ -267,6 +274,7 @@ class _Harness:
             features=features,
             robot_type=contract.robot_type,
             encoder_threads=2,
+            video_encoding=video_encoding,
             pool_size=1,
             video_specs_by_key={v.key: v for v in contract.videos},
             descriptors_by_ds={_DS: {}},
@@ -409,6 +417,19 @@ def test_contract_change_converts_everything_but_reformatting_converts_nothing(h
     harness.export(events)
     harness.contract_path.write_text(_CONTRACT.replace("robot_type: test_arm", "robot_type: other_arm"))
     harness.export(events)
+
+    # Assert
+    assert harness.converted[1:] == [[], ["ev_0", "ev_1"]]
+
+
+def test_video_setting_change_converts_everything_but_restating_a_default_converts_nothing(harness):
+    # Arrange
+    events = _events(0, 1)
+    harness.export(events)
+
+    # Act
+    harness.export(events, video_overrides={"crf": 30})
+    harness.export(events, video_overrides={"crf": 40})
 
     # Assert
     assert harness.converted[1:] == [[], ["ev_0", "ev_1"]]

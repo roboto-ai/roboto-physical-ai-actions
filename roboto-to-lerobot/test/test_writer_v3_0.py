@@ -30,10 +30,11 @@ _FEATURES = {
 _STOCK_RUN = video_utils._CameraEncoderThread.run
 
 
-def _writer(root: Path, *, queue_maxsize: int = 30) -> LeRobotWriter:
+def _writer(root: Path, *, queue_maxsize: int = 30, video_encoding: dict | None = None) -> LeRobotWriter:
     return LeRobotWriter.create(
         repo_id="test", fps=10, features=_FEATURES, root=root, robot_type="test",
         image_writer_threads=1, streaming_encoding=True, encoder_threads=1, encoder_queue_maxsize=queue_maxsize,
+        video_encoding=video_encoding,
     )
 
 
@@ -194,3 +195,23 @@ def test_episode_without_cameras_saves(tmp_path):
     # Assert
     info = json.loads((tmp_path / "ds" / "meta" / "info.json").read_text())
     assert (info["total_episodes"], info["total_frames"]) == (1, 5)
+
+
+def test_video_settings_reach_the_encoded_video(tmp_path):
+    """The requested keyframe interval and quality are what the camera's video is encoded with."""
+    # Arrange
+    video_encoding = LeRobotWriter.resolve_video_encoding({"g": 4, "crf": 40})
+    writer = _writer(tmp_path / "ds", video_encoding=video_encoding)
+
+    # Act
+    _add_frames(writer, 12)
+    writer.save_episode()
+    writer.finalize()
+
+    # Assert
+    root = tmp_path / "ds"
+    with av.open(str(root / "videos" / _CAM / "chunk-000" / "file-000.mp4")) as container:
+        packets = [p for p in container.demux(video=0) if p.size]
+    assert [i for i, p in enumerate(packets) if p.is_keyframe] == [0, 4, 8]
+    video_info = json.loads((root / "meta" / "info.json").read_text())["features"][_CAM]["info"]
+    assert (video_info["video.g"], video_info["video.crf"]) == (4, 40)

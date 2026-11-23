@@ -33,6 +33,21 @@
             "required": false
         },
         {
+            "name": "video_crf",
+            "description": "Video quality for every camera, as the SVT-AV1 constant rate factor: an integer from 1 to 63. Lower values keep more detail and make larger files. Leave unset for 30. Only roboto-to-lerobot-v3_0 accepts it; roboto-to-lerobot-v2_1 fails the run if it is set.",
+            "required": false
+        },
+        {
+            "name": "video_preset",
+            "description": "SVT-AV1 speed preset for every camera: an integer from 0 to 13. Lower values compress better but encode much more slowly, which lengthens the run. Leave unset for 12. Only roboto-to-lerobot-v3_0 accepts it; roboto-to-lerobot-v2_1 fails the run if it is set.",
+            "required": false
+        },
+        {
+            "name": "video_gop",
+            "description": "Keyframe interval for every camera, in frames: an integer of 1 or more. Larger values make much smaller files, and reading one frame at random takes longer because decoding starts at the keyframe before it; every frame still decodes exactly. Leave unset for 2. Only roboto-to-lerobot-v3_0 accepts it; roboto-to-lerobot-v2_1 fails the run if it is set.",
+            "required": false
+        },
+        {
             "name": "shard_count",
             "description": "Number of parallel writer shards; each shard independently writes a partial dataset that is then merged (stream-copy, no re-encoding) into the final output. Sharded writing needs a merge API that lerobot 0.3.x lacks, so without episode_cache only the v3_0 variant acts on it: the v2_1 variant (lerobot 0.3.3) accepts this parameter and ignores it, falling back to a single writer and logging a warning. With episode_cache, both variants use it as the maximum number of processes that convert the episodes missing from the cache. Without episode_cache, sharding also changes episode order: episodes in the merged dataset are grouped by shard rather than strictly chronological, though each episode's original start_time_ns is preserved in the output manifest.",
             "required": false,
