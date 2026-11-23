@@ -48,6 +48,8 @@ class LeRobotWriter:
         # 0.6.x-only encoder knobs: 0.3.x's LeRobotDataset.create rejects
         # them, so we keep them in the adapter signature (so main.py has a
         # single call shape) and drop them before calling lerobot.
+        # ``video_encoding`` holds no settings, because
+        # ``resolve_video_encoding`` refuses every one.
         _ = (
             batch_encoding_size,
             streaming_encoding,

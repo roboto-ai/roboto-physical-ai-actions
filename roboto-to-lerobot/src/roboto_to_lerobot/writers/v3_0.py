@@ -60,9 +60,8 @@ class LeRobotWriter:
             root=root,
             robot_type=robot_type,
             use_videos=True,
-            # Settings ``video_encoding`` leaves out keep RGBEncoderConfig's
-            # defaults (g=2, crf=30, preset=12), which match what 0.5.x
-            # hard-coded.
+            # Settings that ``video_encoding`` leaves out keep
+            # RGBEncoderConfig's defaults (g=2, crf=30, preset=12).
             rgb_encoder=RGBEncoderConfig(**{**(video_encoding or {}), "vcodec": _VCODEC}),
             image_writer_threads=image_writer_threads,
             batch_encoding_size=batch_encoding_size,

@@ -958,10 +958,10 @@ def _run_shard_subprocess(
     video_specs_by_key: dict,
     descriptors_by_ds: dict,
     contracts_by_ds: dict,
-    video_encoding: dict | None = None,
     pool_tasks: list,
     drain_order: list,
     result_path: str,
+    video_encoding: dict | None = None,
     episode_conn: Connection | None = None,
 ) -> None:
     """Entrypoint for a single shard process.

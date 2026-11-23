@@ -16,7 +16,8 @@ Both keys are sha256 hex digests of canonical JSON:
 * ``recipe_hash`` covers everything that changes the bytes of an entry or
   whether two entries can be merged: the parsed contract YAML, this
   package's source, the lerobot version and codebase version, the video
-  codec, the streaming-encoding flag and the resolved ``features`` dict.
+  encoder settings, the streaming-encoding flag and the resolved
+  ``features`` dict.
 * ``episode_key`` covers everything that selects one episode's input: the
   event (id, bounds, source dataset, raw task label), the fetch window
   padding, the dataset's resolved topic bindings, and a fingerprint of every
@@ -96,6 +97,11 @@ def recipe_hash(
     shard count and the collection are left out: they do not change the
     bytes of an entry. The lerobot and codebase versions keep the two
     variants' entries (v2.1 and v3.0) under different hashes.
+
+    ``video_encoding`` is what ``LeRobotWriter.resolve_video_encoding``
+    returned. Because it includes the settings left at their defaults, a
+    run that sets a video parameter to its default reuses the entries of a
+    run that left it unset.
     """
     try:
         from lerobot.datasets.dataset_metadata import CODEBASE_VERSION

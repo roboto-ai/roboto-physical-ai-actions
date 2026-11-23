@@ -65,9 +65,9 @@ class LeRobotWriter(Protocol):
         ``video_encoding`` is what :meth:`resolve_video_encoding` returned;
         ``None`` keeps LeRobot's encoder defaults.
 
-        ``vcodec`` is deliberately not in the Protocol: the v3_0 adapter
-        locks it to ``"libsvtav1"`` because alternatives degrade downstream
-        training quality.
+        ``vcodec`` is deliberately not a parameter: the v3_0 adapter locks
+        it to ``"libsvtav1"``, even over a ``vcodec`` in ``video_encoding``,
+        because alternatives degrade downstream training quality.
         """
         ...
 
@@ -76,7 +76,10 @@ class LeRobotWriter(Protocol):
         """Return the video encoder settings ``create`` applies, given the caller's ``overrides``.
 
         ``overrides`` may set ``crf``, ``preset`` and ``g`` (keyframe
-        interval). Raises ``ValueError`` when the adapter cannot apply them.
+        interval). The result includes the settings ``overrides`` leaves at
+        their defaults, so overrides that only restate a default return the
+        same settings as no overrides. Raises ``ValueError`` when the adapter
+        cannot apply them.
         """
         ...
 
