@@ -287,14 +287,17 @@ class AlignSpec:
 class TransformSpec:
     """Transform configuration.
 
-    type:   transform name (matches key in the TRANSFORMS registry)
-    params: free-form kwargs forwarded to the transform function
-    stage:  "pre" (before alignment, on raw stream) or "post" (after alignment)
+    type:    transform name (matches key in the TRANSFORMS registry)
+    params:  free-form kwargs forwarded to the transform function
+    stage:   "pre" (before alignment, on raw stream) or "post" (after alignment)
+    columns: positions, in the stream's ``selector.names``, of the columns the
+             transform reads and writes; ``None`` for every column
     """
 
     type: str
     params: dict[str, Any]
     stage: str = "post"
+    columns: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1229,7 +1232,11 @@ class DataCollection:
                 all_timestamps = []
                 all_values = []
 
-                for _, row in raw_df.iterrows():
+                # Timestamps come from the int64 column: ``iterrows`` turns a
+                # row whose fields are all numeric into float64, which
+                # ``merge_asof`` refuses against the int64 timeline and which
+                # cannot hold a nanosecond time exactly.
+                for timestamp, (_, row) in zip(raw_df["timestamp"].tolist(), raw_df.iterrows(), strict=True):
                     decoded = decode_value(row, action)
 
                     # Check if decoder returned flattened structure (e.g., JointTrajectory)
@@ -1239,7 +1246,7 @@ class DataCollection:
                         all_values.extend(decoded['values'])
                     else:
                         # Regular decoder - one value per message
-                        all_timestamps.append(row["timestamp"])
+                        all_timestamps.append(timestamp)
                         all_values.append(decoded)
 
                 # Create DataFrame with timestamp + values columns
@@ -1320,11 +1327,13 @@ class DataCollection:
                 timestamps = []
                 decoded_values = []
 
-                for _, row in raw_df.iterrows():
+                # Timestamps come from the int64 column; see the same loop in
+                # ``_load_actions``.
+                for timestamp, (_, row) in zip(raw_df["timestamp"].tolist(), raw_df.iterrows(), strict=True):
                     # The decoder expects the row as a message-like object
                     # Roboto returns rows with columns like "name", "position", etc.
                     decoded = decode_value(row, observation)
-                    timestamps.append(row["timestamp"])
+                    timestamps.append(timestamp)
                     decoded_values.append(decoded)
 
                 # Single ``values`` column of per-row numpy arrays — matches
@@ -1694,14 +1703,26 @@ def _parse_transforms(it: dict[str, Any]) -> list[TransformSpec] | None:
     raw = it.get("transforms")
     if not raw:
         return None
-    return [
-        TransformSpec(
+    names = list((it.get("selector") or {}).get("names") or [])
+    specs = []
+    for t in raw:
+        where = f"Stream '{it.get('key', '?')}': transform '{t['type']}'"
+        stage = t.get("stage", "post")
+        if stage not in ("pre", "post"):
+            raise ValueError(f"{where} has stage {stage!r}; use 'pre' or 'post'.")
+        columns = None
+        if "columns" in t:
+            unknown = [c for c in t["columns"] if c not in names]
+            if unknown:
+                raise ValueError(f"{where} names columns {unknown} that are not in selector.names {names}.")
+            columns = tuple(names.index(c) for c in t["columns"])
+        specs.append(TransformSpec(
             type=t["type"],
-            params={k: v for k, v in t.items() if k not in ("type", "stage")},
-            stage=t.get("stage", "post"),
-        )
-        for t in raw
-    ]
+            params={k: v for k, v in t.items() if k not in ("type", "stage", "columns")},
+            stage=stage,
+            columns=columns,
+        ))
+    return specs
 
 
 def _spec_origin(spec: Any) -> str:

@@ -361,3 +361,29 @@ def test_missing_type_field_in_action_raises_indexed_valueerror_with_key(tmp_pat
     message = str(exc.value)
     assert "actions[0]" in message
     assert "action" in message
+
+
+@pytest.mark.parametrize(
+    ("transform", "message"),
+    [
+        pytest.param("{type: wrap_angle, columns: [yaw]}", "not in selector.names", id="unknown_column"),
+        pytest.param("{type: wrap_angle, stage: during}", "use 'pre' or 'post'", id="unknown_stage"),
+    ],
+)
+def test_transform_with_unknown_column_or_stage_fails_at_load(tmp_path, transform, message):
+    """A transform naming a column the stream does not select, or a stage that does not exist,
+    fails when the contract loads rather than after data is fetched."""
+    path = _write(tmp_path, f"""
+        name: t
+        version: 1
+        fps: 30
+        observations:
+          - key: observation.state
+            topic: /pose
+            type: string_typed_msg
+            selector: {{names: [heading]}}
+            transforms:
+              - {transform}
+    """)
+    with pytest.raises(ValueError, match=message):
+        load_contract(path)

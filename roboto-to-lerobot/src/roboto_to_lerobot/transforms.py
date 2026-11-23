@@ -80,10 +80,20 @@ def apply_transforms(
                 f"Unknown transform: '{spec.type}'. "
                 f"Available: {sorted(TRANSFORMS)}"
             )
+        target = data if spec.columns is None else data[:, spec.columns]
         if timestamps is not None:
-            result = fn(data, spec.params, fps, timestamps=timestamps)
+            result = fn(target, spec.params, fps, timestamps=timestamps)
         else:
-            result = fn(data, spec.params, fps)
+            result = fn(target, spec.params, fps)
+        if spec.columns is not None:
+            if isinstance(result, tuple) or result.shape != target.shape:
+                raise ValueError(
+                    f"Transform '{spec.type}' cannot take 'columns': it changes "
+                    "the number of rows or columns it is given."
+                )
+            data = np.array(data, dtype=np.float64)
+            data[:, spec.columns] = result
+            result = data
 
         if isinstance(result, tuple):
             data, timestamps = result
@@ -292,3 +302,99 @@ def _resample_uniform(
     indices[use_left] = left[use_left]
 
     return data[indices], uniform_ts
+
+
+# ---------------------------------------------------------------------------
+# Rotations, angles and polar vectors
+#
+# Linear interpolation is wrong for these as recorded: a quaternion and its
+# negation are the same rotation, an angle jumps by a full turn where it
+# wraps, and a polar vector's angle wraps too. Each pre-stage transform below
+# puts a stream into a form that ``align: linear`` interpolates correctly;
+# the matching post-stage transform, where there is one, restores the
+# recorded form. Pass ``columns`` to apply one to part of a stream.
+# ---------------------------------------------------------------------------
+
+
+def _angle_period(params: dict) -> float:
+    return 360.0 if params.get("degrees") else 2 * np.pi
+
+
+def _radians(values: np.ndarray, params: dict) -> np.ndarray:
+    return np.deg2rad(values) if params.get("degrees") else values
+
+
+def _require_width(name: str, data: np.ndarray, width: int) -> None:
+    if data.shape[1] != width:
+        raise ValueError(f"{name} takes {width} columns, got {data.shape[1]}; select them with 'columns'.")
+
+
+@register_transform("quaternion_continuity")
+def _quaternion_continuity(data: np.ndarray, params: dict, fps: float, **kwargs: object) -> np.ndarray:
+    """Negate each quaternion that points away from the one before it, so the stream never jumps from q to -q.
+
+    Use at ``stage: pre`` before ``align: linear``, followed by a post-stage
+    ``quaternion_normalize``. Takes the 4 quaternion components in any order.
+    """
+    _require_width("quaternion_continuity", data, 4)
+    dots = np.einsum("ij,ij->i", data[1:], data[:-1])
+    sign = np.concatenate([[1.0], np.cumprod(np.where(dots < 0, -1.0, 1.0))])
+    return data * sign[:, None]
+
+
+@register_transform("quaternion_normalize")
+def _quaternion_normalize(data: np.ndarray, params: dict, fps: float, **kwargs: object) -> np.ndarray:
+    """Scale each quaternion to unit length.
+
+    After ``quaternion_continuity`` and ``align: linear`` this gives normalized
+    linear interpolation, which follows the same path as SLERP. A norm below
+    0.7 means two blended samples were not made continuous first, so it raises.
+    """
+    _require_width("quaternion_normalize", data, 4)
+    norm = np.linalg.norm(data, axis=1, keepdims=True)
+    if (norm < 0.7).any():
+        raise ValueError(
+            f"quaternion_normalize found a quaternion of norm {float(norm.min()):.3f}: two samples blended "
+            "into it point in opposite directions. Add a 'quaternion_continuity' transform with "
+            "'stage: pre' on the same columns."
+        )
+    return data / norm
+
+
+@register_transform("unwrap_angle")
+def _unwrap_angle(data: np.ndarray, params: dict, fps: float, **kwargs: object) -> np.ndarray:
+    """Remove the full-turn jumps where each angle column wraps, so it changes continuously.
+
+    Use at ``stage: pre``; ``degrees: true`` for angles in degrees. Assumes an
+    angle turns less than half a turn between samples.
+    """
+    return np.unwrap(data, axis=0, period=_angle_period(params))
+
+
+@register_transform("wrap_angle")
+def _wrap_angle(data: np.ndarray, params: dict, fps: float, **kwargs: object) -> np.ndarray:
+    """Bring each angle column back into [-180, 180) degrees or [-pi, pi) radians; undoes ``unwrap_angle``."""
+    period = _angle_period(params)
+    return (data + period / 2) % period - period / 2
+
+
+@register_transform("polar_to_cartesian")
+def _polar_to_cartesian(data: np.ndarray, params: dict, fps: float, **kwargs: object) -> np.ndarray:
+    """Turn ``[r, theta]``, theta measured from +x towards +y, into ``[x, y]``."""
+    _require_width("polar_to_cartesian", data, 2)
+    r, theta = data[:, 0], _radians(data[:, 1], params)
+    return np.stack([r * np.cos(theta), r * np.sin(theta)], axis=1)
+
+
+@register_transform("spherical_to_cartesian")
+def _spherical_to_cartesian(data: np.ndarray, params: dict, fps: float, **kwargs: object) -> np.ndarray:
+    """Turn ``[r, theta, phi]`` into ``[x, y, z]``.
+
+    theta is the inclination, measured from +z; phi is the azimuth, measured
+    from +x towards +y.
+    """
+    _require_width("spherical_to_cartesian", data, 3)
+    r, theta, phi = data[:, 0], _radians(data[:, 1], params), _radians(data[:, 2], params)
+    return np.stack(
+        [r * np.sin(theta) * np.cos(phi), r * np.sin(theta) * np.sin(phi), r * np.cos(theta)], axis=1,
+    )

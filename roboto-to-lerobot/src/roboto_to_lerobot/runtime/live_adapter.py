@@ -182,6 +182,13 @@ class LiveAdapter:
                 # never get an fs_hz requirement because the runtime never
                 # designs (or applies) a filter for the action path.
                 continue
+            if transform.columns is not None:
+                raise ValueError(
+                    f"Spec key={spec.key!r} topic={spec.topic!r} limits "
+                    f"{_LIVE_TRANSFORM!r} to some columns, which the live "
+                    "runtime cannot do: it filters every column of a stream. "
+                    "Drop 'columns', or split the stream."
+                )
             if transform.stage == "pre" and "fs_hz" not in transform.params:
                 raise ValueError(
                     f"Spec key={spec.key!r} topic={spec.topic!r} declares a "

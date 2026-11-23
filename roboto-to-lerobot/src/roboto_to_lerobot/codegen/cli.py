@@ -177,6 +177,12 @@ def _refuse_transforms(key: str, transforms, *, fps: float, is_action: bool) -> 
         if transform.type == LIVE_TRANSFORM:
             if is_action:
                 continue  # pass-through — see LiveAdapter.encode_action.
+            if transform.columns is not None:
+                raise GenNodeError(
+                    f"Stream '{key}' limits '{LIVE_TRANSFORM}' to some columns, "
+                    "which the live runtime cannot do: it filters every column "
+                    "of a stream. Drop 'columns', or split the stream."
+                )
             if transform.stage == "pre" and "fs_hz" not in transform.params:
                 raise GenNodeError(
                     f"Stream '{key}' uses stage:pre '{LIVE_TRANSFORM}' "

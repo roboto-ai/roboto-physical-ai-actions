@@ -315,9 +315,14 @@ def generate_frames(
         col = array_keys.get(spec.unique_key)
         if col is None:
             continue
-        stacked = np.stack(merged_df[col].values)  # (T, N)
+        # Frames the stream has no sample for hold NaN; they are dropped
+        # below, so transform only the frames that have one.
+        matched = merged_df[col].notna()
+        if not matched.any():
+            continue
+        stacked = np.stack(merged_df.loc[matched, col].values)  # (T, N)
         stacked = apply_transforms(stacked, post_specs, contract.fps)
-        merged_df[col] = list(stacked)  # back to list-of-arrays
+        merged_df.loc[matched, col] = pd.Series(list(stacked), index=merged_df.index[matched])
 
     rows_before = len(merged_df)
     if dropped_frames is not None:

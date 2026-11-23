@@ -175,3 +175,18 @@ def test_fs_hz_small_deviation_from_measured_fps_does_not_warn(caplog):
         fn(data, {"cutoff_hz": 5.0, "fs_hz": 100.0}, fps=98.0)
 
     assert not any("deviates" in record.message for record in caplog.records)
+
+
+def test_quaternion_normalize_refuses_a_blend_of_opposite_quaternions():
+    """Normalizing a quaternion blended from q and -q (no ``quaternion_continuity`` first) raises
+    instead of returning an arbitrary rotation."""
+    blended = np.array([[0.05, 0.0, 0.0, 0.1]])  # halfway between nearly opposite samples
+    with pytest.raises(ValueError, match="quaternion_continuity"):
+        TRANSFORMS["quaternion_normalize"](blended, {}, 30.0)
+
+
+def test_spherical_to_cartesian_measures_inclination_from_z_and_azimuth_from_x():
+    """``[r, theta, phi]`` uses theta from +z and phi from +x towards +y, in degrees when asked."""
+    spherical = np.array([[2.0, 0.0, 0.0], [2.0, 90.0, 0.0], [2.0, 90.0, 90.0]])
+    cartesian = TRANSFORMS["spherical_to_cartesian"](spherical, {"degrees": True}, 30.0)
+    np.testing.assert_allclose(cartesian, [[0, 0, 2], [2, 0, 0], [0, 2, 0]], atol=1e-12)

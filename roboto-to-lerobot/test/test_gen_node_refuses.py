@@ -420,3 +420,32 @@ def test_refuse_compressed_video_observation_at_cli(tmp_path, capsys):
     assert "compressed-video type" in err
     assert "offline conversion only" in err
     assert not (tmp_path / "node.py").exists()
+
+
+def test_refuse_causal_lowpass_limited_to_columns_at_cli(tmp_path, capsys):
+    """The live runtime filters every column of a stream, so gen-node refuses a causal
+    filter limited to some columns."""
+    contract = _write(tmp_path, """
+        name: c
+        version: 1
+        fps: 30
+        observations:
+          - key: observation.state
+            topic: /robot/joint_states
+            type: sensor_msgs/msg/JointState
+            selector: {names: [j1, j2]}
+            transforms:
+              - type: butterworth_lowpass_causal
+                stage: post
+                cutoff_hz: 5.0
+                columns: [j1]
+        actions:
+          - key: action
+            topic: /teleop/action
+            type: sensor_msgs/msg/JointState
+            selector: {names: [j1, j2]}
+    """)
+    code = main(_argv(contract, tmp_path / "node.py", tmp_path))
+    assert code == 2
+    assert "columns" in capsys.readouterr().err
+    assert not (tmp_path / "node.py").exists()
