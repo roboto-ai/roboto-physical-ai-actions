@@ -5,6 +5,11 @@ API differences vs 0.6.x that this adapter papers over:
   must NOT be inside the frame dict.
 - ``LeRobotDataset.finalize()`` does not exist on 0.3.x — episodes are
   considered finalised on every ``save_episode``.
+
+It also makes every saved episode complete or fails. lerobot 0.3.x writes
+each frame's image to a PNG, prints and ignores a failed write, then encodes
+the episode's video from the PNGs that exist; after each save the adapter
+checks that every video holds as many frames as were added.
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from ..logger import logger
+from .base import EpisodeWriteError
 
 
 class LeRobotWriter:
@@ -21,6 +27,7 @@ class LeRobotWriter:
 
     def __init__(self, dataset: Any) -> None:
         self._dataset = dataset
+        self._frames_added = 0
 
     @classmethod
     def create(
@@ -65,9 +72,33 @@ class LeRobotWriter:
         # 0.3.x: ``task`` must be passed as a kwarg, not as a frame key.
         frame_no_task = {k: v for k, v in frame.items() if k != "task"}
         self._dataset.add_frame(frame_no_task, task=task)
+        self._frames_added += 1
 
     def save_episode(self) -> None:
-        self._dataset.save_episode()
+        dataset, meta = self._dataset, self._dataset.meta
+        frames = self._frames_added
+        videos = {key: dataset.root / meta.get_video_file_path(meta.total_episodes, key) for key in meta.video_keys}
+        try:
+            dataset.save_episode()
+        except Exception as exc:
+            # A failed save keeps the episode index, and lerobot 0.3.x skips
+            # encoding any video file that already exists, so the next
+            # episode would take this episode's video.
+            left = sorted(key for key, path in videos.items() if path.exists())
+            if left:
+                raise EpisodeWriteError(
+                    f"Saving an episode of {frames} frames failed after its videos for {left} were written, "
+                    f"which the next episode would reuse: {exc.__class__.__name__}: {exc}"
+                ) from exc
+            raise
+        self._frames_added = 0
+        counts = {key: _count_video_frames(path) for key, path in videos.items()}
+        wrong = {key: count for key, count in counts.items() if count != frames}
+        if wrong:
+            raise EpisodeWriteError(
+                f"Episode {meta.total_episodes - 1} was given {frames} frames but its videos hold {wrong}; "
+                "its data rows and videos would be misaligned."
+            )
 
     def discard_episode(self) -> None:
         # 0.3.x has no documented abort hook, so fall through a ladder:
@@ -75,6 +106,7 @@ class LeRobotWriter:
         #   2. rebuild the buffer via create_episode_buffer
         #   3. warn — never raise. discard_episode is the soft-drop path; if
         #      it propagates, a single bad event takes down the whole run.
+        self._frames_added = 0
         clear_fn = getattr(self._dataset, "clear_episode_buffer", None)
         if callable(clear_fn):
             try:
@@ -103,3 +135,11 @@ class LeRobotWriter:
         # per episode, so without this a shard would keep every episode's
         # threads alive.
         self._dataset.stop_image_writer()
+
+
+def _count_video_frames(path: Path) -> int:
+    """Count the video packets in ``path``; each is one encoded frame."""
+    import av
+
+    with av.open(str(path)) as container:
+        return sum(1 for packet in container.demux(video=0) if packet.size)
