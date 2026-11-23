@@ -60,7 +60,9 @@ _SVT_BENIGN_WARN = re.compile(
 _INSTALLED = False
 
 
-# How long exiting waits for the filter thread to forward the last lines.
+# How long exit waits for the filter thread to forward what the pipe still
+# holds. A subprocess that is still alive keeps its inherited copy of the pipe
+# open, so the thread never reads end-of-file; this bounds the wait.
 _DRAIN_TIMEOUT_S = 2.0
 
 
@@ -70,6 +72,10 @@ def install_svt_stderr_filter() -> None:
     Idempotent. Must be called before ``LeRobotWriter.create`` (i.e. before
     any libsvtav1 encoder starts) so the first SVT banner write travels
     through the filter rather than landing on the raw fd 2.
+
+    At interpreter exit, points fd 2 back at the original stderr and waits up
+    to ``_DRAIN_TIMEOUT_S`` for the thread to forward the lines still in the
+    pipe, such as the traceback of the exception that ended the run.
     """
     global _INSTALLED
     if _INSTALLED:
@@ -86,6 +92,8 @@ def install_svt_stderr_filter() -> None:
 
     read_fd, write_fd = os.pipe()
     saved_stderr_fd = os.dup(2)
+    # The filter thread closes saved_stderr_fd when it ends, so restoring fd 2
+    # at exit needs a copy of its own.
     restore_fd = os.dup(saved_stderr_fd)
     os.dup2(write_fd, 2)
     os.close(write_fd)
@@ -122,14 +130,18 @@ def install_svt_stderr_filter() -> None:
     thread.start()
 
     def drain() -> None:
-        # Python writes an uncaught exception's traceback to stderr just
-        # before it exits, and exiting stops the filter thread. Point fd 2
-        # back at the real stderr and let the thread forward what the pipe
-        # still holds, so the run's last lines reach the log.
+        # Python writes an uncaught exception's traceback to the pipe before
+        # it runs atexit handlers, then stops daemon threads, so without this
+        # wait the traceback is lost. Restoring fd 2 closes this process's
+        # last write end of the pipe: the thread forwards what the pipe holds,
+        # reads end-of-file, and returns.
         try:
             sys.stderr.flush()
+        except (AttributeError, OSError, ValueError):
+            pass  # stderr is closed or None; what is already in the pipe still matters
+        try:
             os.dup2(restore_fd, 2)
-        except (OSError, ValueError):
+        except OSError:
             return
         thread.join(timeout=_DRAIN_TIMEOUT_S)
 

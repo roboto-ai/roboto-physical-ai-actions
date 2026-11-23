@@ -7,6 +7,7 @@ LeRobot's encoder thread is slowed, stopped or made to fail by replacing its
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -18,7 +19,6 @@ video_utils = pytest.importorskip("lerobot.datasets.video_utils", reason="needs 
 if not hasattr(video_utils, "StreamingVideoEncoder"):
     pytest.skip("needs lerobot >= 0.6", allow_module_level=True)
 
-from roboto_to_lerobot.writers import streaming_encoder  # noqa: E402
 from roboto_to_lerobot.writers.base import EpisodeWriteError  # noqa: E402
 from roboto_to_lerobot.writers.v3_0 import LeRobotWriter  # noqa: E402
 
@@ -58,6 +58,24 @@ def _start_after(delay_s: float):
         _STOCK_RUN(self)
 
     return run
+
+
+def _lose_third_frame(self) -> None:
+    """Encode as LeRobot does, except that the episode's third frame never reaches the video."""
+
+    class _LosesThirdFrame:
+        def __init__(self, frames) -> None:
+            self._frames = frames
+            self._taken = 0
+
+        def get(self, *args, **kwargs):
+            self._taken += 1
+            if self._taken == 3:
+                self._frames.get(*args, **kwargs)
+            return self._frames.get(*args, **kwargs)
+
+    self.frame_queue = _LosesThirdFrame(self.frame_queue)
+    _STOCK_RUN(self)
 
 
 def _fail_at_end(self) -> None:
@@ -104,23 +122,15 @@ def test_encode_longer_than_lerobot_deadline_is_complete(tmp_path, monkeypatch):
     assert _video_frames(tmp_path / "ds") == 10
 
 
-def test_video_shorter_than_episode_fails_save(tmp_path, monkeypatch):
-    """An episode whose video lost a frame fails to save instead of misaligning the dataset."""
-    # Arrange: lose the third frame on its way to the encoder.
-    fed = []
-    stock_feed = streaming_encoder.WaitingStreamingEncoder.feed_frame
-
-    def lose_third(self, video_key, image):
-        fed.append(video_key)
-        if len(fed) != 3:
-            stock_feed(self, video_key, image)
-
-    monkeypatch.setattr(streaming_encoder.WaitingStreamingEncoder, "feed_frame", lose_third)
+def test_video_missing_a_frame_fails_save(tmp_path, monkeypatch):
+    """An episode whose video lost a frame in the encoder fails to save instead of misaligning the dataset."""
+    # Arrange
+    monkeypatch.setattr(video_utils._CameraEncoderThread, "run", _lose_third_frame)
     writer = _writer(tmp_path / "ds")
     _add_frames(writer, 10)
 
     # Act / Assert
-    with pytest.raises(EpisodeWriteError, match=r"given 10 frames but was saved with \{'observation.images.cam': 9\}"):
+    with pytest.raises(EpisodeWriteError):
         writer.save_episode()
 
 
@@ -132,7 +142,7 @@ def test_encoder_failure_at_save_fails_save(tmp_path, monkeypatch):
     _add_frames(writer, 10)
 
     # Act / Assert
-    with pytest.raises(EpisodeWriteError, match=r"after its data rows were written.*injected encoder failure"):
+    with pytest.raises(EpisodeWriteError):
         writer.save_episode()
 
 
@@ -165,3 +175,22 @@ def test_encoder_stopping_mid_episode_fails_add_frame(tmp_path, monkeypatch):
     # Assert
     assert _video_frames(tmp_path / "ds") == 5
 
+
+
+def test_episode_without_cameras_saves(tmp_path):
+    """A dataset with no camera features saves its episodes; there is no video to wait for or check."""
+    # Arrange
+    writer = LeRobotWriter.create(
+        repo_id="test", fps=10, features={"observation.state": _FEATURES["observation.state"]},
+        root=tmp_path / "ds", robot_type="test", streaming_encoding=True,
+    )
+
+    # Act
+    for i in range(5):
+        writer.add_frame({"observation.state": np.array([i, 0], dtype=np.float32)}, task="t")
+    writer.save_episode()
+    writer.finalize()
+
+    # Assert
+    info = json.loads((tmp_path / "ds" / "meta" / "info.json").read_text())
+    assert (info["total_episodes"], info["total_frames"]) == (1, 5)

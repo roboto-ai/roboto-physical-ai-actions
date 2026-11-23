@@ -23,10 +23,10 @@ class EpisodeWriteError(RuntimeError):
     """An episode reached the dataset incompletely, so the dataset cannot be trusted.
 
     Raised when a saved episode's video holds a different number of frames
-    than its data rows, or when ``save_episode`` fails after writing part of
-    the episode to the dataset. Unlike other per-event failures, this one fails the
-    run: skipping the event would leave the dataset's rows and videos
-    misaligned.
+    than the episode has data rows, or when ``save_episode`` fails after
+    writing part of the episode to the dataset. Unlike other per-event
+    failures, this one fails the run, because skipping the event would leave
+    the dataset's rows and videos misaligned.
     """
 
 

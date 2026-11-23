@@ -6,10 +6,11 @@ API differences vs 0.6.x that this adapter papers over:
 - ``LeRobotDataset.finalize()`` does not exist on 0.3.x — episodes are
   considered finalised on every ``save_episode``.
 
-It also makes every saved episode complete or fails. lerobot 0.3.x writes
-each frame's image to a PNG, prints and ignores a failed write, then encodes
-the episode's video from the PNGs that exist; after each save the adapter
-checks that every video holds as many frames as were added.
+It also ensures that every saved episode is complete, or that its save
+fails. lerobot 0.3.x writes each frame's image to a PNG, prints and ignores a
+failed write, then encodes the episode's video from the PNGs that exist, so
+after each save the adapter checks that every video holds as many frames as
+were added.
 """
 
 from __future__ import annotations
@@ -27,7 +28,6 @@ class LeRobotWriter:
 
     def __init__(self, dataset: Any) -> None:
         self._dataset = dataset
-        self._frames_added = 0
 
     @classmethod
     def create(
@@ -72,26 +72,26 @@ class LeRobotWriter:
         # 0.3.x: ``task`` must be passed as a kwarg, not as a frame key.
         frame_no_task = {k: v for k, v in frame.items() if k != "task"}
         self._dataset.add_frame(frame_no_task, task=task)
-        self._frames_added += 1
 
     def save_episode(self) -> None:
         dataset, meta = self._dataset, self._dataset.meta
-        frames = self._frames_added
+        frames = dataset.episode_buffer["size"]
         videos = {key: dataset.root / meta.get_video_file_path(meta.total_episodes, key) for key in meta.video_keys}
         try:
             dataset.save_episode()
         except Exception as exc:
-            # A failed save keeps the episode index, and lerobot 0.3.x skips
-            # encoding any video file that already exists, so the next
-            # episode would take this episode's video.
+            # lerobot 0.3.x encodes the videos before it records the episode
+            # in the metadata. A save that fails between the two keeps the
+            # episode index, and lerobot skips encoding a video file that
+            # already exists, so the next episode would take this episode's
+            # video. A save that fails later has already recorded the episode.
             left = sorted(key for key, path in videos.items() if path.exists())
             if left:
                 raise EpisodeWriteError(
-                    f"Saving an episode of {frames} frames failed after its videos for {left} were written, "
-                    f"which the next episode would reuse: {exc.__class__.__name__}: {exc}"
+                    f"Saving an episode of {frames} frames failed after its videos for {left} were written: "
+                    f"{exc.__class__.__name__}: {exc}"
                 ) from exc
             raise
-        self._frames_added = 0
         counts = {key: _count_video_frames(path) for key, path in videos.items()}
         wrong = {key: count for key, count in counts.items() if count != frames}
         if wrong:
@@ -102,11 +102,11 @@ class LeRobotWriter:
 
     def discard_episode(self) -> None:
         # 0.3.x has no documented abort hook, so fall through a ladder:
-        #   1. clear_episode_buffer (0.6.x-style, kept in case 0.3.x exposes it)
+        #   1. clear_episode_buffer (0.3.3 has it, without the delete_images
+        #      argument that 0.6.x takes)
         #   2. rebuild the buffer via create_episode_buffer
         #   3. warn — never raise. discard_episode is the soft-drop path; if
         #      it propagates, a single bad event takes down the whole run.
-        self._frames_added = 0
         clear_fn = getattr(self._dataset, "clear_episode_buffer", None)
         if callable(clear_fn):
             try:
@@ -138,7 +138,10 @@ class LeRobotWriter:
 
 
 def _count_video_frames(path: Path) -> int:
-    """Count the video packets in ``path``; each is one encoded frame."""
+    """Count the encoded frames in ``path``'s first video stream, one per non-empty packet.
+
+    ``demux`` ends with an empty packet that flushes the decoder; it holds no frame.
+    """
     import av
 
     with av.open(str(path)) as container:

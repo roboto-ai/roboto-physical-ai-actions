@@ -108,15 +108,16 @@ _IMAGE_WRITER_THREADS = 8
 # disables the batched branch so only the streaming branch runs.
 _BATCH_ENCODING_SIZE = 1
 _STREAMING_ENCODING = True
-# SVT-AV1 level-of-parallelism per camera stream. ``None`` selects SVT
-# auto-LP; an explicit value keeps the encoders' CPU use predictable across
-# shards (see ``_warn_oversubscription``). ``encoder_threads`` is exposed as
-# an action parameter for tuning. A low value makes the export wait on the
-# encoder; it never loses frames (``writers/streaming_encoder.py``).
-_ENCODER_THREADS: int | None = 2
-# Bounded encoder queue inside lerobot's writer. The writer waits when it
-# is full, so its size trades memory for smoothing bursts; the cost is resident memory roughly
-# equal to maxsize × frame_size × camera_count.
+# Default SVT-AV1 level of parallelism per camera stream; the
+# ``encoder_threads`` action parameter overrides it. A fixed value, rather
+# than SVT's automatic choice, keeps the encoders' CPU use predictable across
+# shards (see ``_warn_oversubscription``). A low value makes the export wait
+# on the encoder but loses no frames (``writers/streaming_encoder.py``).
+_ENCODER_THREADS = 2
+# Frames each camera's streaming encoder may hold in its queue. When the
+# queue is full, ``add_frame`` waits for the encoder, so a larger queue lets
+# the export run further ahead of the encoder, at a cost in resident memory
+# of roughly maxsize × frame_size × camera_count.
 _ENCODER_QUEUE_MAXSIZE = 300
 
 # Process-pool knobs. The ``pool_size`` action parameter is the user-facing
@@ -184,21 +185,14 @@ def _resolve_encoder_threads(param_value: object = None) -> int:
     Precedence: explicit ``encoder_threads`` action parameter > the
     ``ROBOTO_TO_LEROBOT_ENCODER_THREADS`` env var > the compiled-in
     default (``_ENCODER_THREADS``). ``None`` and empty string are treated
-    as unset at every layer. Bad values raise so a typo does not silently
-    fall back to SVT auto-LP.
-
-    The parameter path only accepts a positive integer; opt in to SVT
-    auto-LP by changing ``_ENCODER_THREADS`` to ``None`` in source.
+    as unset at every layer. A value that is not a positive integer raises
+    instead of falling back to the default, so a typo is not silently
+    ignored.
     """
     if param_value is not None and param_value != "":
         return _parse_pool_size(param_value, source="encoder_threads parameter")
     raw = os.environ.get(_ENCODER_THREADS_ENV)
     if raw is None or raw == "":
-        if _ENCODER_THREADS is None:
-            raise ValueError(
-                "_ENCODER_THREADS is None (SVT auto-LP) and no override was "
-                "passed; set encoder_threads explicitly."
-            )
         return _ENCODER_THREADS
     return _parse_pool_size(raw, source=_ENCODER_THREADS_ENV)
 
@@ -663,8 +657,9 @@ def _run_pool_drain(
                 shard_idx=shard_idx,
             )
         except EpisodeWriteError:
-            # The episode is partly in the dataset; skipping it would leave
-            # the dataset's rows and videos misaligned.
+            # An episode the writer could not save whole fails the run: in a
+            # shared dataset, skipping it would leave rows and videos
+            # misaligned, and a short video must never reach the episode cache.
             raise
         except Exception as exc:
             # The writer may have buffered frames before the failure;

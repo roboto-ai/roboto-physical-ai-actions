@@ -12,7 +12,7 @@ A conversion reads recorded data, so it can always wait for the encoder.
 finish, and raises if an encoder thread stops before the episode is done.
 
 This module imports lerobot 0.6 or later at import time; only the v3_0
-adapter imports it, inside ``LeRobotWriter.create``.
+adapter imports it, when it creates a writer with streaming encoding.
 """
 
 from __future__ import annotations

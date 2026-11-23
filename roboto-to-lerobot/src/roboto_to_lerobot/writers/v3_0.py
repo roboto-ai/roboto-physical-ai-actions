@@ -8,10 +8,11 @@ API differences from 0.3.x that this adapter handles:
 - ``LeRobotDataset.create`` takes the codec inside an ``RGBEncoderConfig``
   (``rgb_encoder``) rather than as a ``vcodec`` kwarg.
 
-It also makes every saved episode complete or fails: with streaming encoding
-it replaces LeRobot's encoder with one that waits instead of dropping frames
-(see :mod:`roboto_to_lerobot.writers.streaming_encoder`), and after each save
-it checks that every video holds as many frames as the episode has rows.
+It also ensures that every saved episode is complete, or that its save
+fails. With streaming encoding it replaces LeRobot's encoder with one that
+waits instead of dropping frames (see
+:mod:`roboto_to_lerobot.writers.streaming_encoder`), and after each save it
+checks that every video holds as many frames as the episode has rows.
 """
 
 from __future__ import annotations
@@ -32,7 +33,6 @@ class LeRobotWriter:
 
     def __init__(self, dataset: Any) -> None:
         self._dataset = dataset
-        self._frames_added = 0
 
     @classmethod
     def create(
@@ -68,7 +68,8 @@ class LeRobotWriter:
             encoder_threads=encoder_threads,
             encoder_queue_maxsize=encoder_queue_maxsize,
         )
-        if streaming_encoding:
+        # LeRobot builds a streaming encoder only for a dataset with videos.
+        if streaming_encoding and dataset.meta.video_keys:
             _install_waiting_encoder(dataset)
         return cls(dataset)
 
@@ -77,7 +78,6 @@ class LeRobotWriter:
         # ``task`` argument replaces any ``task`` key already in ``frame``.
         frame_with_task = {**frame, "task": task}
         self._dataset.add_frame(frame_with_task)
-        self._frames_added += 1
 
     def save_episode(self) -> None:
         # LeRobot writes the episode's data rows before it finishes the
@@ -85,7 +85,7 @@ class LeRobotWriter:
         # episode metadata does not cover.
         writer = self._dataset.writer
         rows_before = writer._recorded_frames
-        frames = self._frames_added
+        frames = writer.episode_buffer["size"]
         try:
             self._dataset.save_episode()
         except Exception as exc:
@@ -95,7 +95,6 @@ class LeRobotWriter:
                     f"so the dataset holds rows no episode describes: {exc.__class__.__name__}: {exc}"
                 ) from exc
             raise
-        self._frames_added = 0
         _check_video_frames(self._dataset.meta, frames)
 
     def discard_episode(self) -> None:
@@ -103,7 +102,6 @@ class LeRobotWriter:
         # in-memory buffer, so the next save_episode cannot inherit
         # half-buffered frames from a failed conversion.
         self._dataset.clear_episode_buffer(delete_images=True)
-        self._frames_added = 0
 
     def finalize(self) -> None:
         self._dataset.finalize()
@@ -135,7 +133,7 @@ def _install_waiting_encoder(dataset: Any) -> None:
 
 
 def _check_video_frames(meta: Any, frames: int) -> None:
-    """Raise ``EpisodeWriteError`` unless the episode just saved has ``frames`` rows and video frames.
+    """Raise ``EpisodeWriteError`` unless the episode just saved has ``frames`` rows and ``frames`` frames per video.
 
     LeRobot records each video's span in the episode metadata from the
     encoded file's duration, which is its frame count divided by the fps.
