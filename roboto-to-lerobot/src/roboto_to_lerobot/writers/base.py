@@ -19,6 +19,17 @@ from pathlib import Path
 from typing import Any, Protocol
 
 
+class EpisodeWriteError(RuntimeError):
+    """An episode reached the dataset incompletely, so the dataset cannot be trusted.
+
+    Raised when a saved episode's video holds a different number of frames
+    than its data rows, or when ``save_episode`` fails after writing the
+    episode's data rows. Unlike other per-event failures, this one fails the
+    run: skipping the event would leave the dataset's rows and videos
+    misaligned.
+    """
+
+
 class LeRobotWriter(Protocol):
     """Minimal write-side surface for a LeRobot dataset.
 
@@ -66,7 +77,12 @@ class LeRobotWriter(Protocol):
         ...
 
     def save_episode(self) -> None:
-        """Flush the current episode to disk and start a new one."""
+        """Flush the current episode to disk and start a new one.
+
+        Raises :class:`EpisodeWriteError` when the episode could not be
+        written completely; any other exception leaves the dataset as it was
+        before the episode, so the caller may discard the episode and go on.
+        """
         ...
 
     def discard_episode(self) -> None:

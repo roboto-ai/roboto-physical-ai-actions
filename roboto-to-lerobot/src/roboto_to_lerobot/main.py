@@ -68,6 +68,7 @@ from .stderr_filter import (
 )
 from .subtasks import apply_session_subtasks
 from .writers import LeRobotWriter
+from .writers.base import EpisodeWriteError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -108,12 +109,13 @@ _IMAGE_WRITER_THREADS = 8
 _BATCH_ENCODING_SIZE = 1
 _STREAMING_ENCODING = True
 # SVT-AV1 level-of-parallelism per camera stream. ``None`` selects SVT
-# auto-LP, which has allowed the bounded encoder queue to overflow under
-# bursty ``add_frame`` pressure and silently drop frames. Pin to >= 2;
-# ``encoder_threads`` is exposed as an action parameter for tuning.
+# auto-LP; an explicit value keeps the encoders' CPU use predictable across
+# shards (see ``_warn_oversubscription``). ``encoder_threads`` is exposed as
+# an action parameter for tuning. A low value makes the export wait on the
+# encoder; it never loses frames (``writers/streaming_encoder.py``).
 _ENCODER_THREADS: int | None = 2
-# Bounded encoder queue inside lerobot's writer. Larger values absorb
-# bursts at the episode boundary; the cost is resident memory roughly
+# Bounded encoder queue inside lerobot's writer. The writer waits when it
+# is full, so its size trades memory for smoothing bursts; the cost is resident memory roughly
 # equal to maxsize × frame_size × camera_count.
 _ENCODER_QUEUE_MAXSIZE = 300
 
@@ -183,7 +185,7 @@ def _resolve_encoder_threads(param_value: object = None) -> int:
     ``ROBOTO_TO_LEROBOT_ENCODER_THREADS`` env var > the compiled-in
     default (``_ENCODER_THREADS``). ``None`` and empty string are treated
     as unset at every layer. Bad values raise so a typo does not silently
-    fall back to SVT auto-LP, which has dropped frames at high pool sizes.
+    fall back to SVT auto-LP.
 
     The parameter path only accepts a positive integer; opt in to SVT
     auto-LP by changing ``_ENCODER_THREADS`` to ``None`` in source.
@@ -195,8 +197,7 @@ def _resolve_encoder_threads(param_value: object = None) -> int:
         if _ENCODER_THREADS is None:
             raise ValueError(
                 "_ENCODER_THREADS is None (SVT auto-LP) and no override was "
-                "passed; this configuration has dropped frames at high pool "
-                "sizes — set encoder_threads explicitly."
+                "passed; set encoder_threads explicitly."
             )
         return _ENCODER_THREADS
     return _parse_pool_size(raw, source=_ENCODER_THREADS_ENV)
@@ -639,7 +640,9 @@ def _run_pool_drain(
     is one of ``_INFRASTRUCTURE_ERRORS``: then the drain raises the
     ``RuntimeError`` from :func:`_infrastructure_failure`, which names the
     event. A pool that is already broken when the next task is submitted
-    fails the run the same way, naming that task's event.
+    fails the run the same way, naming that task's event. A failure to
+    write an event's episode is recorded as a skip too, unless the writer
+    raises :class:`EpisodeWriteError`, which fails the run.
 
     ``on_episode_saved``, if given, is called with an event's
     ``drain_order`` entry right after its episode is saved. An exception it
@@ -659,6 +662,10 @@ def _run_pool_drain(
                 accumulator=accumulator,
                 shard_idx=shard_idx,
             )
+        except EpisodeWriteError:
+            # The episode is partly in the dataset; skipping it would leave
+            # the dataset's rows and videos misaligned.
+            raise
         except Exception as exc:
             # The writer may have buffered frames before the failure;
             # discard them so the next episode cannot inherit them.

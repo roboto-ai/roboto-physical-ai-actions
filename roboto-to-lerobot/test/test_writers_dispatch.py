@@ -198,8 +198,10 @@ def test_v3_0_kwarg_task_overrides_frame_task(
 
 
 def test_v3_0_forwards_new_encoding_kwargs(
-    fake_lerobot: MagicMock, tmp_path: Path
+    fake_lerobot: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The fake dataset has no LeRobot streaming encoder to replace.
+    monkeypatch.setattr(sys.modules[V30Writer.__module__], "_install_waiting_encoder", lambda dataset: None)
     V30Writer.create(
         **_create_kwargs(tmp_path),
         batch_encoding_size=16,
