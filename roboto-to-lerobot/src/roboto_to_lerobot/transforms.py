@@ -1,8 +1,10 @@
 # roboto_to_lerobot/transforms.py
 # -----------------------------------------------------------------------------
 # Registry of transforms applied to observation/action timeseries.
-# Each transform operates on the full episode stacked as a (T, N) ndarray:
-# every column of the stream, or the ``columns`` its spec lists.
+# Each transform operates on a stream stacked as a (T, N) ndarray: the whole
+# episode at stage pre, or one unbroken run of the frames the stream has a
+# sample for at stage post. N is every column of the stream, or the
+# ``columns`` its spec lists.
 # Transforms may optionally receive and return timestamps.
 # -----------------------------------------------------------------------------
 
@@ -172,7 +174,7 @@ def _butterworth_lowpass(
 
     Uses ``scipy.signal.sosfiltfilt`` (forward-backward filtering), which
     has zero phase distortion but is *non-causal*: each output sample
-    depends on both past and future samples in the episode. That makes it
+    depends on both past and future samples. That makes it
     unreproducible online — a live policy only ever has past samples
     available, so a filter applied this way during training cannot be
     replicated bit-for-bit at deployment time. Prefer this for stream
@@ -193,12 +195,12 @@ def _butterworth_lowpass(
     order = params.get("order", 2)
     _validate_cutoff_hz("butterworth_lowpass", cutoff_hz, fps)
     sos = butter(order, cutoff_hz, btype="low", output="sos", fs=fps)
-    # sosfiltfilt pads each end with this many reflected samples (its own
-    # default) and refuses input no longer than that, as a short run of
-    # frames between two gaps can be; such input gets as much padding as it
-    # can take, and longer input is filtered exactly as before.
-    padlen = 3 * (2 * len(sos) + 1 - min((sos[:, 2] == 0).sum(), (sos[:, 5] == 0).sum()))
-    return sosfiltfilt(sos, data, axis=0, padlen=min(padlen, len(data) - 1))
+    # By default sosfiltfilt extends each end by 3 * ntaps samples, with ntaps
+    # computed as below, and raises on input no longer than that, which a
+    # short run of frames between two gaps can be. Cap the padding at one
+    # sample less than the input; longer input keeps the default padding.
+    ntaps = 2 * len(sos) + 1 - min((sos[:, 2] == 0).sum(), (sos[:, 5] == 0).sum())
+    return sosfiltfilt(sos, data, axis=0, padlen=min(3 * ntaps, len(data) - 1))
 
 
 @register_transform("butterworth_lowpass_causal")

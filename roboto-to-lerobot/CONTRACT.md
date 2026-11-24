@@ -271,8 +271,8 @@ by their names in `selector.names`; the other columns pass through unchanged.
 Frames where a stream has a gap longer than its tolerance are dropped. A
 `post` transform runs separately on each unbroken run of the remaining
 frames, so `finite_difference` and the Butterworth filters never treat the
-two sides of a gap as neighbours. A run too short for a filter's usual edge
-padding is filtered with as much padding as it allows, and a single frame's
+two sides of a gap as neighbours. A run too short for `butterworth_lowpass`'s usual
+edge padding is filtered with as much padding as it allows, and a single frame's
 `finite_difference` is zero.
 
 ### Built-in transforms

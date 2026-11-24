@@ -1688,12 +1688,13 @@ def _as_qos(it: dict[str, Any]) -> QosSpec | None:
 def _message_rows(raw_df: pd.DataFrame) -> Iterator[pd.Series]:
     """Yield each message of a fetched topic as a row of its fields, each keeping its own type.
 
-    ``iterrows`` gives every field of a row the type all the columns share,
-    so on a topic whose fields are all numbers each field, the timestamp
-    included, arrives as float64: an integer above 2**53, such as a time in
-    nanoseconds, is rounded, and ``merge_asof`` refuses the float timestamps
-    against the int64 timeline. Rows taken from the frame cast to ``object``
-    keep each field as it was fetched.
+    ``iterrows`` converts every field of a row to one type that all the
+    columns can share. On a topic whose fields are all numbers, one of them a
+    float, that type is float64: an integer field above 2**53, such as the
+    nanosecond timestamp, is rounded, and ``merge_asof`` rejects the float
+    timestamps against the int64 timeline. Casting the frame to ``object``
+    first keeps each field as it was fetched, an int64 field as an exact
+    Python ``int``.
     """
     for _, row in raw_df.astype(object).iterrows():
         yield row

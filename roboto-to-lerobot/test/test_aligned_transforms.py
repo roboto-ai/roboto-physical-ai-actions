@@ -39,19 +39,22 @@ def _topic_df(columns: dict[str, np.ndarray], *, text_field: bool = True) -> pd.
     return df
 
 
-def _convert(tmp_path: Path, stream: str, df: pd.DataFrame) -> np.ndarray:
-    """Convert ``df`` with a contract whose one observation is ``stream``; return each frame's values.
+def _convert(
+    tmp_path: Path, stream: str, df: pd.DataFrame, *, section: str = "observations", key: str = "observation.state",
+) -> np.ndarray:
+    """Convert ``df`` with a contract whose one stream, under ``section``, is ``stream``; return each frame's ``key``.
 
     The frames are on the ``_REFERENCE_S`` timeline, minus any the stream has no sample for.
     """
+    other = "actions" if section == "observations" else "observations"
     path = tmp_path / "contract.yaml"
-    path.write_text("name: t\nversion: 1\nfps: 30\nobservations:\n" + dedent(stream))
+    path.write_text(f"name: t\nversion: 1\nfps: 30\n{other}: []\n{section}:\n" + dedent(stream))
     contract = load_contract(path)
     topics = {"/pose": [FakeTopic(topic_id="tp_pose", name="/pose", df=df)]}
     collection = DataCollection(contract, topics, _T0 - 10**9, _T0 + 3 * 10**9)
     reference = pd.Series(_T0 + np.arange(len(_REFERENCE_S), dtype=np.int64) * _STEP_NS, name="timestamp")
     frames = list(generate_frames(contract, collection, reference))
-    return np.stack([f["observation.state"] for f in frames]).astype(np.float64)
+    return np.stack([f[key] for f in frames]).astype(np.float64)
 
 
 def test_quaternion_pose_follows_slerp(tmp_path):
@@ -191,20 +194,22 @@ def test_post_transform_converts_a_short_run_between_gaps(tmp_path, transform, e
     np.testing.assert_allclose(values[:, 0], expected, atol=1e-5)
 
 
-def test_topic_with_only_numeric_fields_aligns(tmp_path):
-    """A topic whose fields are all numbers aligns onto the timeline like any other."""
+@pytest.mark.parametrize(("section", "key"), [("observations", "observation.state"), ("actions", "action")])
+def test_topic_with_only_numeric_fields_aligns(tmp_path, section, key):
+    """A topic whose fields are all numbers aligns onto the timeline like any other, as an
+    observation or as an action."""
     # Arrange
     position = np.linspace(0.0, 2.0, len(_SOURCE_S))
     df = _topic_df({"px": position}, text_field=False)
 
     # Act
-    values = _convert(tmp_path, stream="""
-        - key: observation.state
+    values = _convert(tmp_path, stream=f"""
+        - key: {key}
           topic: /pose
           type: string_typed_msg
-          selector: {names: [px]}
-          align: {method: linear, tolerance_ms: 150}
-    """, df=df)
+          selector: {{names: [px]}}
+          align: {{method: linear, tolerance_ms: 150}}
+    """, df=df, section=section, key=key)
 
     # Assert
     assert len(values) == len(_REFERENCE_S)
