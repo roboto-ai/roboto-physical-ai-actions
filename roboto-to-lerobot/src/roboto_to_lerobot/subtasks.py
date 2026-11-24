@@ -16,7 +16,7 @@ through the gap after its event ended.
 An episode leaves out the frames for which a stream has no data and numbers
 the rest without them; ``plan_segments`` takes those positions so that labels
 stay on the frames their events cover. The ``subtask_events`` parameter
-chooses the events by name (:func:`parse_event_patterns`).
+chooses the events by name or tag (:func:`parse_event_patterns`).
 
 The columns are added after the dataset is finalized and merged, so sharded
 writing and video encoding are unaffected. A dataset whose sessions have no
@@ -52,6 +52,7 @@ class SubtaskWindow:
     name: str
     start_time: int
     end_time: int
+    tags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -86,35 +87,57 @@ def session_subtask_windows(
         events = list(by_id.values())
 
     windows = (
-        SubtaskWindow(e.event_id, e.name, int(e.start_time), int(e.end_time))
+        SubtaskWindow(e.event_id, e.name, int(e.start_time), int(e.end_time), tuple(e.tags))
         for e in events
     )
     return tuple(sorted(windows, key=lambda w: (w.start_time, w.event_id)))
 
 
+TAG_PREFIX = "tag:"
+"""Marks a pattern that matches an event's tags rather than its name."""
+
+
 class EventPatterns(NamedTuple):
-    """Which events become sub-tasks, by name: any ``include`` glob (or all, when empty) and no ``exclude`` glob."""
+    """Which events become sub-tasks: those matching any ``include`` pattern (or all, when empty) and no ``exclude`` one.
+
+    A pattern is a glob on the event's name or, written ``tag:<glob>``, on its
+    tags, where it matches an event that has any tag matching the glob.
+    """
 
     include: tuple[str, ...] = ()
     exclude: tuple[str, ...] = ()
 
-    def select(self, name: str) -> bool:
-        included = not self.include or any(fnmatchcase(name, pattern) for pattern in self.include)
-        return included and not any(fnmatchcase(name, pattern) for pattern in self.exclude)
+    def select(self, window: SubtaskWindow) -> bool:
+        included = not self.include or any(_matches(pattern, window) for pattern in self.include)
+        return included and not any(_matches(pattern, window) for pattern in self.exclude)
+
+
+def _matches(pattern: str, window: SubtaskWindow) -> bool:
+    if pattern.startswith(TAG_PREFIX):
+        return any(fnmatchcase(tag, pattern.removeprefix(TAG_PREFIX)) for tag in window.tags)
+    return fnmatchcase(window.name, pattern)
 
 
 ALL_EVENTS = EventPatterns()
 
 
 def parse_event_patterns(raw: object) -> EventPatterns:
-    """Parse the ``subtask_events`` parameter: comma-separated globs, where a leading ``!`` excludes.
+    """Parse the ``subtask_events`` parameter: comma-separated globs on event names, or on tags as ``tag:<glob>``.
 
-    Unset or blank selects every event.
+    A leading ``!`` excludes. Unset or blank selects every event.
     """
-    patterns = [pattern.strip() for pattern in str(raw or "").split(",") if pattern.strip()]
+
+    def normalized(pattern: str) -> str:
+        pattern = pattern.strip()
+        if pattern.startswith(TAG_PREFIX):
+            glob = pattern.removeprefix(TAG_PREFIX).strip()
+            return TAG_PREFIX + glob if glob else ""
+        return pattern
+
+    patterns = [p for p in map(normalized, str(raw or "").split(",")) if p]
     return EventPatterns(
         include=tuple(p for p in patterns if not p.startswith("!")),
-        exclude=tuple(p[1:].strip() for p in patterns if p.startswith("!") and p[1:].strip()),
+        exclude=tuple(p for p in (normalized(p[1:]) for p in patterns if p.startswith("!")) if p),
     )
 
 
@@ -258,7 +281,7 @@ def apply_session_subtasks(
         episode_to_event: The run's final manifest entries, one per written
             episode, each with the ``dropped_frames`` of its episode.
         fps: The dataset's frame rate.
-        event_patterns: Which events become sub-tasks, by name.
+        event_patterns: Which events become sub-tasks, by name or tag.
 
     Returns:
         The manifest's record of what was written, or ``None`` if no sub-tasks
@@ -268,7 +291,7 @@ def apply_session_subtasks(
     windows_by_session = {
         s.source_id: windows
         for s in sources
-        if (windows := tuple(w for w in s.subtask_windows if event_patterns.select(w.name)))
+        if (windows := tuple(w for w in s.subtask_windows if event_patterns.select(w)))
     }
     if not windows_by_session:
         return None

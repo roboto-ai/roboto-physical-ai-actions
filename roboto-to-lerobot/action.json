@@ -19,7 +19,7 @@
         },
         {
             "name": "subtask_events",
-            "description": "Which events on a session become its episode's sub-tasks, by event name: comma-separated glob patterns, where a leading '!' excludes. An event is used when it matches one of the patterns without '!' (or when there are none) and none of the patterns with '!'. For example 'grasp*,lift' uses only those events and '!qa/*' uses every event except those under 'qa/'. Unset, every event becomes a sub-task. Applies to collections of sessions on roboto-to-lerobot-v3_0.",
+            "description": "Which events on a session become its episode's sub-tasks, by event name or tag: comma-separated glob patterns on the event name, or on its tags when written 'tag:<glob>', where a leading '!' excludes. A tag pattern matches an event that has any tag matching the glob. An event is used when it matches one of the patterns without '!' (or when there are none) and none of the patterns with '!'. For example 'grasp*,lift' uses only those events, '!qa/*' uses every event except those under 'qa/', 'tag:subtask' uses the events tagged 'subtask', and 'grasp*,!tag:qa' uses the 'grasp*' events not tagged 'qa'. Unset, every event becomes a sub-task. Applies to collections of sessions on roboto-to-lerobot-v3_0.",
             "required": false
         },
         {

@@ -26,8 +26,8 @@ def _ns(seconds: float) -> int:
     return EPISODE_START_NS + round(seconds * 1e9)
 
 
-def _window(event_id: str, name: str, start_s: float, end_s: float) -> SubtaskWindow:
-    return SubtaskWindow(event_id, name, _ns(start_s), _ns(end_s))
+def _window(event_id: str, name: str, start_s: float, end_s: float, tags: tuple[str, ...] = ()) -> SubtaskWindow:
+    return SubtaskWindow(event_id, name, _ns(start_s), _ns(end_s), tags)
 
 
 def _source(session_id: str, *windows: SubtaskWindow) -> EpisodeSource:
@@ -172,6 +172,34 @@ def test_subtask_events_chooses_by_name_which_events_become_subtasks(
 
     dataset = LeRobotDataset(REPO_ID, root=dataset_root)
     assert (_active_subtask(dataset, 7), _active_subtask(dataset, 14)) == (at_frame_7, at_frame_14)
+
+
+@pytest.mark.parametrize(
+    ("subtask_events", "expected"),
+    [
+        ("tag:subtask", ("grasp", GAP_SUBTASK, GAP_SUBTASK, GAP_SUBTASK)),
+        ("!tag:qa", ("grasp", GAP_SUBTASK, GAP_SUBTASK, "lift")),
+        ("grasp*,!tag:qa", ("grasp", GAP_SUBTASK, GAP_SUBTASK, GAP_SUBTASK)),
+        ("lift,tag:rev*", (GAP_SUBTASK, GAP_SUBTASK, "grasp_check", "lift")),
+    ],
+)
+def test_subtask_events_chooses_by_tag_and_name_which_events_become_subtasks(dataset_root, subtask_events, expected):
+    sources = [
+        _source(
+            "se_a",
+            _window("ev_grasp", "grasp", 0.5, 1.0, tags=("subtask",)),
+            _window("ev_blur", "blur", 1.2, 1.4, tags=("qa",)),
+            _window("ev_check", "grasp_check", 1.5, 1.7, tags=("qa", "review")),
+            _window("ev_lift", "lift", 1.8, 1.9),
+        ),
+    ]
+
+    apply_session_subtasks(
+        dataset_root, sources, [_entry(0, "se_a")], FPS, event_patterns=parse_event_patterns(subtask_events),
+    )
+
+    dataset = LeRobotDataset(REPO_ID, root=dataset_root)
+    assert tuple(_active_subtask(dataset, frame) for frame in (7, 12, 15, 18)) == expected
 
 
 def test_lerobot_without_language_columns_skips_subtasks_and_leaves_the_dataset_alone(dataset_root, monkeypatch):

@@ -227,13 +227,13 @@ def test_annotate_relabels_session_entries_and_leaves_event_entries():
     assert annotate_manifest_entry(event_entry, by_key) is event_entry
 
 
-def _event(event_id, name, start, end):
-    return SimpleNamespace(event_id=event_id, name=name, start_time=start, end_time=end)
+def _event(event_id, name, start, end, tags=()):
+    return SimpleNamespace(event_id=event_id, name=name, start_time=start, end_time=end, tags=list(tags))
 
 
-def _subtask_names(platform, session):
+def _subtasks(platform, session):
     sources, _ = resolve_episode_sources(_collection([session]), _contract())
-    return [w.name for w in sources[0].subtask_windows]
+    return [(w.name, w.tags) for w in sources[0].subtask_windows]
 
 
 def test_subtasks_come_from_the_events_on_the_session(platform):
@@ -241,10 +241,10 @@ def test_subtasks_come_from_the_events_on_the_session(platform):
     platform.file_events["fl_1"] = [_event("ev_old", "on_file", 110, 120)]
     session = FakeSession(
         "se_a", [_session_file("fl_1")], min_timestamp_ns=100, max_timestamp_ns=200,
-        events=[_event("evt_2", "lift", 150, 160), _event("evt_1", "grasp", 120, 130)],
+        events=[_event("evt_2", "lift", 150, 160), _event("evt_1", "grasp", 120, 130, tags=["qa"])],
     )
 
-    assert _subtask_names(platform, session) == ["grasp", "lift"]
+    assert _subtasks(platform, session) == [("grasp", ("qa",)), ("lift", ())]
 
 
 def test_org_without_session_events_uses_the_events_on_the_sessions_files(platform):
@@ -253,7 +253,7 @@ def test_org_without_session_events_uses_the_events_on_the_sessions_files(platfo
     platform.add_file("fl_other", "ds_a", 100, 300)
     shared = _event("ev_shared", "span", 190, 210)
     platform.file_events.update({
-        "fl_1": [_event("ev_1", "grasp", 110, 120), shared],
+        "fl_1": [_event("ev_1", "grasp", 110, 120, tags=["qa"]), shared],
         "fl_2": [shared],
         "fl_other": [_event("ev_other", "not_this_session", 110, 120)],
     })
@@ -262,4 +262,4 @@ def test_org_without_session_events_uses_the_events_on_the_sessions_files(platfo
         min_timestamp_ns=100, max_timestamp_ns=300, has_session_events=False,
     )
 
-    assert _subtask_names(platform, session) == ["grasp", "span"]
+    assert _subtasks(platform, session) == [("grasp", ("qa",)), ("span", ())]
