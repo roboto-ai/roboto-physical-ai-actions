@@ -139,13 +139,16 @@ def test_event_shorter_than_a_frame_is_reported_rather_than_silently_lost(datase
     assert _active_subtask(dataset, 12) == GAP_SUBTASK
 
 
-def test_frames_dropped_before_an_event_do_not_move_its_subtask_off_the_frames_it_covers(dataset_root):
-    # The episode left out reference frames 0, 1 and 7, so the frame at 0.5 s is its frame 3
-    # and the frame at 1.0 s its frame 7.
+def test_dropped_frames_do_not_move_a_subtask_off_the_frames_its_event_covers(dataset_root):
+    # Arrange
+    # grasp covers reference frames 5 to 9. With reference frames 0, 1 and 7 left out of the
+    # episode, those are the episode's frames 3 to 6.
     sources = [_source("se_a", _window("ev_grasp", "grasp", 0.5, 1.0))]
 
+    # Act
     apply_session_subtasks(dataset_root, sources, [_entry(0, "se_a", dropped_frames=(0, 1, 7))], FPS)
 
+    # Assert
     dataset = LeRobotDataset(REPO_ID, root=dataset_root)
     assert [_active_subtask(dataset, frame) for frame in (2, 3, 6, 7)] == [GAP_SUBTASK, "grasp", "grasp", GAP_SUBTASK]
 
@@ -158,18 +161,22 @@ def test_frames_dropped_before_an_event_do_not_move_its_subtask_off_the_frames_i
         ("qa/*", GAP_SUBTASK, "qa/blur"),
         (None, "grasp", "qa/blur"),
     ],
+    ids=["exclude", "include-list", "include-glob", "unset-selects-all"],
 )
 def test_subtask_events_chooses_by_name_which_events_become_subtasks(
     dataset_root, subtask_events, at_frame_7, at_frame_14,
 ):
+    # Arrange
     sources = [
         _source("se_a", _window("ev_grasp", "grasp", 0.5, 1.0), _window("ev_qa", "qa/blur", 1.2, 1.6)),
     ]
 
+    # Act
     apply_session_subtasks(
         dataset_root, sources, [_entry(0, "se_a")], FPS, event_patterns=parse_event_patterns(subtask_events),
     )
 
+    # Assert
     dataset = LeRobotDataset(REPO_ID, root=dataset_root)
     assert (_active_subtask(dataset, 7), _active_subtask(dataset, 14)) == (at_frame_7, at_frame_14)
 
@@ -182,8 +189,10 @@ def test_subtask_events_chooses_by_name_which_events_become_subtasks(
         ("grasp*,!tag:qa", ("grasp", GAP_SUBTASK, GAP_SUBTASK, GAP_SUBTASK)),
         ("lift,tag:rev*", (GAP_SUBTASK, GAP_SUBTASK, "grasp_check", "lift")),
     ],
+    ids=["include-tag", "exclude-tag", "exclude-tag-from-name-glob", "name-or-tag-glob"],
 )
 def test_subtask_events_chooses_by_tag_and_name_which_events_become_subtasks(dataset_root, subtask_events, expected):
+    # Arrange
     sources = [
         _source(
             "se_a",
@@ -194,10 +203,12 @@ def test_subtask_events_chooses_by_tag_and_name_which_events_become_subtasks(dat
         ),
     ]
 
+    # Act
     apply_session_subtasks(
         dataset_root, sources, [_entry(0, "se_a")], FPS, event_patterns=parse_event_patterns(subtask_events),
     )
 
+    # Assert
     dataset = LeRobotDataset(REPO_ID, root=dataset_root)
     assert tuple(_active_subtask(dataset, frame) for frame in (7, 12, 15, 18)) == expected
 

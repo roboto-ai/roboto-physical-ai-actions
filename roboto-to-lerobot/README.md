@@ -174,9 +174,11 @@ events on its files. Every event is used unless `subtask_events` narrows
 them by name or tag. Frames no event covers get the sub-task `no_subtask`,
 and `manifest.json` records every segment under `subtasks`. An episode leaves
 out the frames for which a stream has no data and numbers the rest without
-them; the manifest lists those positions as the episode's `dropped_frames`,
-and sub-tasks are placed on the frames their events cover. Datasets whose
-sessions have no events are unchanged. Only `roboto-to-lerobot-v3_0` writes
+them. Its `episode_to_event` entry in the manifest lists the left-out frames
+under `dropped_frames`, each as its position before the drop: position `i`
+is the frame `i / fps` seconds after `start_time_ns`. Sub-tasks stay on the
+frames their events cover. Datasets whose sessions have no events that
+`subtask_events` selects are unchanged. Only `roboto-to-lerobot-v3_0` writes
 sub-tasks: lerobot 0.3.3 has no column for them, so `roboto-to-lerobot-v2_1`
 logs a warning and writes none.
 

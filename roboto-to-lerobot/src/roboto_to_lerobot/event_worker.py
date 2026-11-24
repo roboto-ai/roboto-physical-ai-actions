@@ -118,7 +118,8 @@ def _worker_build_episode(
     """Build one episode in the worker.
 
     Returns the event index (for in-order drain on the main process), the
-    resolved task label, and the list of frame dicts. Video entries in each
+    resolved task label, the list of frame dicts, and the reference-timeline
+    positions of the frames left out of that list. Video entries in each
     frame carry ``_DeferredFrame`` sentinels — the main process decodes them
     just before handing each frame to ``writer.add_frame``.
     """
@@ -176,8 +177,8 @@ class WorkerEpisode(NamedTuple):
     monkeypatching the worker call.
 
     ``dropped_frames`` are the positions, on the episode's reference
-    timeline, of the frames left out of ``frames`` because a stream had no
-    value for them. ``frames`` are numbered without them.
+    timeline, of the frames left out of ``frames`` because a stream's value
+    for them is missing; ``frames`` holds the remaining positions in order.
     """
 
     event_idx: int

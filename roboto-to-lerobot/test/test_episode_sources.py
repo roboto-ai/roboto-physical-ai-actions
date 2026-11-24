@@ -231,7 +231,7 @@ def _event(event_id, name, start, end, tags=()):
     return SimpleNamespace(event_id=event_id, name=name, start_time=start, end_time=end, tags=list(tags))
 
 
-def _subtasks(platform, session):
+def _subtasks(session):
     sources, _ = resolve_episode_sources(_collection([session]), _contract())
     return [(w.name, w.tags) for w in sources[0].subtask_windows]
 
@@ -244,7 +244,7 @@ def test_subtasks_come_from_the_events_on_the_session(platform):
         events=[_event("evt_2", "lift", 150, 160), _event("evt_1", "grasp", 120, 130, tags=["qa"])],
     )
 
-    assert _subtasks(platform, session) == [("grasp", ("qa",)), ("lift", ())]
+    assert _subtasks(session) == [("grasp", ("qa",)), ("lift", ())]
 
 
 def test_org_without_session_events_uses_the_events_on_the_sessions_files(platform):
@@ -262,4 +262,4 @@ def test_org_without_session_events_uses_the_events_on_the_sessions_files(platfo
         min_timestamp_ns=100, max_timestamp_ns=300, has_session_events=False,
     )
 
-    assert _subtasks(platform, session) == [("grasp", ("qa",)), ("span", ())]
+    assert _subtasks(session) == [("grasp", ("qa",)), ("span", ())]

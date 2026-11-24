@@ -19,12 +19,13 @@ backward to the keyframe that anchors a range's leading delta frames, skips
 frames it cannot decode, and covers H.264/H.265/VP9/AV1 — the four formats the
 Foxglove ``CompressedVideo`` spec allows. Nothing here parses a bitstream.
 
-Detection mirrors what Roboto ingestion registers, not a topic-name heuristic:
-ingestion tags compressed-video topics with the codec-agnostic representation
-format ``compressedVideo`` and declares the actual codec per message in the
-message's ``format`` field. Both signals
-are read here — the representation format and the topic's schema name — with
-the contract's declared ``type:`` as the fallback for stubs and older topics.
+Detection reads what Roboto ingestion registers rather than guessing from
+topic names. Ingestion tags a compressed-video topic with the codec-agnostic
+representation format ``compressedVideo`` and declares each message's codec in
+its ``format`` field. A topic counts as compressed video when its
+representation format or its schema name says so; the per-message ``format``
+then selects the decoder. A contract's declared ``type:`` decides how a spec is
+loaded, and these topic signals catch a video topic declared as stills.
 """
 
 from __future__ import annotations
@@ -56,11 +57,10 @@ __all__ = (
 
 
 # Compressed-video schema names, as Roboto's ROS ingestion recognizes them.
-# These are also the
-# ``type:`` spellings a contract may declare for a video stream, and each one is
-# registered in the decoder registry (``runtime/decoders.py``) — a spelling in
-# one and not the other would route a spec to the video-stream loader and then
-# fail to find a decoder for it.
+# These are also the ``type:`` spellings a contract may declare for a video
+# stream, and each one is registered in the decoder registry
+# (``runtime/decoders.py``). A spelling in one and not the other would route a
+# spec to the video-stream loader, which would then find no decoder for it.
 COMPRESSED_VIDEO_SCHEMAS: frozenset[str] = frozenset({
     "foxglove_msgs/CompressedVideo",
     "foxglove_msgs/msg/CompressedVideo",
@@ -89,9 +89,9 @@ COMPRESSED_VIDEO_MESSAGE_PATHS: list[str] = ["format", "data"]
 def is_compressed_video_schema(schema_name: str) -> bool:
     """True if ``schema_name`` names a compressed-video stream.
 
-    The rule Roboto's ROS ingestion applies: the
-    well-known Foxglove schemas exactly, plus any schema whose leaf type name is
-    ``CompressedVideo`` or ``CompressedVideoPacket``. The leaf must match in
+    Applies the same rule as Roboto's ROS ingestion: the Foxglove schemas in
+    ``COMPRESSED_VIDEO_SCHEMAS`` exactly, plus any schema whose leaf type name
+    is ``CompressedVideo`` or ``CompressedVideoPacket``. The leaf must match in
     full, so metadata types like ``CompressedVideoInfo`` — about video, but
     carrying no playable stream — do not qualify.
 
@@ -154,9 +154,8 @@ def is_compressed_video_topic(topic: Any) -> bool:
 def _resolve_stream_codec(first_format: Any, topic_name: str) -> VideoCodec:
     """Resolve the codec of a compressed-video stream from a message's ``format`` token.
 
-    Mirrors the backend's ``resolve_video_stream_codec``: the codec is declared
-    per message, and a message without a ``format`` token is treated as H.264
-    (ingestion's legacy behaviour).
+    The codec is declared per message, and a message without a ``format`` token
+    is treated as H.264, as Roboto ingestion treats it.
 
     Raises:
         ValueError: If the token names a codec with no decode path. An

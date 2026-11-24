@@ -1,11 +1,12 @@
 """Turn the events on a session into LeRobot sub-tasks.
 
 Each event on a session in the input collection labels the frames of that
-session's episode, using the event's name as the sub-task. The labels are
-written the way lerobot >= 0.6 reads them: ``style="subtask"`` rows in the
-``language_persistent`` column. The ``subtask_index`` /
-``meta/subtasks.parquet`` layout some LeRobot docs still describe is the legacy
-one, and lerobot's own annotation writer drops it.
+session's episode, using the event's name as the sub-task. The
+``subtask_events`` parameter narrows the events by name or tag
+(:func:`parse_event_patterns`). The labels are written the way lerobot >= 0.6
+reads them: ``style="subtask"`` rows in the ``language_persistent`` column.
+The ``subtask_index`` / ``meta/subtasks.parquet`` layout some LeRobot docs
+still describe is the legacy one, and lerobot's own annotation writer drops it.
 
 A persistent row stays active until the next row supersedes it, so it has a
 start but no end, while an event has both. :func:`plan_segments` flattens an
@@ -14,13 +15,12 @@ with :data:`GAP_SUBTASK`; without that row, a sub-task would appear to run on
 through the gap after its event ended.
 
 An episode leaves out the frames for which a stream has no data and numbers
-the rest without them; ``plan_segments`` takes those positions so that labels
-stay on the frames their events cover. The ``subtask_events`` parameter
-chooses the events by name or tag (:func:`parse_event_patterns`).
+the rest without them. :func:`plan_segments` takes the positions of the
+left-out frames, so that each label stays on the frames its event covers.
 
 The columns are added after the dataset is finalized and merged, so sharded
 writing and video encoding are unaffected. A dataset whose sessions have no
-events is left exactly as it was written.
+event that ``subtask_events`` selects is left exactly as it was written.
 """
 
 from __future__ import annotations
@@ -98,9 +98,11 @@ TAG_PREFIX = "tag:"
 
 
 class EventPatterns(NamedTuple):
-    """Which events become sub-tasks: those matching any ``include`` pattern (or all, when empty) and no ``exclude`` one.
+    """Which events become sub-tasks.
 
-    A pattern is a glob on the event's name or, written ``tag:<glob>``, on its
+    An event is selected when it matches any ``include`` pattern, or
+    ``include`` is empty, and matches no ``exclude`` pattern. A pattern is a
+    case-sensitive glob on the event's name or, written ``tag:<glob>``, on its
     tags, where it matches an event that has any tag matching the glob.
     """
 
@@ -124,21 +126,21 @@ ALL_EVENTS = EventPatterns()
 def parse_event_patterns(raw: object) -> EventPatterns:
     """Parse the ``subtask_events`` parameter: comma-separated globs on event names, or on tags as ``tag:<glob>``.
 
-    A leading ``!`` excludes. Unset or blank selects every event.
+    A leading ``!`` excludes. Whitespace around a pattern, after ``!`` and
+    after ``tag:`` is ignored, and a pattern with an empty glob is skipped.
+    Unset or blank selects every event.
     """
-
-    def normalized(pattern: str) -> str:
-        pattern = pattern.strip()
+    include: list[str] = []
+    exclude: list[str] = []
+    for part in str(raw or "").split(","):
+        pattern = part.strip()
+        patterns = exclude if pattern.startswith("!") else include
+        pattern = pattern.removeprefix("!").strip()
         if pattern.startswith(TAG_PREFIX):
-            glob = pattern.removeprefix(TAG_PREFIX).strip()
-            return TAG_PREFIX + glob if glob else ""
-        return pattern
-
-    patterns = [p for p in map(normalized, str(raw or "").split(",")) if p]
-    return EventPatterns(
-        include=tuple(p for p in patterns if not p.startswith("!")),
-        exclude=tuple(p for p in (normalized(p[1:]) for p in patterns if p.startswith("!")) if p),
-    )
+            pattern = TAG_PREFIX + pattern.removeprefix(TAG_PREFIX).strip()
+        if pattern not in ("", TAG_PREFIX):
+            patterns.append(pattern)
+    return EventPatterns(include=tuple(include), exclude=tuple(exclude))
 
 
 def plan_segments(
@@ -158,11 +160,12 @@ def plan_segments(
         windows: The events to label the episode with.
         episode_start_ns: The time of the first position on the episode's
             reference timeline.
-        n_frames: The frames the episode kept.
+        n_frames: The number of frames the episode kept.
         time_step_ns: The spacing of the reference timeline.
         dropped_frames: The positions on the reference timeline that the
             episode left out, sorted. The kept frames are numbered without
-            them, so a window's frames move up by the drops before it.
+            them: a kept frame's number is its position minus the number of
+            dropped positions before it.
 
     Returns:
         The segments, empty if no window covers a frame, and the windows that
@@ -171,6 +174,8 @@ def plan_segments(
     """
 
     def frame_of(time_ns: int) -> int:
+        # A dropped position maps to the next kept frame, so a window that
+        # starts or ends on one still covers exactly the kept frames inside it.
         position = round((time_ns - episode_start_ns) / time_step_ns)
         return position - bisect_left(dropped_frames, position)
 
