@@ -127,9 +127,8 @@ def test_materialize_deferred_matches_inline_decode():
 def test_materialize_deferred_skips_non_deferred_entries():
     """Frames whose values are already numpy arrays / strings pass through.
 
-    The preloaded slot runs ``generate_frames(defer=False)`` on the main
-    process and hands real arrays to ``add_frame``; materialize_deferred
-    must leave those untouched.
+    Streams decoded when they are fetched (video topics) reach the drain as
+    arrays; materialize_deferred must leave those untouched.
     """
     image = _color_block(4, 4, (10, 20, 30))
     frame = {

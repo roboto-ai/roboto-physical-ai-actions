@@ -115,10 +115,11 @@ _STREAMING_ENCODING = True
 # on the encoder but loses no frames (``writers/streaming_encoder.py``).
 _ENCODER_THREADS = 2
 # Frames each camera's streaming encoder may hold in its queue. When the
-# queue is full, ``add_frame`` waits for the encoder, so a larger queue only
-# lets the export run further ahead of the encoder, at a cost in resident
-# memory of roughly maxsize × frame_size × camera_count per writer: at 300,
-# about 1.9 GB per 1080p camera. 30 frames is a second of video at 30 fps.
+# queue is full, ``add_frame`` waits for the encoder, so a longer queue only
+# lets the export run further ahead of the encoder. The queue holds a copy of
+# each frame, so a writer's queues take roughly maxsize × frame_size ×
+# camera_count bytes: 30 frames, a second of 30 fps video, is about 190 MB
+# for a 1080p camera.
 _ENCODER_QUEUE_MAXSIZE = 30
 
 # Process-pool knobs. The ``pool_size`` action parameter is the user-facing
@@ -527,10 +528,13 @@ def _preload_episode(
     """Build the first event's episode in the main process, or return ``None`` if that fails.
 
     The first event's data is already loaded to discover the features, so
-    building its episode here saves fetching it again in a worker. A failure
-    is logged and not recorded as a skip: the caller then submits the event
-    to the pool like every other event, and what the pool does with it
-    (saves it, skips it, or fails the run) is what the manifest reports.
+    building its episode here saves fetching it again in a worker. As in a
+    worker, image decoding is left to the drain, which decodes each frame
+    just before the writer takes it.
+
+    A failure is logged and not recorded as a skip: the caller then submits
+    the event to the pool like every other event, and what the pool does with
+    it (saves it, skips it, or fails the run) is what the manifest reports.
     """
     try:
         task = resolve_task_label(
@@ -618,16 +622,17 @@ def _drain_one_episode(
         "[%s] Processing episode %s (event_id=%s, dataset=%s, task=%r)",
         shard_tag, episode.event_idx, event_id, src_ds_id, episode.task_label,
     )
-    # Each frame leaves the episode's list as it goes to the writer, so its
-    # decoded images are freed once the writer has them: the writer copies
-    # what it keeps, and an episode's decoded video would not fit in memory.
+    # Take each frame out of the episode's list as it goes to the writer, so
+    # its decoded images are freed once the writer is done with them rather
+    # than when the episode ends: a minute of one 1080p camera at 30 fps is
+    # about 11 GB decoded. The caller still holds the episode, so the list
+    # itself must let go of the frames.
     frames = episode.frames
-    frame_count = 0
-    for i in range(len(frames)):
-        frame, frames[i] = frames[i], None
+    for i, frame in enumerate(frames):
+        frames[i] = None
         materialize_deferred(frame, video_specs_by_key)
         writer.add_frame(frame, task=episode.task_label)
-        frame_count += 1
+    frame_count = len(frames)
     writer.save_episode()
     accumulator.episode_to_event.append({
         "episode_index": accumulator.total_episodes,
@@ -2117,9 +2122,6 @@ def main(context: roboto.InvocationContext) -> None:
                 action_lead_ns=action_lead_ns,
             ))
 
-        # Build the preloaded episode from the first event's data, with its
-        # images left encoded until the drain writes them, as a pool
-        # worker's are.
         preloaded_event = matched_events[preloaded_idx]
         _, _, preloaded_task, preloaded_num_frames = matched[preloaded_idx]
         preloaded_ref_ts = pd.Series(
@@ -2135,9 +2137,10 @@ def main(context: roboto.InvocationContext) -> None:
             metadata_task=preloaded_task,
             ref_ts=preloaded_ref_ts,
         )
-        # The preloaded episode holds what it needs; the first event's
-        # fetched topics and decoded video would otherwise stay in memory
-        # for the whole drain.
+        # Free the first event's fetched data now rather than after the whole
+        # drain. The preloaded episode keeps only the values its frames use,
+        # and once nothing else holds the video decoded at fetch time, the
+        # drain frees each of those frames as it writes it.
         del first_data
         if preloaded_episode is None:
             pool_tasks.append(EventTask(
