@@ -29,7 +29,7 @@
         },
         {
             "name": "encoder_threads",
-            "description": "Level-of-parallelism given to the SVT-AV1 video encoder per camera stream. Must be >= 2: lower values risk the encoder's internal frame queue overflowing under bursty writes, which silently drops frames from the output video. Leave unset to use the built-in value of 2. Only the v3_0 variant acts on it — the v2_1 variant (lerobot 0.3.3) accepts this parameter and silently ignores it, since lerobot 0.3.x has no equivalent encoder-tuning knob, so leave it unset on v2_1.",
+            "description": "Level-of-parallelism given to the SVT-AV1 video encoder per camera stream. Higher values encode each camera faster. The export waits for the encoder rather than dropping frames, so a low value costs time, not frames. Leave unset to use the built-in value of 2. Only the v3_0 variant acts on it — the v2_1 variant (lerobot 0.3.3) accepts this parameter and silently ignores it, since lerobot 0.3.x has no equivalent encoder-tuning knob, so leave it unset on v2_1.",
             "required": false
         },
         {

@@ -44,6 +44,7 @@ from roboto_to_lerobot.main import (
     _shard_path_supported,
     _warn_oversubscription,
 )
+from roboto_to_lerobot.writers.base import EpisodeWriteError
 
 # ---------------------------------------------------------------------------
 # Test doubles for the synchronous pool + writer.
@@ -878,6 +879,42 @@ def test_pool_drain_skips_writer_failure_and_recovers(monkeypatch):
     # The next episode's frames are present and uncontaminated.
     assert len(writer.episodes) == 2
     assert writer.episodes[-1][0]["x"][0] == 2  # event_idx=2 in frame 0
+
+
+def test_pool_drain_fails_the_run_on_incomplete_episode(monkeypatch):
+    """An episode the writer could not save whole fails the run: it is not
+    skipped, and it is not handed on (to the episode cache) as saved."""
+    # Arrange
+    _patch_drain_internals(monkeypatch)
+    matched, events = _drain_inputs(3)
+    drain_order, pool_tasks = _make_drain_inputs(matched, events)
+
+    class _IncompleteWriter(_FailingWriter):
+        def save_episode(self) -> None:
+            if len(self.episodes) == 1:
+                raise EpisodeWriteError("injected incomplete episode")
+            super().save_episode()
+
+    accumulator = _DrainAccum()
+    saved = []
+
+    # Act / Assert
+    with pytest.raises(EpisodeWriteError, match="injected incomplete episode"):
+        _run_pool_drain(
+            writer=_IncompleteWriter(),
+            video_specs_by_key={},
+            pool_tasks=pool_tasks,
+            drain_order=drain_order,
+            descriptors_by_ds={},
+            contracts_by_ds={},
+            pool_size=2,
+            accumulator=accumulator,
+            on_episode_saved=lambda meta: saved.append(meta["event_id"]),
+        )
+
+    # Assert
+    assert accumulator.skipped_events == []
+    assert saved == ["ev_0"]
 
 
 def test_pool_drain_only_preloaded_failure(monkeypatch):
