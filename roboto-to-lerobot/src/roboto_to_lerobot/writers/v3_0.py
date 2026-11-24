@@ -48,6 +48,7 @@ class LeRobotWriter:
         streaming_encoding: bool = False,
         encoder_threads: int | None = None,
         encoder_queue_maxsize: int = 30,
+        video_encoding: Mapping[str, Any] | None = None,
     ) -> LeRobotWriter:
         from lerobot.configs.video import RGBEncoderConfig
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -59,9 +60,9 @@ class LeRobotWriter:
             root=root,
             robot_type=robot_type,
             use_videos=True,
-            # Other RGBEncoderConfig defaults (g=2, crf=30, preset=12) match
-            # what 0.5.x hard-coded, so encoded videos are unchanged.
-            rgb_encoder=RGBEncoderConfig(vcodec=_VCODEC),
+            # Settings that ``video_encoding`` leaves out keep
+            # RGBEncoderConfig's defaults (g=2, crf=30, preset=12).
+            rgb_encoder=RGBEncoderConfig(**{**(video_encoding or {}), "vcodec": _VCODEC}),
             image_writer_threads=image_writer_threads,
             batch_encoding_size=batch_encoding_size,
             streaming_encoding=streaming_encoding,
@@ -72,6 +73,18 @@ class LeRobotWriter:
         if streaming_encoding and dataset.meta.video_keys:
             _install_waiting_encoder(dataset)
         return cls(dataset)
+
+    @classmethod
+    def resolve_video_encoding(cls, overrides: Mapping[str, int]) -> dict[str, Any]:
+        """Return the codec, crf, preset and keyframe interval ``create`` encodes with.
+
+        LeRobot fills in the settings ``overrides`` leaves out and rejects
+        values its encoder config does not accept.
+        """
+        from lerobot.configs.video import RGBEncoderConfig
+
+        config = RGBEncoderConfig(**{**overrides, "vcodec": _VCODEC})
+        return {"vcodec": config.vcodec, "crf": config.crf, "preset": config.preset, "g": config.g}
 
     def add_frame(self, frame: dict[str, Any], task: str) -> None:
         # lerobot 0.6 and later read ``task`` from the frame dict. The

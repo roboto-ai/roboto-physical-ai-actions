@@ -43,15 +43,19 @@ class LeRobotWriter:
         streaming_encoding: bool = False,
         encoder_threads: int | None = None,
         encoder_queue_maxsize: int = 30,
+        video_encoding: Mapping[str, Any] | None = None,
     ) -> LeRobotWriter:
         # 0.6.x-only encoder knobs: 0.3.x's LeRobotDataset.create rejects
         # them, so we keep them in the adapter signature (so main.py has a
         # single call shape) and drop them before calling lerobot.
+        # ``video_encoding`` holds no settings, because
+        # ``resolve_video_encoding`` refuses every one.
         _ = (
             batch_encoding_size,
             streaming_encoding,
             encoder_threads,
             encoder_queue_maxsize,
+            video_encoding,
         )
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -67,6 +71,20 @@ class LeRobotWriter:
             image_writer_threads=image_writer_threads,
         )
         return cls(dataset)
+
+    @classmethod
+    def resolve_video_encoding(cls, overrides: Mapping[str, int]) -> dict[str, Any]:
+        """Return no settings; raise ``ValueError`` if ``overrides`` sets any.
+
+        lerobot 0.3.x encodes with settings it fixes itself, so ignoring a
+        requested setting would silently change the output's quality.
+        """
+        if overrides:
+            raise ValueError(
+                "video_crf, video_preset and video_gop need roboto-to-lerobot-v3_0; "
+                "lerobot 0.3.x, which roboto-to-lerobot-v2_1 runs, fixes its encoder settings."
+            )
+        return {}
 
     def add_frame(self, frame: dict[str, Any], task: str) -> None:
         # 0.3.x: ``task`` must be passed as a kwarg, not as a frame key.

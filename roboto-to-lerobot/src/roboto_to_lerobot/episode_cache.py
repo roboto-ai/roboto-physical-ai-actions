@@ -16,7 +16,8 @@ Both keys are sha256 hex digests of canonical JSON:
 * ``recipe_hash`` covers everything that changes the bytes of an entry or
   whether two entries can be merged: the parsed contract YAML, this
   package's source, the lerobot version and codebase version, the video
-  codec, the streaming-encoding flag and the resolved ``features`` dict.
+  encoder settings, the streaming-encoding flag and the resolved
+  ``features`` dict.
 * ``episode_key`` covers everything that selects one episode's input: the
   event (id, bounds, source dataset, raw task label), the fetch window
   padding, the dataset's resolved topic bindings, and a fingerprint of every
@@ -40,6 +41,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -50,7 +52,6 @@ from roboto.exceptions import RobotoNotFoundException
 
 from .contract_utils import Contract, _topic_intersects_window
 from .logger import logger
-from .writers.v3_0 import _VCODEC
 
 CACHE_PREFIX = ".lerobot-cache"
 # Uploaded after every other file of its entry. It holds the episode's
@@ -86,7 +87,9 @@ def _source_digest() -> str:
     return digest.hexdigest()
 
 
-def recipe_hash(*, contract_path: Path, features: dict, streaming_encoding: bool) -> str:
+def recipe_hash(
+    *, contract_path: Path, features: dict, streaming_encoding: bool, video_encoding: Mapping[str, Any],
+) -> str:
     """Hash the settings that every entry merged into one export must share.
 
     The contract is hashed as parsed YAML, so comments, whitespace, key
@@ -94,6 +97,11 @@ def recipe_hash(*, contract_path: Path, features: dict, streaming_encoding: bool
     shard count and the collection are left out: they do not change the
     bytes of an entry. The lerobot and codebase versions keep the two
     variants' entries (v2.1 and v3.0) under different hashes.
+
+    ``video_encoding`` is what ``LeRobotWriter.resolve_video_encoding``
+    returned. Because it includes the settings left at their defaults, a
+    run that sets a video parameter to its default reuses the entries of a
+    run that left it unset.
     """
     try:
         from lerobot.datasets.dataset_metadata import CODEBASE_VERSION
@@ -105,7 +113,7 @@ def recipe_hash(*, contract_path: Path, features: dict, streaming_encoding: bool
         "source": _source_digest(),
         "lerobot": _pkg_version("lerobot"),
         "codebase_version": CODEBASE_VERSION,
-        "vcodec": _VCODEC,
+        "video_encoding": dict(video_encoding),
         "streaming_encoding": streaming_encoding,
         "features": features,
     })

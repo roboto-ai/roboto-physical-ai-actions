@@ -259,6 +259,40 @@ def _resolve_output_format(param_value: object = None) -> str:
     return value
 
 
+# Video encoder parameters: each maps to an ``RGBEncoderConfig`` field and
+# the range of values it accepts. ``crf`` 0 is left out: FFmpeg's SVT-AV1
+# wrapper reads it as "unset" and encodes at its own default instead of at
+# the best quality.
+_VIDEO_PARAMETERS: dict[str, tuple[str, int, int | None]] = {
+    "video_crf": ("crf", 1, 63),
+    "video_preset": ("preset", 0, 13),
+    "video_gop": ("g", 1, None),
+}
+
+
+def _parse_video_overrides(context: roboto.InvocationContext) -> dict[str, int]:
+    """Read the ``video_crf``, ``video_preset`` and ``video_gop`` parameters that are set.
+
+    Returns them keyed by ``RGBEncoderConfig`` field. Raises ``ValueError``
+    on a value that is not an integer in the parameter's range, before any
+    event is converted.
+    """
+    overrides = {}
+    for name, (field, low, high) in _VIDEO_PARAMETERS.items():
+        raw = context.get_optional_parameter(name)
+        if raw is None or raw == "":
+            continue
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = None
+        if value is None or value < low or (high is not None and value > high):
+            limits = f"from {low} to {high}" if high is not None else f"{low} or more"
+            raise ValueError(f"{name} must be an integer {limits}, got {raw!r}")
+        overrides[field] = value
+    return overrides
+
+
 def _open_episode_cache(context: roboto.InvocationContext) -> EpisodeCache | None:
     """Return the episode cache in the org's assets when ``episode_cache`` is on and usable.
 
@@ -927,6 +961,7 @@ def _run_shard_subprocess(
     pool_tasks: list,
     drain_order: list,
     result_path: str,
+    video_encoding: dict | None = None,
     episode_conn: Connection | None = None,
 ) -> None:
     """Entrypoint for a single shard process.
@@ -979,6 +1014,7 @@ def _run_shard_subprocess(
             "streaming_encoding": _STREAMING_ENCODING,
             "encoder_threads": encoder_threads,
             "encoder_queue_maxsize": _ENCODER_QUEUE_MAXSIZE,
+            "video_encoding": video_encoding,
         }
         accumulator = _DrainAccum()
         on_episode_saved = None
@@ -1045,6 +1081,7 @@ def _spawn_shards(
     descriptors_by_ds: dict,
     contracts_by_ds: dict,
     log_level: int,
+    video_encoding: dict | None = None,
     on_episodes: Callable[[list[dict]], None] | None = None,
 ) -> list[dict]:
     """Spawn one process per shard, wait for all, return per-shard results.
@@ -1110,6 +1147,7 @@ def _spawn_shards(
                 "features": features,
                 "robot_type": robot_type,
                 "encoder_threads": encoder_threads,
+                "video_encoding": video_encoding,
                 "pool_size": pool_size,
                 "video_specs_by_key": video_specs_by_key,
                 "descriptors_by_ds": {ds: descriptors_by_ds[ds] for ds in shard_ds_ids},
@@ -1848,6 +1886,8 @@ def main(context: roboto.InvocationContext) -> None:
         raise ValueError("collection_id must be a non-empty string")
 
     output_format = _resolve_output_format(context.get_optional_parameter("output_format"))
+    video_encoding = LeRobotWriter.resolve_video_encoding(_parse_video_overrides(context))
+    logger.info("Video encoder settings: %s", video_encoding or "fixed by lerobot")
     contract, contract_rel_path, contract_sha256 = _load_contract_from_context(context)
     episode_cache = _open_episode_cache(context)
 
@@ -1982,6 +2022,7 @@ def main(context: roboto.InvocationContext) -> None:
         contract_path=context.input_dir / contract_rel_path,
         features=features,
         streaming_encoding=_STREAMING_ENCODING,
+        video_encoding=video_encoding,
     )
 
     if episode_cache is not None:
@@ -2005,6 +2046,7 @@ def main(context: roboto.InvocationContext) -> None:
             features=features,
             robot_type=contract.robot_type or "unknown",
             encoder_threads=encoder_threads,
+            video_encoding=video_encoding,
             pool_size=pool_size,
             video_specs_by_key=video_specs_by_key,
             descriptors_by_ds=descriptors_by_ds,
@@ -2025,6 +2067,7 @@ def main(context: roboto.InvocationContext) -> None:
             streaming_encoding=_STREAMING_ENCODING,
             encoder_threads=encoder_threads,
             encoder_queue_maxsize=_ENCODER_QUEUE_MAXSIZE,
+            video_encoding=video_encoding,
         )
 
         # ``first_event`` was selected from the first prepared dataset's
@@ -2171,6 +2214,7 @@ def main(context: roboto.InvocationContext) -> None:
             features=features,
             robot_type=contract.robot_type or "unknown",
             encoder_threads=encoder_threads,
+            video_encoding=video_encoding,
             pool_size=pool_size,
             video_specs_by_key=video_specs_by_key,
             descriptors_by_ds=descriptors_by_ds,

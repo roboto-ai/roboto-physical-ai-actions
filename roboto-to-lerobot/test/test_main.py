@@ -2,7 +2,9 @@ import inspect
 import types
 import typing
 
+import pytest
 import roboto
+import roboto_to_lerobot.main as main_mod
 from roboto_to_lerobot.main import main
 
 
@@ -40,3 +42,23 @@ def test_main_function_signature_matches_expectation():
 
     if "return" in type_hints:
         assert type_hints["return"] is types.NoneType, "main() expected to return None"
+
+
+def _video_context(**params):
+    return types.SimpleNamespace(get_optional_parameter=params.get)
+
+
+def test_video_parameters_map_to_encoder_settings():
+    """The set video parameters come back keyed by encoder setting; unset ones are left out."""
+    overrides = main_mod._parse_video_overrides(_video_context(video_crf="20", video_gop=8))
+    assert overrides == {"crf": 20, "g": 8}
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [("video_crf", "0"), ("video_crf", "64"), ("video_crf", "high"), ("video_preset", "14"), ("video_gop", "0")],
+)
+def test_video_parameter_out_of_range_fails(name, value):
+    """A video parameter that is not an integer in its range fails the run."""
+    with pytest.raises(ValueError, match=f"{name} must be an integer"):
+        main_mod._parse_video_overrides(_video_context(**{name: value}))

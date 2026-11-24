@@ -52,6 +52,7 @@ class LeRobotWriter(Protocol):
         streaming_encoding: bool = False,
         encoder_threads: int | None = None,
         encoder_queue_maxsize: int = 30,
+        video_encoding: Mapping[str, Any] | None = None,
     ) -> LeRobotWriter:
         """Create a fresh on-disk dataset rooted at ``root``.
 
@@ -61,9 +62,24 @@ class LeRobotWriter(Protocol):
         lerobot, since 0.3.x's ``LeRobotDataset.create`` would reject them.
         This keeps a single call shape in ``main.py`` across versions.
 
-        ``vcodec`` is deliberately not in the Protocol: the v3_0 adapter
-        locks it to ``"libsvtav1"`` because alternatives degrade downstream
-        training quality.
+        ``video_encoding`` is what :meth:`resolve_video_encoding` returned;
+        ``None`` keeps LeRobot's encoder defaults.
+
+        ``vcodec`` is deliberately not a parameter: the v3_0 adapter locks
+        it to ``"libsvtav1"``, even over a ``vcodec`` in ``video_encoding``,
+        because alternatives degrade downstream training quality.
+        """
+        ...
+
+    @classmethod
+    def resolve_video_encoding(cls, overrides: Mapping[str, int]) -> dict[str, Any]:
+        """Return the video encoder settings ``create`` applies, given the caller's ``overrides``.
+
+        ``overrides`` may set ``crf``, ``preset`` and ``g`` (keyframe
+        interval). The result includes the settings ``overrides`` leaves at
+        their defaults, so overrides that only restate a default return the
+        same settings as no overrides. Raises ``ValueError`` when the adapter
+        cannot apply them.
         """
         ...
 

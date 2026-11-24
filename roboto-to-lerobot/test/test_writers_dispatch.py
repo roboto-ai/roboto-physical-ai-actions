@@ -265,6 +265,13 @@ def test_v2_1_silently_drops_new_encoding_kwargs(
         )
 
 
+def test_v2_1_rejects_video_settings() -> None:
+    """lerobot 0.3.x cannot apply video settings, so asking for one fails instead of being ignored."""
+    assert V21Writer.resolve_video_encoding({}) == {}
+    with pytest.raises(ValueError, match="need roboto-to-lerobot-v3_0"):
+        V21Writer.resolve_video_encoding({"crf": 20})
+
+
 # -----------------------------------------------------------------------------
 # discard_episode: soft-drop abort hook for the per-event try/except in
 # _run_pool_drain. v3_0 delegates to lerobot 0.6.x's clear_episode_buffer.
