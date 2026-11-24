@@ -451,3 +451,18 @@ def test_action_causal_transform_boots_and_is_unfiltered_passthrough():
     topic, payload = out[0]
     assert topic == "/teleop/action"
     np.testing.assert_allclose(payload["data"], [1.0, 2.0, 3.0])
+
+
+def test_refuses_causal_transform_limited_to_columns():
+    """The live runtime filters every column of a stream, so it refuses a causal filter
+    limited to some columns."""
+    transform = _causal_transform(stage="post")
+    spec = ObservationSpec(
+        key="observation.state",
+        topic="/robot/state",
+        type="std_msgs/msg/Float64MultiArray",
+        align=AlignSpec(method="hold", tolerance_ms=100),
+        transforms=[TransformSpec(type=transform.type, params=transform.params, stage="post", columns=(0,))],
+    )
+    with pytest.raises(ValueError, match="columns"):
+        LiveAdapter(_make_contract(observations=[spec]))

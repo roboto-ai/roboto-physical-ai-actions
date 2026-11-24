@@ -23,7 +23,7 @@ License text: ``runtime/LICENSE-rosetta``.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
@@ -287,14 +287,17 @@ class AlignSpec:
 class TransformSpec:
     """Transform configuration.
 
-    type:   transform name (matches key in the TRANSFORMS registry)
-    params: free-form kwargs forwarded to the transform function
-    stage:  "pre" (before alignment, on raw stream) or "post" (after alignment)
+    type:    transform name (matches key in the TRANSFORMS registry)
+    params:  free-form kwargs forwarded to the transform function
+    stage:   "pre" (before alignment, on raw stream) or "post" (after alignment)
+    columns: positions, in the stream's ``selector.names``, of the columns the
+             transform reads and writes; ``None`` for every column
     """
 
     type: str
     params: dict[str, Any]
     stage: str = "post"
+    columns: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1229,7 +1232,7 @@ class DataCollection:
                 all_timestamps = []
                 all_values = []
 
-                for _, row in raw_df.iterrows():
+                for row in _message_rows(raw_df):
                     decoded = decode_value(row, action)
 
                     # Check if decoder returned flattened structure (e.g., JointTrajectory)
@@ -1316,23 +1319,16 @@ class DataCollection:
                     self.observations[unique_key] = pd.DataFrame({"timestamp": []})
                     continue
 
-                # Apply decoder to each message
-                timestamps = []
-                decoded_values = []
-
-                for _, row in raw_df.iterrows():
-                    # The decoder expects the row as a message-like object
-                    # Roboto returns rows with columns like "name", "position", etc.
-                    decoded = decode_value(row, observation)
-                    timestamps.append(row["timestamp"])
-                    decoded_values.append(decoded)
+                # Each row is one message, with columns such as "name" and
+                # "position", which the decoder reads like a message object.
+                decoded_values = [decode_value(row, observation) for row in _message_rows(raw_df)]
 
                 # Single ``values`` column of per-row numpy arrays — matches
                 # what ``lerobot.generate_frames`` expects when it stacks /
                 # merges array streams onto the reference timeline.
                 result = pd.DataFrame({
-                    "timestamp": timestamps,
-                    "values": decoded_values,  # List of numpy arrays
+                    "timestamp": raw_df["timestamp"].to_numpy(),
+                    "values": decoded_values,
                 })
 
                 # Populate resolved_features with LeRobot-facing names
@@ -1689,19 +1685,57 @@ def _as_qos(it: dict[str, Any]) -> QosSpec | None:
     )
 
 
+def _message_rows(raw_df: pd.DataFrame) -> Iterator[pd.Series]:
+    """Yield each message of a fetched topic as a row of its fields, each keeping its own type.
+
+    ``iterrows`` converts every field of a row to one type that all the
+    columns can share. On a topic whose fields are all numbers, one of them a
+    float, that type is float64: an integer field above 2**53, such as the
+    nanosecond timestamp, is rounded, and ``merge_asof`` rejects the float
+    timestamps against the int64 timeline. Casting the frame to ``object``
+    first keeps each field as it was fetched, an int64 field as an exact
+    Python ``int``.
+    """
+    for _, row in raw_df.astype(object).iterrows():
+        yield row
+
+
 def _parse_transforms(it: dict[str, Any]) -> list[TransformSpec] | None:
-    """Extract and parse ``transforms`` from a spec block."""
+    """Parse a spec block's ``transforms``, or return ``None`` when it has none.
+
+    Converts each transform's ``columns`` names to their positions in
+    ``selector.names``. Raises ``ValueError`` for a ``stage`` other than
+    ``pre`` or ``post``, for ``columns`` that is not a non-empty list of
+    distinct names, and for a column name that ``selector.names`` lacks, so a
+    mistyped contract fails when it loads rather than after its data is
+    fetched.
+    """
     raw = it.get("transforms")
     if not raw:
         return None
-    return [
-        TransformSpec(
+    names = list((it.get("selector") or {}).get("names") or [])
+    specs: list[TransformSpec] = []
+    for t in raw:
+        where = f"Stream '{it.get('key', '?')}': transform '{t['type']}'"
+        stage = t.get("stage", "post")
+        if stage not in ("pre", "post"):
+            raise ValueError(f"{where} has stage {stage!r}; use 'pre' or 'post'.")
+        columns = None
+        if "columns" in t:
+            listed = t["columns"]
+            if not isinstance(listed, list) or not listed or len(set(listed)) != len(listed):
+                raise ValueError(f"{where} needs 'columns' as a list of distinct names, got {listed!r}.")
+            unknown = [c for c in listed if c not in names]
+            if unknown:
+                raise ValueError(f"{where} names columns {unknown} that are not in selector.names {names}.")
+            columns = tuple(names.index(c) for c in listed)
+        specs.append(TransformSpec(
             type=t["type"],
-            params={k: v for k, v in t.items() if k not in ("type", "stage")},
-            stage=t.get("stage", "post"),
-        )
-        for t in raw
-    ]
+            params={k: v for k, v in t.items() if k not in ("type", "stage", "columns")},
+            stage=stage,
+            columns=columns,
+        ))
+    return specs
 
 
 def _spec_origin(spec: Any) -> str:

@@ -257,6 +257,24 @@ actions:
 | `pre`   | Before alignment, on the raw stream.      | Operates on raw timestamps. Use for resampling and pre-alignment filtering.            |
 | `post`  | After alignment, on the reference timeline. | Operates at `contract.fps`. **Default when `stage:` is omitted.**                  |
 
+Any other `stage` fails when the contract loads.
+
+### Columns
+
+A transform applies to every column of its stream unless it lists `columns`,
+by their names in `selector.names`; the other columns pass through unchanged.
+`columns` must be a non-empty list of distinct names, each in
+`selector.names`, or the contract fails when it loads. A transform given
+`columns` must keep the number of rows and columns it is given, so
+`resample_uniform` cannot take them.
+
+Frames where a stream has a gap longer than its tolerance are dropped. A
+`post` transform runs separately on each unbroken run of the remaining
+frames, so `finite_difference` and the Butterworth filters never treat the
+two sides of a gap as neighbours. A run too short for `butterworth_lowpass`'s usual
+edge padding is filtered with as much padding as it allows, and a single frame's
+`finite_difference` is zero.
+
 ### Built-in transforms
 
 | Type                    | Stage     | Params                                            | Description                                                                                                              |
@@ -265,6 +283,12 @@ actions:
 | `butterworth_lowpass`   | any       | `cutoff_hz` (required), `order` (default `2`)     | Zero-phase Butterworth low-pass filter (uses scipy `sosfiltfilt`).                                                       |
 | `butterworth_lowpass_causal` | any  | `cutoff_hz` (required), `order` (default `2`), `fs_hz` (optional) | Causal (forward-only) Butterworth low-pass filter (uses scipy `sosfilt`, seeded with `sosfilt_zi` to avoid a startup transient). |
 | `finite_difference`     | any       | —                                                 | Frame-to-frame difference (`out[i] = in[i+1] - in[i]`). Last row is repeated to keep the shape constant.                  |
+| `quaternion_continuity` | `pre`     | —                                                 | Takes 4 quaternion columns, in any order. Negates each quaternion whose dot product with the one before it is negative, so the stream never jumps from q to -q. |
+| `quaternion_normalize`  | `post`    | —                                                 | Takes 4 quaternion columns. Scales each quaternion to unit length; raises if one has norm below 0.7, which means `quaternion_continuity` is missing. |
+| `unwrap_angle`          | `pre`     | `degrees` (default `false`)                       | Removes the full-turn jumps where an angle wraps, so it changes continuously. Assumes less than half a turn between samples. |
+| `wrap_angle`            | `post`    | `degrees` (default `false`)                       | Brings an angle back into [-π, π) radians or [-180, 180) degrees.                                                        |
+| `polar_to_cartesian`    | `pre`     | `degrees` (default `false`)                       | Takes `[r, theta]`, theta from +x towards +y, and returns `[x, y]`.                                                       |
+| `spherical_to_cartesian` | `pre`    | `degrees` (default `false`)                       | Takes `[r, theta, phi]`, theta the inclination from +z and phi the azimuth from +x towards +y, and returns `[x, y, z]`. |
 
 `fs_hz` (on `butterworth_lowpass_causal` only) declares the sample rate the
 filter is *designed* for, overriding the `fps` the transform would otherwise
@@ -300,6 +324,8 @@ runtime (`roboto_to_lerobot.runtime.live_adapter.LiveAdapter`) —
 `butterworth_lowpass` needs future
 samples and can never run online, so `gen-node` and the live adapter both
 refuse it (and `resample_uniform`, and every other transform) unconditionally.
+Both also refuse `butterworth_lowpass_causal` with `columns` on an
+observation, since the live filter applies to every column of a stream.
 On observations, the causal filter runs for real: a `stage: pre` instance
 filters each decoded message before it enters the alignment buffer (so it
 must declare `fs_hz`, per above), and a `stage: post` instance filters at
@@ -316,6 +342,48 @@ When chaining a `pre`-stage timestamp-modifying transform (`resample_uniform`)
 with later filters, the `fps` argument passed to subsequent transforms is
 recomputed from the new timestamps automatically — so a `butterworth_lowpass`
 after `resample_uniform` sees the resampled rate, not the raw one.
+
+### Rotations, angles and polar vectors
+
+`align: linear` blends each column on its own, which is wrong for these as
+recorded: a quaternion and its negation are the same rotation, an angle
+jumps by a full turn where it wraps, and a polar vector's angle wraps too.
+Pair a `pre` transform that makes the stream safe to blend with, where it
+has one, a `post` transform that restores the recorded form:
+
+```yaml
+observations:
+  - key: observation.state
+    topic: /tool/odom
+    type: nav_msgs/msg/Odometry
+    selector:
+      names: [pose.pose.position.x, pose.pose.position.y, pose.pose.position.z,
+              pose.pose.orientation.x, pose.pose.orientation.y, pose.pose.orientation.z, pose.pose.orientation.w]
+      lerobot_names: [x, y, z, qx, qy, qz, qw]
+    align: {method: linear, tolerance_ms: 100}
+    transforms:
+      - type: quaternion_continuity
+        stage: pre
+        columns: [pose.pose.orientation.x, pose.pose.orientation.y, pose.pose.orientation.z, pose.pose.orientation.w]
+      - type: quaternion_normalize      # stage defaults to "post"
+        columns: [pose.pose.orientation.x, pose.pose.orientation.y, pose.pose.orientation.z, pose.pose.orientation.w]
+```
+
+- **Quaternions.** `quaternion_continuity` before alignment and
+  `quaternion_normalize` after it give normalized linear interpolation, which
+  follows the same path as SLERP. Its angle from SLERP is about
+  1.2e-6 × θ³ degrees, θ being the rotation in degrees between the two
+  samples blended: under 0.001° at 10°, 0.06° at 36°, 0.5° at 72°.
+- **Single angles** (yaw, a joint that turns without limit): `unwrap_angle`
+  before alignment, `wrap_angle` after it. Interpolating Euler angle triples
+  is not recommended; record a quaternion instead.
+- **Polar and spherical vectors:** `polar_to_cartesian` or
+  `spherical_to_cartesian` before alignment. The dataset then holds the
+  cartesian vector, which has no wrap or pole for a policy to learn around;
+  set `lerobot_names` to name its components.
+
+None of these can run in the live runtime, which refuses them like every
+transform other than `butterworth_lowpass_causal`.
 
 To add a new transform, register it in
 `src/roboto_to_lerobot/transforms.py` via `@register_transform("name")`.

@@ -164,9 +164,10 @@ def _refuse_transforms(key: str, transforms, *, fps: float, is_action: bool) -> 
 
     For observations, the causal transform additionally must declare
     ``fs_hz`` when ``stage: pre`` (the raw topic rate training measured is
-    otherwise unknowable to the live runtime), and must not declare an
+    otherwise unknowable to the live runtime), must not declare an
     ``fs_hz`` that contradicts ``fps`` when ``stage: post`` (post-stage
-    transforms always run on the contract-fps timeline). Actions accept
+    transforms always run on the contract-fps timeline), and must not list
+    ``columns`` (the live filter runs on every column). Actions accept
     the causal transform unconditionally — no ``fs_hz`` check — because
     the runtime passes the policy's action output through unfiltered
     rather than designing a live filter for it.
@@ -177,6 +178,13 @@ def _refuse_transforms(key: str, transforms, *, fps: float, is_action: bool) -> 
         if transform.type == LIVE_TRANSFORM:
             if is_action:
                 continue  # pass-through — see LiveAdapter.encode_action.
+            if transform.columns is not None:
+                raise GenNodeError(
+                    f"Stream '{key}' limits '{LIVE_TRANSFORM}' to some columns, "
+                    "which the live runtime cannot do: it filters every column "
+                    "of a stream. Drop 'columns', or select those columns in a "
+                    "stream of their own."
+                )
             if transform.stage == "pre" and "fs_hz" not in transform.params:
                 raise GenNodeError(
                     f"Stream '{key}' uses stage:pre '{LIVE_TRANSFORM}' "
