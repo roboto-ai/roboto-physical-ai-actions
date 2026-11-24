@@ -13,6 +13,7 @@ from roboto_to_lerobot.subtasks import (
     GAP_SUBTASK,
     SubtaskWindow,
     apply_session_subtasks,
+    parse_event_patterns,
 )
 
 FPS = 10
@@ -25,8 +26,8 @@ def _ns(seconds: float) -> int:
     return EPISODE_START_NS + round(seconds * 1e9)
 
 
-def _window(event_id: str, name: str, start_s: float, end_s: float) -> SubtaskWindow:
-    return SubtaskWindow(event_id, name, _ns(start_s), _ns(end_s))
+def _window(event_id: str, name: str, start_s: float, end_s: float, tags: tuple[str, ...] = ()) -> SubtaskWindow:
+    return SubtaskWindow(event_id, name, _ns(start_s), _ns(end_s), tags)
 
 
 def _source(session_id: str, *windows: SubtaskWindow) -> EpisodeSource:
@@ -41,13 +42,15 @@ def _source(session_id: str, *windows: SubtaskWindow) -> EpisodeSource:
     )
 
 
-def _entry(episode_index: int, session_id: str, n_frames: int = 20) -> dict:
+def _entry(episode_index: int, session_id: str, dropped_frames: tuple[int, ...] = ()) -> dict:
+    """The manifest entry of a 20-frame episode that left ``dropped_frames`` out of its reference timeline."""
     return {
         "episode_index": episode_index,
         "session_id": session_id,
-        "n_frames": n_frames,
+        "n_frames": 20,
+        "dropped_frames": list(dropped_frames),
         "start_time_ns": EPISODE_START_NS,
-        "end_time_ns": EPISODE_START_NS + (n_frames - 1) * STEP_NS,
+        "end_time_ns": EPISODE_START_NS + (20 + len(dropped_frames) - 1) * STEP_NS,
     }
 
 
@@ -134,6 +137,80 @@ def test_event_shorter_than_a_frame_is_reported_rather_than_silently_lost(datase
     assert [d["event_id"] for d in summary["dropped_events"]] == ["ev_instant"]
     dataset = LeRobotDataset(REPO_ID, root=dataset_root)
     assert _active_subtask(dataset, 12) == GAP_SUBTASK
+
+
+def test_dropped_frames_do_not_move_a_subtask_off_the_frames_its_event_covers(dataset_root):
+    # Arrange
+    # grasp covers reference frames 5 to 9. With reference frames 0, 1 and 7 left out of the
+    # episode, those are the episode's frames 3 to 6.
+    sources = [_source("se_a", _window("ev_grasp", "grasp", 0.5, 1.0))]
+
+    # Act
+    apply_session_subtasks(dataset_root, sources, [_entry(0, "se_a", dropped_frames=(0, 1, 7))], FPS)
+
+    # Assert
+    dataset = LeRobotDataset(REPO_ID, root=dataset_root)
+    assert [_active_subtask(dataset, frame) for frame in (2, 3, 6, 7)] == [GAP_SUBTASK, "grasp", "grasp", GAP_SUBTASK]
+
+
+@pytest.mark.parametrize(
+    ("subtask_events", "at_frame_7", "at_frame_14"),
+    [
+        ("!qa/*", "grasp", GAP_SUBTASK),
+        ("grasp, lift", "grasp", GAP_SUBTASK),
+        ("qa/*", GAP_SUBTASK, "qa/blur"),
+        (None, "grasp", "qa/blur"),
+    ],
+    ids=["exclude", "include-list", "include-glob", "unset-selects-all"],
+)
+def test_subtask_events_chooses_by_name_which_events_become_subtasks(
+    dataset_root, subtask_events, at_frame_7, at_frame_14,
+):
+    # Arrange
+    sources = [
+        _source("se_a", _window("ev_grasp", "grasp", 0.5, 1.0), _window("ev_qa", "qa/blur", 1.2, 1.6)),
+    ]
+
+    # Act
+    apply_session_subtasks(
+        dataset_root, sources, [_entry(0, "se_a")], FPS, event_patterns=parse_event_patterns(subtask_events),
+    )
+
+    # Assert
+    dataset = LeRobotDataset(REPO_ID, root=dataset_root)
+    assert (_active_subtask(dataset, 7), _active_subtask(dataset, 14)) == (at_frame_7, at_frame_14)
+
+
+@pytest.mark.parametrize(
+    ("subtask_events", "expected"),
+    [
+        ("tag:subtask", ("grasp", GAP_SUBTASK, GAP_SUBTASK, GAP_SUBTASK)),
+        ("!tag:qa", ("grasp", GAP_SUBTASK, GAP_SUBTASK, "lift")),
+        ("grasp*,!tag:qa", ("grasp", GAP_SUBTASK, GAP_SUBTASK, GAP_SUBTASK)),
+        ("lift,tag:rev*", (GAP_SUBTASK, GAP_SUBTASK, "grasp_check", "lift")),
+    ],
+    ids=["include-tag", "exclude-tag", "exclude-tag-from-name-glob", "name-or-tag-glob"],
+)
+def test_subtask_events_chooses_by_tag_and_name_which_events_become_subtasks(dataset_root, subtask_events, expected):
+    # Arrange
+    sources = [
+        _source(
+            "se_a",
+            _window("ev_grasp", "grasp", 0.5, 1.0, tags=("subtask",)),
+            _window("ev_blur", "blur", 1.2, 1.4, tags=("qa",)),
+            _window("ev_check", "grasp_check", 1.5, 1.7, tags=("qa", "review")),
+            _window("ev_lift", "lift", 1.8, 1.9),
+        ),
+    ]
+
+    # Act
+    apply_session_subtasks(
+        dataset_root, sources, [_entry(0, "se_a")], FPS, event_patterns=parse_event_patterns(subtask_events),
+    )
+
+    # Assert
+    dataset = LeRobotDataset(REPO_ID, root=dataset_root)
+    assert tuple(_active_subtask(dataset, frame) for frame in (7, 12, 15, 18)) == expected
 
 
 def test_lerobot_without_language_columns_skips_subtasks_and_leaves_the_dataset_alone(dataset_root, monkeypatch):

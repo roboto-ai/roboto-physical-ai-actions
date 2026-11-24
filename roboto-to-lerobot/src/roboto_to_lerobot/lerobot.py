@@ -84,6 +84,7 @@ def generate_frames(
     reference_timestamps: pd.Series,
     task: str = "default",
     defer_image_decode: bool = False,
+    dropped_frames: list[int] | None = None,
 ) -> Generator[dict[str, Any], None, None]:
     """
     Generate observation-action frame dicts aligned to *reference_timestamps*.
@@ -100,6 +101,10 @@ def generate_frames(
             columns correspond to the selector paths from the contract.
         reference_timestamps: DataFrame / Series with a ``"timestamp"`` column
             that defines the output cadence.
+        dropped_frames: If given, receives the positions in
+            ``reference_timestamps`` of the frames left out because a stream's
+            value for them is missing (NaN). It is filled before the first
+            frame is yielded.
 
     Yields:
         dict mapping base keys to numpy arrays (observations / actions)
@@ -315,6 +320,12 @@ def generate_frames(
         merged_df[col] = list(stacked)  # back to list-of-arrays
 
     rows_before = len(merged_df)
+    if dropped_frames is not None:
+        # Each merge keeps one row per reference timestamp, in order, so a
+        # row's position is its frame's position on the reference timeline.
+        # (An exact-timestamp merge, align method ``none``, keeps that only
+        # while its stream has no repeated timestamps.)
+        dropped_frames.extend(np.flatnonzero(merged_df.isna().any(axis=1).to_numpy()).tolist())
     merged_df = merged_df.dropna()
     rows_after = len(merged_df)
     rows_dropped = rows_before - rows_after

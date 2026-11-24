@@ -23,7 +23,7 @@ from roboto_to_lerobot.episode_sources import (
     ResolvedSources,
 )
 from roboto_to_lerobot.subtasks import SubtaskWindow
-from test_episode_cache import _DS, _SECOND, _events, _Harness, main_mod
+from test_episode_cache import _DS, _SECOND, _T0, _events, _Harness, main_mod
 
 pytestmark = pytest.mark.skipif(
     not main_mod._shard_path_supported(), reason="v3.0 output needs lerobot 0.6 or later",
@@ -135,6 +135,30 @@ def test_session_collection_exports_through_the_cache_with_subtasks_and_session_
     second_session = LeRobotDataset(root.name, root=root, episode_filter=lambda ep: ep["roboto/session_id"] == "se_1")
     assert second_session.episodes == [1]
     assert "language_persistent" in second_session.meta.features
+
+
+def test_subtasks_stay_on_their_frames_when_an_episode_drops_frames_at_its_start(export):
+    # Arrange
+    # The session starts 0.3 s before the recording has data. The joint state and action hold their
+    # last value, and have none to hold on the first three reference frames, so the episode drops them.
+    start = _T0 - 3 * _SECOND // 10
+    grasp = SubtaskWindow("ev_grasp", "grasp", _T0 + 2 * _SECOND // 10, _T0 + 6 * _SECOND // 10)
+    session = EpisodeSource("session", "se_0", "se_0", (_DS,), start, _T0 + _SECOND, {}, (grasp,))
+
+    # Act
+    out = export(roboto.CollectionResourceType.Session, [session], episode_cache="true")
+
+    # Assert
+    manifest = json.loads((out / "manifest.json").read_text())
+    (episode,) = manifest["episode_to_event"]
+    # 11 of the 14 reference frames from -0.3 s to 1.0 s are kept.
+    assert (episode["dropped_frames"], episode["n_frames"]) == ([0, 1, 2], 11)
+    # grasp covers reference frames 5 to 8, which are the episode's frames 2 to 5.
+    assert manifest["subtasks"]["episodes"][0]["segments"] == [
+        {"content": "no_subtask", "start_frame": 0, "event_id": None},
+        {"content": "grasp", "start_frame": 2, "event_id": "ev_grasp"},
+        {"content": "no_subtask", "start_frame": 6, "event_id": None},
+    ]
 
 
 def test_event_collection_exports_with_event_ids_and_no_session_fields(export):

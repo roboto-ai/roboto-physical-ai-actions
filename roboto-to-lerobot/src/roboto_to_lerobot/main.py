@@ -66,7 +66,7 @@ from .stderr_filter import (
     install_svt_stderr_filter,
     set_libav_log_level,
 )
-from .subtasks import apply_session_subtasks
+from .subtasks import apply_session_subtasks, parse_event_patterns
 from .writers import LeRobotWriter
 from .writers.base import EpisodeWriteError
 
@@ -539,7 +539,8 @@ def _preload_episode(
             end_time_ns=int(event.end_time),
             metadata_task=metadata_task,
         )
-        frames = list(generate_frames(contract, episode_data, ref_ts, task=task))
+        dropped_frames: list[int] = []
+        frames = list(generate_frames(contract, episode_data, ref_ts, task=task, dropped_frames=dropped_frames))
     except Exception:
         logger.warning(
             "Could not build the first event (event_id=%s) in the main process; converting it in the pool instead.",
@@ -547,7 +548,9 @@ def _preload_episode(
             exc_info=True,
         )
         return None
-    return WorkerEpisode(event_idx=event_idx, task_label=task, frames=frames)
+    return WorkerEpisode(
+        event_idx=event_idx, task_label=task, frames=frames, dropped_frames=tuple(dropped_frames),
+    )
 
 
 def _record_skip(
@@ -625,6 +628,7 @@ def _drain_one_episode(
         "start_time_ns": int(start_time_ns),
         "end_time_ns": int(end_time_ns),
         "n_frames": frame_count,
+        "dropped_frames": list(episode.dropped_frames),
         "task": episode.task_label,
     })
     accumulator.total_frames += frame_count
@@ -1888,6 +1892,7 @@ def main(context: roboto.InvocationContext) -> None:
     output_format = _resolve_output_format(context.get_optional_parameter("output_format"))
     video_encoding = LeRobotWriter.resolve_video_encoding(_parse_video_overrides(context))
     logger.info("Video encoder settings: %s", video_encoding or "fixed by lerobot")
+    subtask_events = parse_event_patterns(context.get_optional_parameter("subtask_events"))
     contract, contract_rel_path, contract_sha256 = _load_contract_from_context(context)
     episode_cache = _open_episode_cache(context)
 
@@ -2273,7 +2278,7 @@ def main(context: roboto.InvocationContext) -> None:
         per_dataset_counts[e["source_dataset_id"]] += 1
     source_dataset_ids = sorted({d for s in sources for d in s.dataset_ids})
     subtasks_summary = apply_session_subtasks(
-        dataset_root, sources, episode_to_event, contract.fps,
+        dataset_root, sources, episode_to_event, contract.fps, event_patterns=subtask_events,
     )
 
     # Archive the contract bytes so the run survives later edits to the source.
