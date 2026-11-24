@@ -22,6 +22,7 @@ patched ``_worker_build_episode`` is enough to assert the drain order.
 from __future__ import annotations
 
 import pickle
+import tracemalloc
 from concurrent.futures import Future
 from types import SimpleNamespace
 from typing import Any
@@ -48,6 +49,7 @@ from roboto_to_lerobot.lerobot import (
     generate_frames,
     materialize_deferred,
 )
+from roboto_to_lerobot.main import _drain_one_episode, _DrainAccum
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -125,9 +127,8 @@ def test_materialize_deferred_matches_inline_decode():
 def test_materialize_deferred_skips_non_deferred_entries():
     """Frames whose values are already numpy arrays / strings pass through.
 
-    The preloaded slot runs ``generate_frames(defer=False)`` on the main
-    process and hands real arrays to ``add_frame``; materialize_deferred
-    must leave those untouched.
+    Streams decoded when they are fetched (video topics) reach the drain as
+    arrays; materialize_deferred must leave those untouched.
     """
     image = _color_block(4, 4, (10, 20, 30))
     frame = {
@@ -387,6 +388,42 @@ def test_drain_loop_preserves_event_order_when_futures_complete_out_of_order():
         consumed.append(episode.event_idx)
 
     assert consumed == list(range(n_events))
+
+
+def test_draining_an_episode_holds_one_decoded_frame_at_a_time():
+    """Writing an episode decodes each frame's images just before the writer takes it and frees
+    them after, so a writer process never holds an episode's decoded video."""
+    # Arrange: 60 frames of 640x480 JPEG (about 0.9 MB each once decoded), and a
+    # writer that keeps nothing, as LeRobot's copies what it keeps.
+    spec = _video_spec("observation.images.cam", resize=None)
+    jpeg = _jpeg_bytes(_color_block(480, 640, (10, 200, 30)))
+    frames = [
+        {"observation.images.cam": _DeferredFrame(
+            video_key=spec.key, decoder_type=spec.type, payload={"format": "jpeg", "data": jpeg}, resize=None,
+        )}
+        for _ in range(60)
+    ]
+    episode = WorkerEpisode(event_idx=0, task_label="t", frames=frames)
+    shapes = []
+    writer = SimpleNamespace(
+        add_frame=lambda frame, task: shapes.append(frame[spec.key].shape),
+        save_episode=lambda: None,
+    )
+
+    # Act
+    tracemalloc.start()
+    try:
+        _drain_one_episode(
+            writer=writer, video_specs_by_key={spec.key: spec}, src_ds_id="ds", event_id="ev",
+            start_time_ns=0, end_time_ns=1, episode=episode, accumulator=_DrainAccum(),
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    # Assert
+    assert shapes == [(480, 640, 3)] * 60
+    assert peak < 5 * 480 * 640 * 3
 
 
 def test_event_task_round_trips_through_pickle():
