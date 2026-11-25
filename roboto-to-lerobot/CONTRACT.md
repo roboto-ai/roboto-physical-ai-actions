@@ -546,6 +546,13 @@ register it in `src/roboto_to_lerobot/decoders.py` via
 Supported `Image` encodings: `rgb8`, `bgr8`, `mono8`, `rgba8`, `bgra8`, `8UC1`
 (decodes as mono8).
 
+While an episode is built and written, its camera messages wait in a file on
+the action's local disk rather than in memory, and each frame is read back
+from that file just before it is decoded and written. The file is deleted as
+soon as its episode is written or skipped. These files take as much disk as
+the recorded camera messages of the episodes that are being built or waiting
+to be written: up to `pool_size` + 4 episodes in each shard.
+
 #### Compressed video
 
 Topics that Roboto ingestion tags `compressedVideo` store one encoded video

@@ -202,9 +202,10 @@ class _Harness:
         monkeypatch.setattr(episode_cache, "object_ref", _ref)
         monkeypatch.setattr(episode_cache, "download_refs", _copy_refs)
 
-    def _worker_init(self, descriptors_by_ds, contracts_by_ds) -> None:
+    def _worker_init(self, descriptors_by_ds, contracts_by_ds, spool_dir=None) -> None:
         event_worker._WORKER_STATE["topics"] = dict.fromkeys(contracts_by_ds, self.topics)
         event_worker._WORKER_STATE["contracts"] = contracts_by_ds
+        event_worker._WORKER_STATE["spool_dir"] = spool_dir
 
     def _spawn_inline(self, *, chunks_drain, chunks_tasks, shard_workdir, on_episodes, **kwargs):
         self.converted[-1].extend(sorted(m["event_id"] for drain in chunks_drain for m in drain))

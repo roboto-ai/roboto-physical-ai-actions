@@ -53,6 +53,7 @@ from roboto.experimental.video import (
 
 from .extract import _add_timestamp_column, select_message_field
 from .logger import logger
+from .spool import SpoolRef, SpoolWriter, unspool
 
 __all__ = (
     "COMPRESSED_VIDEO_MESSAGE_PATHS",
@@ -231,7 +232,9 @@ class VideoSession:
     feeds a fresh decoder the same packets in the same order, so it emits the
     same frames. A worker therefore ships an episode's compressed packets,
     a few MB per camera-minute, instead of its decoded frames, about 1.7 GB
-    per minute of 640x480 at 30 fps.
+    per minute of 640x480 at 30 fps. When the probe had a spool, ``loads``
+    holds a ``SpoolRef`` in place of each packet, and decoding reads the
+    packets back from the spool file.
 
     Compared and hashed by identity, so a reader can key its decodes by
     session: one probe makes one session, every row it returns refers to it,
@@ -243,12 +246,14 @@ class VideoSession:
     start_ns: int
     end_ns: int
     keyframe_lookback_ns: int
-    loads: dict[tuple[int, int], list[tuple[int, bytes]]]
+    loads: dict[tuple[int, int], list[tuple[int, bytes | SpoolRef]]]
 
     def decode(self) -> Iterator[Any]:
         """Decode the recorded packets again, yielding ``DecodedVideoFrame`` s in the probe's order."""
         return decode_frames_in_range(
-            lambda range_start, range_end: self.loads[(range_start, range_end)],
+            lambda range_start, range_end: (
+                (log_time, unspool(data)) for log_time, data in self.loads[(range_start, range_end)]
+            ),
             self.start_ns,
             self.end_ns,
             keyframe_lookback_ns=self.keyframe_lookback_ns,
@@ -391,6 +396,7 @@ def probe_video_stream_rows(
     topic_name: str,
     field: str | None = None,
     keyframe_lookback_ns: int = DEFAULT_KEYFRAME_LOOKBACK_NS,
+    spool: SpoolWriter | None = None,
 ) -> list[dict]:
     """Find the frames a compressed-video topic's ``[start_ns, end_ns]`` range decodes to.
 
@@ -425,6 +431,8 @@ def probe_video_stream_rows(
             messages themselves.
         keyframe_lookback_ns: How far before ``start_ns`` to search for the
             keyframe that anchors the range's leading delta frames.
+        spool: Where to write the packets the session keeps. Without one,
+            the session keeps them in memory.
 
     Returns:
         The rows in the order the decoder emits their frames, which is what
@@ -441,7 +449,7 @@ def probe_video_stream_rows(
     if not in_range:
         return []
     codec = _resolve_stream_codec(in_range[0][1], topic_name)
-    loads: dict[tuple[int, int], list[tuple[int, bytes]]] = {}
+    loads: dict[tuple[int, int], list[tuple[int, bytes | SpoolRef]]] = {}
 
     def load_messages(range_start: int, range_end: int) -> list[tuple[int, bytes]]:
         messages = (
@@ -458,7 +466,9 @@ def probe_video_stream_rows(
                 )
                 continue
             kept.append((log_time, data))
-        loads[(range_start, range_end)] = kept
+        loads[(range_start, range_end)] = (
+            kept if spool is None else [(log_time, spool.put(data)) for log_time, data in kept]
+        )
         return kept
 
     session = VideoSession(

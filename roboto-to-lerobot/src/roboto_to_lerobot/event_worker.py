@@ -24,6 +24,11 @@ the resulting frame list back to the main process, which serialises
 Pickling raw bytes is far cheaper than pickling decoded numpy arrays, which
 matters because every video frame crosses the IPC boundary. Tabular numpy
 arrays (observations / actions) are small enough to pickle as-is.
+
+Given a spool directory, a worker writes each episode's camera payloads to a
+spool file of its own there as they are fetched (see the ``spool`` module),
+and the frames carry references into that file instead of the bytes. The
+episode then pickles to a size that does not depend on its camera payload.
 """
 
 from __future__ import annotations
@@ -41,6 +46,7 @@ from .contract_utils import (
     resolve_task_label,
 )
 from .lerobot import generate_frames
+from .spool import SpoolWriter
 
 
 class TopicDescriptor(NamedTuple):
@@ -92,12 +98,15 @@ _WORKER_STATE: dict[str, Any] = {}
 def _worker_init(
     descriptors_by_ds: dict[str, dict[str, list[TopicDescriptor]]],
     contracts_by_ds: dict[str, Contract],
+    spool_dir: str | None = None,
 ) -> None:
     """Build per-worker ``Topic`` objects and stash them on the module.
 
     Makes no API call: each ``Topic`` is built from the record its
     descriptor carries, against this worker's own ``RobotoClient``, which
-    later fetches the topic's data.
+    later fetches the topic's data. ``spool_dir``, an existing directory,
+    is where each episode's spool file goes; without it, camera payloads
+    stay in memory.
     """
     client = roboto.RobotoClient.defaulted()
     _WORKER_STATE["topics"] = {
@@ -111,6 +120,7 @@ def _worker_init(
         for ds_id, by_name in descriptors_by_ds.items()
     }
     _WORKER_STATE["contracts"] = contracts_by_ds
+    _WORKER_STATE["spool_dir"] = spool_dir
 
 
 def _worker_build_episode(
@@ -123,7 +133,28 @@ def _worker_build_episode(
     positions of the frames left out of that list. Video entries in each
     frame carry ``_DeferredFrame`` sentinels — the main process decodes them
     just before handing each frame to ``writer.add_frame``.
+
+    When :func:`_worker_init` was given a spool directory, the episode's
+    camera payloads are in the spool file named by
+    ``WorkerEpisode.spool_path``. The file is closed when this returns, and
+    the caller deletes it once the episode is drained. If building the
+    episode fails, the file is deleted here before the exception propagates.
     """
+    spool_dir = _WORKER_STATE.get("spool_dir")
+    if not spool_dir:
+        return _build_episode(task, None)
+    spool = SpoolWriter(spool_dir, prefix=f"event-{task.event_idx}-")
+    try:
+        episode = _build_episode(task, spool)
+    except BaseException:
+        spool.discard()
+        raise
+    spool.close()
+    return episode
+
+
+def _build_episode(task: EventTask, spool: SpoolWriter | None) -> WorkerEpisode:
+    """Build ``task``'s episode, writing its camera payloads to ``spool`` if given."""
     contract = _WORKER_STATE["contracts"][task.src_ds_id]
     topics = _WORKER_STATE["topics"][task.src_ds_id]
 
@@ -132,6 +163,7 @@ def _worker_build_episode(
         topics=topics,
         start_time_ns=task.start_time_ns - task.buffer_ns,
         end_time_ns=task.end_time_ns + task.buffer_ns + task.action_lead_ns,
+        spool=spool,
     )
 
     # ``task.task_label`` is only the raw event metadata (may be ``None``);
@@ -168,6 +200,7 @@ def _worker_build_episode(
         task_label=resolved_task_label,
         frames=frames,
         dropped_frames=tuple(dropped_frames),
+        spool_path=spool.path if spool is not None else None,
     )
 
 
@@ -180,12 +213,17 @@ class WorkerEpisode(NamedTuple):
     ``dropped_frames`` are the positions, on the episode's reference
     timeline, of the frames left out of ``frames`` because a stream's value
     for them is missing; ``frames`` holds the remaining positions in order.
+
+    ``spool_path`` is the spool file that holds the camera payloads
+    ``frames`` refer to, or ``None`` when the episode was built without a
+    spool. Whoever drains the episode deletes the file.
     """
 
     event_idx: int
     task_label: str
     frames: list[dict[str, Any]]
     dropped_frames: tuple[int, ...] = ()
+    spool_path: str | None = None
 
 
 def topic_descriptors_from_topics(
