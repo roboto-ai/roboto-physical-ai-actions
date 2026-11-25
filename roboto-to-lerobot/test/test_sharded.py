@@ -42,6 +42,7 @@ from roboto_to_lerobot.main import (
     _resolve_shard_count,
     _run_pool_drain,
     _shard_path_supported,
+    _SpoolBudget,
     _warn_oversubscription,
 )
 from roboto_to_lerobot.writers.base import EpisodeWriteError
@@ -572,6 +573,135 @@ def test_run_pool_drain_with_preloaded_event(monkeypatch):
     # Preloaded episode lands in chronological position (slot 2), proven
     # by recovering the event_idx from the first frame.
     assert [ep[0]["x"][0] for ep in writer.episodes] == [0, 1, 2, 3]
+
+
+# ---------------------------------------------------------------------------
+# _run_pool_drain with a spool budget: the spool files of the episodes in
+# flight stay within the budget, and every event still drains, in order.
+# ---------------------------------------------------------------------------
+
+# Each synthetic event's fetch range is 500,000 ns (see ``_event``); its
+# episode spools one byte per nanosecond of it.
+_EPISODE_SPOOL_BYTES = 500_000
+
+
+class _RunAheadPool:
+    """A ``ProcessPoolExecutor`` double whose workers finish every submitted task before the drain writes the next episode.
+
+    A submitted task stays pending until the drain asks any future for its
+    result; then every queued task runs, in submission order. So the drain
+    sees each task it submitted since it last asked as still being built,
+    and the spool files of all the episodes in flight are on disk together
+    before the drain writes, then deletes, the episode it waits for.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._queue: list[tuple[Future, Any, EventTask]] = []
+
+    def submit(self, fn, task: EventTask) -> Future:
+        pool = self
+
+        class _Pending(Future):
+            def result(self, timeout=None):
+                pool._run_queued()
+                return super().result(timeout)
+
+        future = _Pending()
+        self._queue.append((future, fn, task))
+        return future
+
+    def _run_queued(self) -> None:
+        while self._queue:
+            future, fn, task = self._queue.pop(0)
+            future.set_result(fn(task))
+
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+        pass
+
+
+def _drain_with_spool_budget(
+    monkeypatch, tmp_path, pool_tasks, drain_order, max_bytes, bytes_per_ns: float = 1.0,
+) -> tuple[_FakeWriter, list[tuple[int, int]]]:
+    """Drain through ``_RunAheadPool`` with a spool budget; return the writer and, after each episode is built,
+    how many episodes the writer had saved and the spool bytes on disk.
+
+    Each worker builds ``_fake_build_episode``'s episode with a spool file in
+    ``tmp_path`` of one byte per nanosecond of its task's fetch range. The
+    budget's starting estimate of spool bytes per nanosecond is ``bytes_per_ns``.
+    """
+    writer = _FakeWriter()
+    spool_bytes: list[tuple[int, int]] = []
+
+    def build_episode(task: EventTask) -> WorkerEpisode:
+        path = tmp_path / f"event-{task.event_idx}.spool"
+        path.write_bytes(bytes(task.end_time_ns - task.start_time_ns))
+        spool_bytes.append((len(writer.episodes), sum(f.stat().st_size for f in tmp_path.iterdir())))
+        return _fake_build_episode(task)._replace(spool_path=str(path))
+
+    main_mod = sys.modules["roboto_to_lerobot.main"]
+    monkeypatch.setattr(main_mod, "ProcessPoolExecutor", _RunAheadPool)
+    monkeypatch.setattr(main_mod, "_worker_build_episode", build_episode)
+    _run_pool_drain(
+        writer=writer, video_specs_by_key={}, pool_tasks=pool_tasks, drain_order=drain_order,
+        descriptors_by_ds={}, contracts_by_ds={}, pool_size=4, accumulator=_DrainAccum(),
+        spool_budget=_SpoolBudget(max_bytes=max_bytes, bytes_per_ns=bytes_per_ns),
+    )
+    return writer, spool_bytes
+
+
+def test_pool_drain_keeps_spooled_episodes_in_flight_within_the_budget(monkeypatch, tmp_path):
+    """With room for two and a half episodes' spool files, workers that run ahead of the writer never hold
+    more than two episodes on disk, and every event still drains in order."""
+    # Arrange
+    drain_order, pool_tasks = _make_drain_inputs(*_drain_inputs(8))
+
+    # Act
+    writer, spool_bytes = _drain_with_spool_budget(
+        monkeypatch, tmp_path, pool_tasks, drain_order, max_bytes=5 * _EPISODE_SPOOL_BYTES // 2,
+    )
+
+    # Assert
+    assert [episode[0]["x"][0] for episode in writer.episodes] == list(range(8))
+    assert max(on_disk for _, on_disk in spool_bytes) == 2 * _EPISODE_SPOOL_BYTES
+
+
+def test_pool_drain_converts_over_budget_episodes_one_at_a_time_in_order_when_the_first_task_comes_last(
+    monkeypatch, tmp_path,
+):
+    """An episode whose spool alone exceeds the budget still converts, alone. The main process hands the
+    first event's task to the pool last when it could not build that event itself."""
+    # Arrange
+    drain_order, pool_tasks = _make_drain_inputs(*_drain_inputs(5))
+    pool_tasks = pool_tasks[1:] + pool_tasks[:1]
+
+    # Act
+    writer, spool_bytes = _drain_with_spool_budget(
+        monkeypatch, tmp_path, pool_tasks, drain_order, max_bytes=_EPISODE_SPOOL_BYTES // 2,
+    )
+
+    # Assert
+    assert [episode[0]["x"][0] for episode in writer.episodes] == list(range(5))
+    assert max(on_disk for _, on_disk in spool_bytes) == _EPISODE_SPOOL_BYTES
+
+
+def test_pool_drain_tightens_admission_once_an_episode_spools_more_than_the_first_event_did(monkeypatch, tmp_path):
+    """When episodes spool more per nanosecond than the first event did, the drain raises its estimate to
+    the rate a drained episode spooled, so from then on the spool files in flight stay within the budget."""
+    # Arrange: the budget expects half a byte per nanosecond of fetch range;
+    # every episode spools one.
+    drain_order, pool_tasks = _make_drain_inputs(*_drain_inputs(8))
+    max_bytes = 5 * _EPISODE_SPOOL_BYTES // 2
+
+    # Act
+    writer, spool_bytes = _drain_with_spool_budget(
+        monkeypatch, tmp_path, pool_tasks, drain_order, max_bytes=max_bytes, bytes_per_ns=0.5,
+    )
+
+    # Assert: before the first episode is saved, the underestimate admits more
+    # than the budget holds; after it, the spool files stay within the budget.
+    assert [episode[0]["x"][0] for episode in writer.episodes] == list(range(8))
+    assert max(on_disk for saved, on_disk in spool_bytes if saved == 0) > max_bytes
+    assert max(on_disk for saved, on_disk in spool_bytes if saved >= 1) <= max_bytes
 
 
 # ---------------------------------------------------------------------------

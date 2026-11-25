@@ -16,6 +16,7 @@ Parquet-backed read returns each top-level field as one column of dicts.
 from __future__ import annotations
 
 import array
+import pickle
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -25,19 +26,23 @@ import numpy as np
 import pandas as pd
 import pytest
 import yaml
+from roboto_to_lerobot import camera_windows, event_worker
 from roboto_to_lerobot.contract_utils import (
     Contract,
     DataCollection,
     collect_topics_from_files,
     load_contract,
 )
+from roboto_to_lerobot.event_worker import EventTask, _worker_build_episode
 from roboto_to_lerobot.lerobot import (
     episode_video_reader,
     generate_frames,
     materialize_deferred,
 )
+from roboto_to_lerobot.main import _drain_one_episode, _DrainAccum
 from roboto_to_lerobot.runtime import LiveAdapter
 from roboto_to_lerobot.runtime import load_contract as load_live_contract
+from test_compressed_video import COMPRESSED_VIDEO, _encode_h264_access_units
 
 FIRST_LOG_TIME_NS = 1_700_000_000_000_000_000
 FRAME_INTERVAL_NS = 50_000_000
@@ -128,7 +133,9 @@ class RecordTopic:
     selected field into dotted columns (``pd.json_normalize``), ``"parquet"``
     returns one column per top-level field holding each message's dict.
     ``path_types`` is the type the topic's record lists for a message path,
-    as Roboto records a nested message's type. ``fetches`` counts the reads.
+    as Roboto records a nested message's type. A read returns the messages
+    whose log time is in ``[start_time, end_time)``, as the SDK does.
+    ``fetches`` counts the reads.
     """
 
     name: str
@@ -170,7 +177,7 @@ class RecordTopic:
         selected = [
             (log_time, _project(message, message_paths_include) if message_paths_include else message)
             for log_time, message in zip(self.log_times, self.messages, strict=True)
-            if start_time.value <= log_time <= end_time.value
+            if start_time.value <= log_time < end_time.value
         ]
         index = pd.DatetimeIndex([pd.Timestamp(t, unit="ns") for t, _ in selected], name="log_time")
         records = [message for _, message in selected]
@@ -210,7 +217,7 @@ def _frames(contract: Contract, topics: list[RecordTopic]) -> dict[str, list[np.
     reading compressed video through one reader over the episode)."""
     first = topics[0]
     collection = DataCollection(
-        contract, {topic.name: [topic] for topic in topics}, first.start_time, first.end_time,
+        contract, {topic.name: [topic] for topic in topics}, first.start_time, first.end_time + 1,
     )
     reference = pd.Series(first.log_times, name="timestamp")
     specs_by_key = {spec.key: spec for spec in contract.videos}
@@ -294,6 +301,68 @@ def test_nested_compressed_video_decodes_to_the_frames_of_the_same_stream_on_its
     # Assert
     assert len(frames["nested"]) == len(access_units)
     np.testing.assert_array_equal(frames["nested"], frames["standalone"])
+
+
+@pytest.mark.parametrize("store", ["mcap", "parquet"])
+def test_nested_cameras_written_through_a_spool_in_windows_equal_the_same_cameras_on_their_own_topics(
+    monkeypatch, tmp_path, store,
+):
+    """A CompressedImage and an H.264 stream nested in one custom message, built into an episode by a
+    worker with a spool directory and read in several time windows, are written exactly as the same
+    cameras on their own topics, and the episode handed to the writer carries none of their bytes."""
+    # Arrange: each message carries a JPEG camera and one H.264 access unit.
+    access_units = _encode_h264_access_units(8, gop=4)
+    images = [_image_message(COMPRESSED_IMAGE, "jpeg", frame, seed=1) for frame in range(len(access_units))]
+    videos = [{"format": "h264", "data": unit} for unit in access_units]
+    nested = RecordTopic(
+        name="/observation", store=store, topic_id="tp_nested",
+        messages=[
+            _merge(_nest("cameras.front", image), _nest("sensors.video", video))
+            for image, video in zip(images, videos, strict=True)
+        ],
+    )
+    topics = {
+        "/observation": [nested],
+        "/front": [RecordTopic(name="/front", store=store, topic_id="tp_front", messages=images)],
+        "/video": [RecordTopic(name="/video", store=store, topic_id="tp_video", messages=videos)],
+    }
+    contract = _contract(tmp_path, [
+        _video("nested.front", "/observation", COMPRESSED_IMAGE, "cameras.front"),
+        _video("nested.video", "/observation", COMPRESSED_VIDEO, "sensors.video"),
+        _video("front", "/front", COMPRESSED_IMAGE),
+        _video("video", "/video", COMPRESSED_VIDEO),
+    ])
+    # Every camera window two messages long.
+    monkeypatch.setattr(camera_windows, "FIRST_WINDOW_NS", 2 * FRAME_INTERVAL_NS)
+    monkeypatch.setattr(camera_windows, "TARGET_WINDOW_BYTES", 1)
+    monkeypatch.setattr(camera_windows, "MIN_WINDOW_NS", 2 * FRAME_INTERVAL_NS)
+    spool_dir = tmp_path / "spool"
+    spool_dir.mkdir()
+    monkeypatch.setattr(event_worker, "_WORKER_STATE", {
+        "contracts": {"ds": contract}, "topics": {"ds": topics}, "spool_dir": str(spool_dir),
+    })
+    task = EventTask(
+        event_idx=0, event_id="ev", src_ds_id="ds", start_time_ns=nested.start_time,
+        end_time_ns=nested.end_time + 1, task_label="t", num_frames=len(access_units), buffer_ns=0,
+        action_lead_ns=0,
+    )
+    written: list[dict[str, Any]] = []
+    writer = SimpleNamespace(add_frame=lambda frame, task: written.append(frame), save_episode=lambda: None)
+
+    # Act: the episode crosses to the writer pickled, as the pool hands it over.
+    episode = pickle.dumps(_worker_build_episode(task))
+    _drain_one_episode(
+        writer=writer, video_specs_by_key={spec.key: spec for spec in contract.videos}, src_ds_id="ds",
+        event_id="ev", start_time_ns=0, end_time_ns=1, episode=pickle.loads(episode), accumulator=_DrainAccum(),
+    )
+
+    # Assert
+    assert nested.fetches == 2 * 4, "each nested camera's fetch must read its 8 messages in 4 windows"
+    assert len(written) == len(access_units)
+    for key in ("front", "video"):
+        np.testing.assert_array_equal([frame[f"nested.{key}"] for frame in written], [frame[key] for frame in written])
+    camera_bytes = [image["data"] for image in images] + [unit for unit in access_units if len(unit) >= 64]
+    assert not [data for data in camera_bytes if data in episode], "camera bytes must wait in the spool file"
 
 
 # ── a path the topic does not have ──────────────────────────────────────────

@@ -35,6 +35,7 @@ loaded, and these topic signals catch a video topic declared as stills.
 
 from __future__ import annotations
 
+import itertools
 import re
 from collections import Counter
 from collections.abc import Iterable, Iterator
@@ -51,6 +52,7 @@ from roboto.experimental.video import (
     supported_formats,
 )
 
+from .camera_windows import fetch_in_windows
 from .extract import _add_timestamp_column, select_message_field
 from .logger import logger
 from .spool import SpoolRef, SpoolWriter, unspool
@@ -188,8 +190,14 @@ def _resolve_stream_codec(first_format: Any, topic_name: str) -> VideoCodec:
 
 def _fetch_messages(
     topic: Any, range_start: int, range_end: int, topic_name: str, field: str | None,
-) -> list[tuple[int, Any, bytes]]:
-    """Read one Topic's compressed-video messages for a range as ``(log_time, format, data)``.
+) -> Iterator[list[tuple[int, Any, bytes]]]:
+    """Read one Topic's compressed-video messages for a range as ``(log_time, format, data)``, a window at a time.
+
+    The range is read in half-open windows (see
+    :py:mod:`roboto_to_lerobot.camera_windows`), and each window's messages
+    are yielded as one list, so a caller that is done with a window before
+    taking the next holds one window's packets at a time. Together the lists
+    hold the messages one call over the range returns, in the same order.
 
     Frames are keyed by log time, derived the same way every other stream in
     this converter derives it (``_add_timestamp_column`` over what
@@ -201,23 +209,34 @@ def _fetch_messages(
     paths = COMPRESSED_VIDEO_MESSAGE_PATHS
     if field is not None:
         paths = [f"{field}.{path}" for path in paths]
-    raw = topic.get_data_as_df(
-        start_time=pd.Timestamp(range_start, unit="ns"),
-        end_time=pd.Timestamp(range_end, unit="ns"),
-        message_paths_include=paths,
-    )
-    if raw is None or len(raw) == 0:
-        return []
-    df = _add_timestamp_column(raw)
-    if field is not None:
-        df = select_message_field(df, field, topic_name)
-    return [
-        (int(log_time), token, bytes(data))
-        for log_time, token, data in zip(
-            df["timestamp"], df["format"], df["data"], strict=True
+
+    def fetch(window_start: int, window_end: int) -> tuple[list[tuple[int, Any, bytes]], int, int | None]:
+        raw = topic.get_data_as_df(
+            start_time=pd.Timestamp(window_start, unit="ns"),
+            end_time=pd.Timestamp(window_end, unit="ns"),
+            message_paths_include=paths,
         )
-        if data is not None
-    ]
+        if raw is None or len(raw) == 0:
+            return [], 0, None
+        df = _add_timestamp_column(raw)
+        if field is not None:
+            df = select_message_field(df, field, topic_name)
+        messages = [
+            (int(log_time), token, bytes(data))
+            for log_time, token, data in zip(
+                df["timestamp"], df["format"], df["data"], strict=True
+            )
+            if data is not None
+        ]
+        return messages, sum(len(data) for _, _, data in messages), messages[0][0] if messages else None
+
+    return fetch_in_windows(
+        fetch,
+        range_start,
+        range_end,
+        data_start_ns=getattr(topic, "start_time", None),
+        data_end_ns=getattr(topic, "end_time", None),
+    )
 
 
 @dataclass(eq=False)
@@ -398,7 +417,7 @@ def probe_video_stream_rows(
     keyframe_lookback_ns: int = DEFAULT_KEYFRAME_LOOKBACK_NS,
     spool: SpoolWriter | None = None,
 ) -> list[dict]:
-    """Find the frames a compressed-video topic's ``[start_ns, end_ns]`` range decodes to.
+    """Find the frames a compressed-video topic's ``[start_ns, end_ns)`` range decodes to.
 
     One row per decodable frame, shaped so ``DataCollection._load_videos`` can
     concat and timestamp-sort it like the other video loaders' output::
@@ -418,13 +437,17 @@ def probe_video_stream_rows(
     backward walk is why compressed video cannot be decoded one message at a
     time.
 
-    The requested range is fetched once and reused; only the keyframe lookback,
-    when needed, costs a second fetch.
+    The requested range is read once, in windows (see
+    :py:mod:`roboto_to_lerobot.camera_windows`), and the decoder consumes each
+    window's packets before the next window is requested. With ``spool``,
+    each packet is spooled as the decoder reads it, so the probe holds one
+    window's packets at a time. Only the keyframe lookback, when needed,
+    costs a second read.
 
     Args:
         topic: The ``roboto.Topic`` to read, via ``get_data_as_df``.
         start_ns: Start of the range, nanoseconds since epoch (inclusive).
-        end_ns: End of the range, nanoseconds since epoch.
+        end_ns: End of the range, nanoseconds since epoch (exclusive).
         topic_name: Topic name, used in error and log messages.
         field: Message path of the video message nested in each message of a
             custom type, or ``None`` when the topic's messages are the video
@@ -445,19 +468,40 @@ def probe_video_stream_rows(
             surface as an episode silently missing its camera.
         ImportError: If PyAV is not installed (the ``roboto[video]`` extra).
     """
-    in_range = _fetch_messages(topic, start_ns, end_ns, topic_name, field)
-    if not in_range:
+    windows = _fetch_messages(topic, start_ns, end_ns, topic_name, field)
+    first_window = next((window for window in windows if window), None)
+    if first_window is None:
         return []
-    codec = _resolve_stream_codec(in_range[0][1], topic_name)
+    codec = _resolve_stream_codec(first_window[0][1], topic_name)
+    in_range_count = 0
+
+    def read_in_range(
+        first_window: list[tuple[int, Any, bytes]], later_windows: Iterator[list[tuple[int, Any, bytes]]],
+    ) -> Iterator[tuple[int, Any, bytes]]:
+        """The requested range's messages: the window taken above to resolve the codec, then the rest.
+
+        Lets go of each window before the next is fetched.
+        """
+        nonlocal in_range_count
+        in_range_count += len(first_window)
+        yield from first_window
+        del first_window
+        for window in later_windows:
+            in_range_count += len(window)
+            yield from window
+            del window
+
+    in_range: Iterator[tuple[int, Any, bytes]] | None = read_in_range(first_window, windows)
+    del first_window
     loads: dict[tuple[int, int], list[tuple[int, bytes | SpoolRef]]] = {}
 
-    def load_messages(range_start: int, range_end: int) -> list[tuple[int, bytes]]:
-        messages = (
-            in_range
-            if (range_start, range_end) == (start_ns, end_ns)
-            else _fetch_messages(topic, range_start, range_end, topic_name, field)
-        )
-        kept: list[tuple[int, bytes]] = []
+    def load_messages(range_start: int, range_end: int) -> Iterator[tuple[int, bytes]]:
+        nonlocal in_range
+        if (range_start, range_end) == (start_ns, end_ns) and in_range is not None:
+            messages, in_range = in_range, None
+        else:
+            messages = itertools.chain.from_iterable(_fetch_messages(topic, range_start, range_end, topic_name, field))
+        kept = loads[(range_start, range_end)] = []
         for log_time, token, data in messages:
             if isinstance(token, str) and token.lower() not in codec.formats:
                 logger.warning(
@@ -465,11 +509,8 @@ def probe_video_stream_rows(
                     topic_name, log_time, token, codec.name,
                 )
                 continue
-            kept.append((log_time, data))
-        loads[(range_start, range_end)] = (
-            kept if spool is None else [(log_time, spool.put(data)) for log_time, data in kept]
-        )
-        return kept
+            kept.append((log_time, data if spool is None else spool.put(data)))
+            yield log_time, data
 
     session = VideoSession(
         topic_name=topic_name,
@@ -490,15 +531,15 @@ def probe_video_stream_rows(
 
     if not rows:
         raise ValueError(
-            f"Topic '{topic_name}' has {len(in_range)} compressed-video message(s) in "
-            f"[{start_ns}, {end_ns}] but none decoded. Either no keyframe lies within the "
+            f"Topic '{topic_name}' has {in_range_count} compressed-video message(s) in "
+            f"[{start_ns}, {end_ns}) but none decoded. Either no keyframe lies within the "
             f"{keyframe_lookback_ns} ns lookback before the range, or the stream's keyframes "
             f"are missing the in-band parameter sets a decoder needs to initialize."
         )
-    if len(rows) < len(in_range):
+    if len(rows) < in_range_count:
         logger.warning(
             "Topic %s: decoded %d of %d compressed-video messages in range; the rest had no "
             "reachable keyframe or were corrupt.",
-            topic_name, len(rows), len(in_range),
+            topic_name, len(rows), in_range_count,
         )
     return rows

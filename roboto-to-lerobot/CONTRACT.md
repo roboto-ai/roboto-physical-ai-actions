@@ -551,7 +551,19 @@ the action's local disk rather than in memory, and each frame is read back
 from that file just before it is decoded and written. The file is deleted as
 soon as its episode is written or skipped. These files take as much disk as
 the recorded camera messages of the episodes that are being built or waiting
-to be written: up to `pool_size` + 4 episodes in each shard.
+to be written: up to `pool_size` + 4 episodes in each shard. The shards also
+share half of the disk space that is free when the conversion starts, in
+equal parts: a shard starts an episode only when the episode's camera
+messages fit in its part together with those of its other episodes in
+flight. For an episode that has not been read yet, the shard estimates its
+camera messages from the time range read for the episode and the bytes per
+second that the first event recorded, or that any finished episode recorded
+if that is more. A shard with no other episode in flight always starts the
+next one, so an episode larger than the shard's part is converted alone. A
+camera is read in time windows: the first covers 10 seconds of its messages,
+and each later one is sized to hold about 64 MB. Each window is written to
+the file before the next is read, so the memory that reading a camera takes
+does not grow with the length of the episode.
 
 #### Compressed video
 
