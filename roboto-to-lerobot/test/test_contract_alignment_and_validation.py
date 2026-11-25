@@ -1,6 +1,6 @@
 """Contract-loading tests for the hub-launch breaking-change batch.
 
-Covers three schema changes, all enforced at :func:`load_contract` time:
+Covers four schema changes, all enforced at :func:`load_contract` time:
 
 1. ``tolerance_ms`` semantics unified with the live runtime's bounded
    default (see ``AlignSpec`` / ``_as_align`` in ``contract_utils``):
@@ -10,6 +10,9 @@ Covers three schema changes, all enforced at :func:`load_contract` time:
 3. An ``image.depth:`` block is rejected at load time — depth images are
    not supported yet, and the error points at the repo for anyone who
    wants to contribute support.
+4. ``image.field`` and ``image.type``, for an image nested in a custom
+   message, are set together: a message path and an image or
+   compressed-video type.
 
 Plus the error-message quality pass: duplicate ``lerobot_names`` name both
 conflicting specs, and a missing/wrong-typed field in one spec raises a
@@ -266,6 +269,49 @@ def test_image_without_depth_block_still_loads(tmp_path):
     """)
     contract = load_contract(path)
     assert contract.videos[0].image == {"resize": [480, 640]}
+
+
+# ---------------------------------------------------------------------------
+# image.field: the message path of an image nested in a custom message
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("image", "message"),
+    [
+        pytest.param("{field: '', type: sensor_msgs/msg/CompressedImage}", "must be a message path", id="empty"),
+        pytest.param(
+            "{field: cameras..front, type: sensor_msgs/msg/CompressedImage}", "must be a message path",
+            id="empty_part",
+        ),
+        pytest.param(
+            "{field: [cameras], type: sensor_msgs/msg/CompressedImage}", "must be a message path", id="not_a_string",
+        ),
+        pytest.param("{field: cameras.front}", "without image.type", id="field_without_type"),
+        pytest.param("{type: sensor_msgs/msg/CompressedImage}", "without image.field", id="type_without_field"),
+        pytest.param("{field: cameras.front, type: video}", "applies only to", id="file_backed_video"),
+    ],
+)
+def test_invalid_nested_image_fails_at_load_naming_the_spec(tmp_path, image, message):
+    """``image.field`` and ``image.type`` are set together: a field that is not a
+    message path, either key without the other, or a nested file-backed video
+    (read as whole frames, not by message path) fails when the contract loads."""
+    # Arrange
+    path = _write(tmp_path, f"""
+        name: c
+        version: 1
+        fps: 20
+        observations:
+          - key: observation.images.front
+            topic: /robot/observation
+            type: custom_msgs/msg/Observation
+            image: {image}
+    """)
+
+    # Act / Assert
+    with pytest.raises(ValueError, match=message) as excinfo:
+        load_contract(path)
+    assert "'observation.images.front'" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------

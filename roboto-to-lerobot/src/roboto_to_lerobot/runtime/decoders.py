@@ -54,19 +54,22 @@ if TYPE_CHECKING:
 # For video decoders, ``msg`` is a pandas Series whose columns are whatever
 # ``DataCollection._load_videos`` produced for that message type — see
 # ``lerobot.generate_frames`` for how payload columns are plumbed through.
+# The CompressedImage and Image decoders also receive ROS message objects from
+# the live runtime (``LiveAdapter.on_message``), so they read every field
+# through :func:`_dot_get`, which accepts either shape.
 # Every video decoder MUST return an HWC uint8 RGB array.
 # =============================================================================
 
 
 @register_decoder("sensor_msgs/msg/CompressedImage", dtype="video")
 def _dec_compressed_image(msg: Any, spec: ObservationSpec) -> np.ndarray:
-    """Decode a sensor_msgs/CompressedImage (or file-backed video) row to HWC uint8 RGB.
+    """Decode a sensor_msgs/CompressedImage (or a file-backed video row) to HWC uint8 RGB.
 
-    Expects ``msg["data"]`` (raw encoded bytes) and ``msg["format"]``
-    (format hint such as ``"jpeg"`` or ``"png"`` — informational only,
-    cv2 auto-detects from magic bytes).
+    Expects ``data`` (raw encoded bytes) and ``format`` (format hint such as
+    ``"jpeg"`` or ``"png"`` — informational only, cv2 auto-detects from magic
+    bytes).
     """
-    return decompress_image(msg["data"], msg["format"])
+    return decompress_image(_dot_get(msg, "data"), _dot_get(msg, "format"))
 
 
 # File-backed video frames (``video`` / ``avi_video`` / ``mp4_video`` contract
@@ -139,16 +142,16 @@ def _TEMP_looks_like_compressed_image(data: bytes) -> bool:
 
 @register_decoder("sensor_msgs/msg/Image", dtype="video")
 def _dec_raw_image(msg: Any, spec: ObservationSpec) -> np.ndarray:
-    """Decode a raw sensor_msgs/Image row to HWC uint8 RGB.
+    """Decode a raw sensor_msgs/Image to HWC uint8 RGB.
 
-    Dispatches on ``msg["encoding"]``. Color encodings (rgb8/bgr8/mono8) are
+    Dispatches on the ``encoding`` field. Color encodings (rgb8/bgr8/mono8) are
     reshaped in place; depth encodings (mono16/16UC1/32FC1) are normalised to
     uint8 via the ``image.depth`` block on the contract spec.
     """
-    encoding = str(msg["encoding"])
-    height = int(msg["height"])
-    width = int(msg["width"])
-    data = msg["data"]
+    encoding = str(_dot_get(msg, "encoding"))
+    height = int(_dot_get(msg, "height"))
+    width = int(_dot_get(msg, "width"))
+    data = _dot_get(msg, "data")
 
     # ------------------- TEMP SDK workaround (depth only) --------------------
     # Remove this block when roboto Topic.get_data* can serve original bytes.

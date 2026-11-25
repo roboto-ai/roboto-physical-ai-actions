@@ -43,7 +43,7 @@ from roboto.experimental.video import (
     supported_formats,
 )
 
-from .extract import _add_timestamp_column
+from .extract import _add_timestamp_column, select_message_field
 from .logger import logger
 from .runtime.image import resize_image
 
@@ -175,22 +175,31 @@ def _resolve_stream_codec(first_format: Any, topic_name: str) -> VideoCodec:
 
 
 
-def _fetch_messages(topic: Any, range_start: int, range_end: int) -> list[tuple[int, Any, bytes]]:
+def _fetch_messages(
+    topic: Any, range_start: int, range_end: int, topic_name: str, field: str | None,
+) -> list[tuple[int, Any, bytes]]:
     """Read one Topic's compressed-video messages for a range as ``(log_time, format, data)``.
 
     Frames are keyed by log time, derived the same way every other stream in
     this converter derives it (``_add_timestamp_column`` over what
     ``get_data_as_df`` returns), so a video frame and a joint-state sample that
-    share a log time align on the reference timeline.
+    share a log time align on the reference timeline. With ``field`` set, each
+    message carries its video message at that message path, and ``format`` and
+    ``data`` are read from there.
     """
+    paths = COMPRESSED_VIDEO_MESSAGE_PATHS
+    if field is not None:
+        paths = [f"{field}.{path}" for path in paths]
     raw = topic.get_data_as_df(
         start_time=pd.Timestamp(range_start, unit="ns"),
         end_time=pd.Timestamp(range_end, unit="ns"),
-        message_paths_include=COMPRESSED_VIDEO_MESSAGE_PATHS,
+        message_paths_include=paths,
     )
     if raw is None or len(raw) == 0:
         return []
     df = _add_timestamp_column(raw)
+    if field is not None:
+        df = select_message_field(df, field, topic_name)
     return [
         (int(log_time), token, bytes(data))
         for log_time, token, data in zip(
@@ -207,6 +216,7 @@ def decode_video_stream_rows(
     *,
     topic_name: str,
     resize: tuple[int, int] | None = None,
+    field: str | None = None,
     keyframe_lookback_ns: int = DEFAULT_KEYFRAME_LOOKBACK_NS,
 ) -> list[dict]:
     """Decode a compressed-video topic's ``[start_ns, end_ns]`` range to frame rows.
@@ -240,6 +250,9 @@ def decode_video_stream_rows(
         topic_name: Topic name, used only in error and log messages.
         resize: ``(height, width)`` to resize each frame to, or ``None`` to keep
             the stream's native resolution.
+        field: Message path of the video message nested in each message of a
+            custom type, or ``None`` when the topic's messages are the video
+            messages themselves.
         keyframe_lookback_ns: How far before ``start_ns`` to search for the
             keyframe that anchors the range's leading delta frames.
 
@@ -253,7 +266,7 @@ def decode_video_stream_rows(
             surface as an episode silently missing its camera.
         ImportError: If PyAV is not installed (the ``roboto[video]`` extra).
     """
-    in_range = _fetch_messages(topic, start_ns, end_ns)
+    in_range = _fetch_messages(topic, start_ns, end_ns, topic_name, field)
     if not in_range:
         return []
     codec = _resolve_stream_codec(in_range[0][1], topic_name)
@@ -262,7 +275,7 @@ def decode_video_stream_rows(
         messages = (
             in_range
             if (range_start, range_end) == (start_ns, end_ns)
-            else _fetch_messages(topic, range_start, range_end)
+            else _fetch_messages(topic, range_start, range_end, topic_name, field)
         )
         for log_time, token, data in messages:
             if isinstance(token, str) and token.lower() not in codec.formats:

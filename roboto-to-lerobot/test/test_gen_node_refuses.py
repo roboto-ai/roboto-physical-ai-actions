@@ -14,6 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 from textwrap import dedent
 
+import pytest
 from roboto_to_lerobot.codegen.cli import main
 
 _MINIMAL_OK = """
@@ -394,25 +395,37 @@ def test_refuse_observation_without_decoder_at_cli(tmp_path, capsys):
     assert not (tmp_path / "node.py").exists()
 
 
-def test_refuse_compressed_video_observation_at_cli(tmp_path, capsys):
-    """A live node cannot decode compressed video: each message is one encoded
-    access unit that needs its GOP prefix, and the node keeps no decoder state
-    between messages. The offline converter supports these topics, so the
-    refusal has to be explicit — the type does have a registered decoder."""
-    contract = _write(tmp_path, """
+@pytest.mark.parametrize(
+    ("type_str", "image"),
+    [
+        pytest.param("foxglove_msgs/msg/CompressedVideo", "{resize: [64, 64]}", id="own_topic"),
+        pytest.param(
+            "custom_msgs/msg/Observation",
+            "{field: cameras.hand, type: foxglove_msgs/msg/CompressedVideo, resize: [64, 64]}",
+            id="nested",
+        ),
+    ],
+)
+def test_refuse_compressed_video_observation_at_cli(tmp_path, capsys, type_str, image):
+    """A live node cannot decode compressed video, published on its own topic or
+    nested in a custom message: each message is one encoded access unit that
+    needs its GOP prefix, and the node keeps no decoder state between messages.
+    The offline converter supports these topics, so the refusal has to be
+    explicit — the type does have a registered decoder."""
+    contract = _write(tmp_path, f"""
         name: c
         version: 1
         fps: 30
         observations:
           - key: observation.images.hand
             topic: /camera/hand/video
-            type: foxglove_msgs/msg/CompressedVideo
-            image: {resize: [64, 64]}
+            type: {type_str}
+            image: {image}
         actions:
           - key: action
             topic: /teleop/action
             type: sensor_msgs/msg/JointState
-            selector: {names: [j1, j2]}
+            selector: {{names: [j1, j2]}}
     """)
     code = main(_argv(contract, tmp_path / "node.py", tmp_path))
     assert code == 2

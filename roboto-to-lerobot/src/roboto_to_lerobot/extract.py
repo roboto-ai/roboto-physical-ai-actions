@@ -86,6 +86,63 @@ def _add_timestamp_column(df: pd.DataFrame) -> pd.DataFrame:
     out = out.drop(columns=[idx_col])
     return out
 
+
+def select_message_field(df: pd.DataFrame, field: str, topic_name: str) -> pd.DataFrame:
+    """Keep ``timestamp`` and the fields under the message path ``field``, renamed as if top-level.
+
+    An image nested in a custom message is fetched by its own message paths
+    (``<field>.data``, ...). The SDK returns those in one of two shapes,
+    depending on how the topic is stored: an MCAP-backed read flattens them into
+    dotted columns (``<field>.data``, ``<field>.header.stamp.sec``), and a
+    Parquet-backed read returns the first path component as one column holding a
+    dict per message. Both become the columns the same image published as its
+    own message would have (``data``, ``header...``), so every image decoder
+    reads a nested image exactly as it reads a top-level one. ``df`` is not
+    modified, because every still image nested in one topic is selected from
+    the same fetched DataFrame.
+
+    Args:
+        df: One topic's fetch, with the ``timestamp`` column
+            :func:`_add_timestamp_column` adds.
+        field: Dotted message path of the nested message, such as
+            ``observation.cameras.front``.
+        topic_name: Topic name, used only in the error message.
+
+    Raises:
+        ValueError: If ``df`` has rows but no column holds ``field``, neither
+            as dotted columns nor as a dict column on its path.
+    """
+    prefix = f"{field}."
+    flattened = [column for column in df.columns if column.startswith(prefix)]
+    if flattened:
+        fields = df[flattened].rename(columns=lambda column: column[len(prefix):])
+    else:
+        values = _struct_values(df, field)
+        if values is None and len(df):
+            raise ValueError(f"Topic '{topic_name}' has no message path '{field}'.")
+        fields = pd.DataFrame([value or {} for value in values or []], index=df.index)
+    return pd.concat([df[["timestamp"]], fields], axis=1)
+
+
+def _struct_values(df: pd.DataFrame, field: str) -> list[Any] | None:
+    """Per-message values at ``field`` in a DataFrame whose nested fields are dict columns.
+
+    The longest leading part of ``field`` that names a column is the column
+    read; the rest of the path is followed through each message's dicts. A
+    message where the path ends early (a null struct) yields ``None``. Returns
+    ``None`` when no leading part of ``field`` is a column.
+    """
+    parts = field.split(".")
+    for depth in range(len(parts), 0, -1):
+        column = ".".join(parts[:depth])
+        if column in df.columns:
+            values = df[column].tolist()
+            for part in parts[depth:]:
+                values = [value.get(part) if isinstance(value, dict) else None for value in values]
+            return values
+    return None
+
+
 def _sanitize_topic_for_key(topic: str) -> str:
     """Sanitize a topic name to be used as part of a key.
 

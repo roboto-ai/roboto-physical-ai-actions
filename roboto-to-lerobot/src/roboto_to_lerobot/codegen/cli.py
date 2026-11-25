@@ -28,6 +28,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from ..contract_utils import image_message_type
 from ..runtime import decoders as _decoders  # noqa: F401 — populate DECODERS
 from ..runtime.contract_io import Contract, load_contract
 from ..runtime.converters import DECODERS
@@ -113,6 +114,10 @@ def validate_contract_for_codegen(contract: Contract) -> None:
       ROS message class to import or subscribe with, and compressed-video
       types, whose registered decoder only passes through frames the offline
       converter decoded a whole GOP at a time.
+      For a video spec, these checks apply to the type of the camera message
+      it decodes (:func:`~roboto_to_lerobot.contract_utils.image_message_type`).
+      For a camera nested in a custom message, that type is ``image.type``;
+      the node still subscribes with the custom message, the spec's ``type``.
     - action safety_behavior / encoder / multi-spec selector widths.
 
     Raises:
@@ -127,7 +132,7 @@ def validate_contract_for_codegen(contract: Contract) -> None:
     for spec in contract.videos:
         _refuse_align_method(spec.key, spec.align.method)
         _refuse_video_transforms(spec.key, spec.transforms)
-        _refuse_unsupported_observation(spec.key, spec.topic, spec.type)
+        _refuse_unsupported_observation(spec.key, spec.topic, image_message_type(spec))
 
     for spec in contract.actions:
         # No align check: the runtime never aligns actions, so refusing

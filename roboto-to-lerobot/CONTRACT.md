@@ -84,9 +84,9 @@ distinguished by whether an `image:` block is present:
 | `key`           | yes      | LeRobot feature key. Conventionally `observation.state`, `observation.images.<name>`, etc.                                                                |
 | `topic`         | one of   | ROS topic name. Mutually exclusive with `role`.                                                                                                           |
 | `role`          | one of   | Role label resolved against file metadata at runtime. See [Role-based binding](#role-based-binding). Not allowed for image streams.                       |
-| `type`          | yes      | Message type string used to dispatch the decoder. See [Supported message types](#supported-message-types).                                                |
+| `type`          | yes      | Message type the topic carries. Picks the decoder, except where `image.type` does. See [Supported message types](#supported-message-types).               |
 | `selector`      | no       | `{names: [...], lerobot_names: [...]}`. Selects which fields the decoder extracts. See [Selectors](#selectors-and-lerobot_names).                          |
-| `image`         | no       | Image / video options: `resize: [H, W]`. See [Video / image specs](#video--image-specs).                                                                  |
+| `image`         | no       | Image / video options: `resize: [H, W]`, and `field` and `type` for a nested image. See [Video / image specs](#video--image-specs).                       |
 | `align`         | no       | `{method, tolerance_ms}`. Defaults to `hold` with the auto-bounded tolerance (`max(2/fps, 50 ms)`). See [Alignment](#alignment).                           |
 | `transforms`    | no       | List of transforms applied to the stream. See [Transforms](#transforms).                                                                                   |
 
@@ -94,7 +94,9 @@ distinguished by whether an `image:` block is present:
 
 A spec under `observations:` becomes a video feature when it has an `image:`
 block. The output dtype is always `video` (HWC uint8 RGB at the configured
-resize).
+resize). Each frame read from an image or compressed-video message, nested
+ones included, is placed at the log time of that message: when it reached the
+recorder.
 
 ```yaml
 observations:
@@ -111,11 +113,69 @@ observations:
 | Field    | Required | Description                                                                                                                                                   |
 |----------|----------|---------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `resize` | yes      | `[height, width]` in pixels. Frames are resized to this exact shape.                                                                                          |
+| `field`  | no       | Message path of an image nested in a custom message. See [Images nested in a custom message](#images-nested-in-a-custom-message).                             |
+| `type`   | with `field` | Type of the image message at `field`. Required with `field`, rejected without it.                                                                         |
 
 Restrictions on image streams:
 
 - `align.method: linear` is rejected — use `hold` or `nearest`.
 - `role:` binding is not allowed; image streams must specify `topic:` literally.
+
+### Images nested in a custom message
+
+Some recordings publish no topic per camera. Instead, one custom message
+carries every camera, each as a whole image message in a field of its own.
+Point a spec at one of those fields with `image.field`, the message path of
+the nested image: field names joined by dots, as Roboto writes message paths.
+As on every spec, `type:` names what the topic carries, here the custom
+message. `image.type` names the image message at the path. Declare one spec
+per camera:
+
+```yaml
+observations:
+  - key: observation.images.front
+    topic: /robot/observation
+    type: my_robot_msgs/msg/Observation   # what the topic publishes
+    image:
+      field: cameras.front                    # message path of the nested image
+      type: sensor_msgs/msg/CompressedImage   # what sits at that path
+      resize: [480, 640]
+  - key: observation.images.wrist
+    topic: /robot/observation
+    type: my_robot_msgs/msg/Observation
+    image:
+      field: arm.cameras.wrist
+      type: sensor_msgs/msg/Image
+      resize: [480, 640]
+```
+
+Each nested image is decoded exactly as the same image would be if it were
+published on its own topic. The still images (`CompressedImage`, `Image`)
+nested in one topic are read with a single fetch of that topic. Each nested
+compressed-video stream is fetched and decoded on its own.
+
+`image.type` may be `sensor_msgs/msg/CompressedImage`, `sensor_msgs/msg/Image`
+or a [compressed-video type](#compressed-video), and may be written with or
+without `/msg/` (`sensor_msgs/CompressedImage` names the same type).
+File-backed video (`video`, `avi_video`, `mp4_video`) is read as whole frames
+rather than by message path, so it cannot be nested.
+
+Before it fetches any data, the converter checks each topic that a nested
+image is read from. The conversion fails, with an error that names the spec
+and the topic, if the topic breaks any of these rules:
+
+- the topic's recorded type must be the spec's `type`;
+- the type Roboto recorded at the path, if any, must be `image.type`;
+- the topic must have the nested image's message paths. If it lacks them, the
+  error lists the paths in that topic that have the fields of an `image.type`
+  message.
+
+`gen-node` supports nested images. The generated node subscribes to the topic
+with the custom message from `type:`, once for all the cameras nested in it,
+and decodes each camera from its path. The robot must have the package that
+defines the custom message installed, so that the node can import it. As for
+an image on its own topic, `gen-node` refuses a nested compressed-video
+stream.
 
 ## Action specs
 
@@ -434,9 +494,11 @@ To use role binding end-to-end:
 
 ## Supported message types
 
-`type:` dispatches to a registered decoder. The selector semantics depend on
-the type — see below. To add a new decoder, register it in
-`src/roboto_to_lerobot/decoders.py` via `@register_decoder("type")`.
+`type:` dispatches to a registered decoder (`image.type` does, for an
+[image nested in a custom message](#images-nested-in-a-custom-message)). The
+selector semantics depend on the type — see below. To add a new decoder,
+register it in `src/roboto_to_lerobot/decoders.py` via
+`@register_decoder("type")`.
 
 ### Image / video
 
@@ -511,6 +573,11 @@ the error message will name the offending spec.
 - **Legacy `strategy`/`tol_ms` align keys and the nested `publish:` action
   form** are rejected — see [Alignment](#alignment) and
   [Action specs](#action-specs).
+- **`image.field` and `image.type`** must be set together. `image.field` must
+  be a message path (field names joined by dots), and `image.type` must name
+  an image or compressed-video message, not file-backed video (`video`,
+  `avi_video`, `mp4_video`) — see
+  [Images nested in a custom message](#images-nested-in-a-custom-message).
 - **An `image.depth:` block is rejected** — depth images are not supported
   yet; remove the block. If you need depth support, open an issue or a PR at
   [the repository](https://github.com/roboto-ai/roboto-physical-ai-actions).

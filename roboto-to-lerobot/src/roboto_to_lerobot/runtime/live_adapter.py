@@ -16,11 +16,17 @@ dependency surface is future work.
 from __future__ import annotations
 
 import math
+from functools import reduce
 from typing import Any
 
 import numpy as np
 
-from ..contract_utils import ActionSpec, ObservationSpec
+from ..contract_utils import (
+    ActionSpec,
+    ObservationSpec,
+    image_field,
+    image_message_type,
+)
 from ..logger import logger
 
 # Side-effect imports — populate the decoder/encoder registries used
@@ -33,7 +39,7 @@ from . import decoders as _decoders  # noqa: F401
 from . import encoders as _encoders  # noqa: F401
 from .causal_lowpass import CausalLowpass
 from .contract_io import Contract
-from .converters import DECODERS, decode_value
+from .converters import DECODERS
 from .encoders import ENCODERS, encode_value
 from .image import resize_image
 from .stream_buffer import StreamBuffer, auto_bound_tolerance_ns
@@ -289,7 +295,8 @@ class LiveAdapter:
     def _make_buffer_entry(
         self, spec: ObservationSpec, *, is_video: bool
     ) -> BufferEntry:
-        if spec.type not in DECODERS:
+        msg_type = image_message_type(spec)
+        if msg_type not in DECODERS:
             # Symmetric with the encoder guard in ``_build_action_specs`` —
             # surface a contract that names an undecodable observation/video
             # type at boot rather than at the first ``on_message``. (This
@@ -298,7 +305,7 @@ class LiveAdapter:
             # reconciling that with real ROS messages is future work.)
             raise ValueError(
                 f"No decoder registered for {'video' if is_video else 'observation'} "
-                f"type {spec.type!r} (key={spec.key}, topic={spec.topic}). "
+                f"type {msg_type!r} (key={spec.key}, topic={spec.topic}). "
                 f"Registered types: {sorted(DECODERS)}."
             )
         tolerance_ns = auto_bound_tolerance_ns(
@@ -366,6 +373,11 @@ class LiveAdapter:
         alignment (see ``lerobot.py``'s pre-alignment-transform block).
         Applying the filter after alignment would feed it timestamps that
         have already been resampled/held, which is not what training saw.
+
+        For a spec with ``image.field``, ``msg`` is a custom message, and the
+        camera message nested at that attribute path (such as
+        ``msg.cameras.front``) is decoded by the decoder registered for the
+        spec's ``image.type``.
         """
         entries = self._topic_entries.get(topic)
         if entries is None:
@@ -374,7 +386,10 @@ class LiveAdapter:
                 f"Known topics: {sorted(self._topic_entries)}."
             )
         for spec, buffer in entries:
-            value = decode_value(msg, spec)
+            field = image_field(spec)
+            msg_to_decode = msg if field is None else reduce(getattr, field.split("."), msg)
+            # ``_make_buffer_entry`` refused any spec without a decoder at boot.
+            value = DECODERS[image_message_type(spec)](msg_to_decode, spec)
             if spec.image and "resize" in (spec.image or {}):
                 expected_h, expected_w = spec.image["resize"]
                 value = resize_image(value, expected_h, expected_w)
