@@ -251,12 +251,46 @@ Two rules to keep in mind:
 2. **`lerobot_names` is optional but strongly recommended.** Without it, the
    feature is labeled `<topic>/<selector_name>`, which is verbose and ties
    feature names to ROS topology. With it, you get clean LeRobot-facing names.
-   `lerobot_names` must have the same length as `names`, and every
-   `lerobot_name` must be unique across the entire contract.
+   With `names`, `lerobot_names` must have the same length as `names`, and
+   every `lerobot_name` must be unique across the entire contract.
 
 When multiple specs share a `key` (e.g., two `observation.state` entries from
 two arms), all `lerobot_names` from those specs are concatenated in order to
 form the names of the combined feature.
+
+### Labels by position
+
+Some messages carry no names to select by: a `JointState` whose `name` field
+is empty, or holds a single label that names no joint, or a
+`Float64MultiArray`. Without `names`, the decoder emits the whole vector (for
+`JointState`, every `position`), and `lerobot_names` alone labels it by
+position: the first name labels the first value, and so on.
+
+```yaml
+observations:
+  - key: observation.state
+    topic: /arm/joint_states        # JointState with an empty name field
+    type: sensor_msgs/msg/JointState
+    selector:
+      lerobot_names: [shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]
+```
+
+The names reach the dataset's `meta/info.json` as they would with `names`,
+including concatenation across specs that share a `key`, and must still be
+unique across the contract.
+
+- Every message must decode to exactly as many values as there are
+  `lerobot_names`. A message with more or fewer values fails the conversion,
+  and an observation message fails the live node too. The error names the
+  spec's key, its topic and both lengths, so no value is labelled wrongly.
+- Only types whose decoder, without `names`, emits numbers in an order the
+  message fixes accept labels by position: `JointState`, `JointTrajectory`,
+  `MultiDOFCommand`, `Imu`, `Odometry`, `Twist`, the `*MultiArray` and scalar
+  `std_msgs` types, `AnymalState` and `SeActuatorReadings`. The vector each
+  emits is described in [Numeric streams](#numeric-streams). The contract
+  loader refuses `lerobot_names` without `names` on any other type, such as
+  `std_msgs/msg/String`, `string_typed_msg` or an image.
+- To keep only some of the values, select them with `names`.
 
 ## Alignment
 
@@ -567,7 +601,9 @@ the error message will name the offending spec.
 - **`lerobot_names` must match `names` in length**, and every `lerobot_name`
   in the contract must be globally unique. Both errors name the offending
   spec(s) — a duplicate name names both conflicting specs (key + topic/role),
-  and a length mismatch prints both lists.
+  and a length mismatch prints both lists. Without `names`, `lerobot_names`
+  label values by position, which only some types accept — see
+  [Labels by position](#labels-by-position).
 - **`align.method`** must be one of `hold`, `nearest`, `linear`, `none`.
 - **`align.tolerance_ms: 0`** is rejected — see [Alignment](#alignment).
 - **Legacy `strategy`/`tol_ms` align keys and the nested `publish:` action

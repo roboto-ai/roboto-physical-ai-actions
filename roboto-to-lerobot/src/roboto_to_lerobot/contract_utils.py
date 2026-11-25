@@ -35,7 +35,7 @@ import roboto
 import yaml
 
 from . import decoders  # noqa: F401
-from .converters import DECODERS, decode_value
+from .converters import DECODERS, POSITIONAL_TYPES, check_positional_width, decode_value
 from .extract import (
     _add_timestamp_column,
     _sanitize_topic_for_key,
@@ -528,9 +528,10 @@ class Contract:
         Args:
             resolved_features: Optional mapping of unique_key -> (num_values, names)
                 discovered at runtime by DataCollection. When present, these
-                override the static selector.names from the contract YAML
-                (which may be empty or refer to array field names rather than
-                individual joint names).
+                override the names the contract YAML gives a spec
+                (``lerobot_names``, or else the topic-prefixed
+                ``selector.names``), which may be empty or refer to array
+                field names rather than individual joint names.
 
         Note:
             Multiple observations/actions with the same base key are concatenated
@@ -561,7 +562,7 @@ class Contract:
                     num_values, names = resolved[unique_key]
                     total_values += num_values
                     all_names.extend(names)
-                elif obs.selector and "names" in obs.selector:
+                else:
                     lr_names = obs.get_lerobot_selector_names()
                     total_values += len(lr_names)
                     all_names.extend(lr_names)
@@ -599,7 +600,7 @@ class Contract:
                     num_values, names = resolved[unique_key]
                     total_values += num_values
                     all_names.extend(names)
-                elif action.selector and "names" in action.selector:
+                else:
                     lr_names = action.get_lerobot_selector_names()
                     total_values += len(lr_names)
                     all_names.extend(lr_names)
@@ -1379,8 +1380,7 @@ class DataCollection:
             logger.debug("Loading action: %s (unique_key=%s) from topic %s",
                        action.key, unique_key, action.topic)
 
-            selector_names = (action.selector or {}).get("names", [])
-            # LeRobot-facing names (may be overridden by lerobot_names)
+            # LeRobot-facing names: lerobot_names, or the prefixed selector names
             lr_names = action.get_lerobot_selector_names()
 
             try:
@@ -1409,6 +1409,8 @@ class DataCollection:
                         # Regular decoder - one value per message
                         all_timestamps.append(row["timestamp"])
                         all_values.append(decoded)
+                for value in all_values:
+                    check_positional_width(value, action)
 
                 # Create DataFrame with timestamp + values columns
                 result = pd.DataFrame({
@@ -1428,17 +1430,14 @@ class DataCollection:
                     )
 
                 # Populate resolved_features with LeRobot-facing names
-                if selector_names:
-                    self.resolved_features[unique_key] = (
-                        len(selector_names),
-                        lr_names,
-                    )
+                if lr_names:
+                    self.resolved_features[unique_key] = (len(lr_names), lr_names)
                     logger.debug(
                         "Decoded action %s: %d features, %d rows",
-                        unique_key, len(selector_names), len(result),
+                        unique_key, len(lr_names), len(result),
                     )
                 else:
-                    # Infer width from first row if selector.names is empty
+                    # Infer width from first row if no names label the values
                     width = len(all_values[0]) if all_values else 0
                     self.resolved_features[unique_key] = (width, [])
                     logger.debug(
@@ -1468,8 +1467,7 @@ class DataCollection:
             logger.debug("Loading observation: %s (unique_key=%s) from topic %s",
                        observation.key, unique_key, observation.topic)
 
-            selector_names = (observation.selector or {}).get("names", [])
-            # LeRobot-facing names (may be overridden by lerobot_names)
+            # LeRobot-facing names: lerobot_names, or the prefixed selector names
             lr_names = observation.get_lerobot_selector_names()
 
             try:
@@ -1487,6 +1485,8 @@ class DataCollection:
                 # Each row is one message, with columns such as "name" and
                 # "position", which the decoder reads like a message object.
                 decoded_values = [decode_value(row, observation) for row in _message_rows(raw_df)]
+                for value in decoded_values:
+                    check_positional_width(value, observation)
 
                 # Single ``values`` column of per-row numpy arrays — matches
                 # what ``lerobot.generate_frames`` expects when it stacks /
@@ -1497,17 +1497,14 @@ class DataCollection:
                 })
 
                 # Populate resolved_features with LeRobot-facing names
-                if selector_names:
-                    self.resolved_features[unique_key] = (
-                        len(selector_names),
-                        lr_names,
-                    )
+                if lr_names:
+                    self.resolved_features[unique_key] = (len(lr_names), lr_names)
                     logger.debug(
                         "Decoded observation %s: %d features, %d rows",
-                        unique_key, len(selector_names), len(result),
+                        unique_key, len(lr_names), len(result),
                     )
                 else:
-                    # Infer width from first row if selector.names is empty
+                    # Infer width from first row if no names label the values
                     width = len(decoded_values[0]) if decoded_values else 0
                     self.resolved_features[unique_key] = (width, [])
                     logger.debug(
@@ -1768,19 +1765,33 @@ def _as_align(
 
 
 def _parse_lerobot_names(
-    selector: dict[str, Any] | None, key: str
+    selector: dict[str, Any] | None, key: str, msg_type: str
 ) -> list[str] | None:
     """Extract and validate ``lerobot_names`` from a selector block.
 
-    Returns ``None`` when no ``lerobot_names`` are specified.
-    Raises ``ValueError`` if the length doesn't match ``selector.names``.
+    Returns ``None`` when no ``lerobot_names`` are specified. With
+    ``selector.names``, raises ``ValueError`` if the lengths differ. Without
+    them, the names label the vector ``msg_type`` decodes to by position;
+    raises ``ValueError`` if ``msg_type`` is not in ``POSITIONAL_TYPES``.
+    Each message's length is checked against the names when it is decoded
+    (:func:`~roboto_to_lerobot.runtime.converters.check_positional_width`).
     """
     if not selector:
         return None
     lr_names = selector.get("lerobot_names")
     if lr_names is None:
         return None
-    sel_names = selector.get("names", [])
+    sel_names = selector.get("names") or []
+    if not sel_names:
+        if lr_names and msg_type not in POSITIONAL_TYPES:
+            raise ValueError(
+                f"Key '{key}' sets selector.lerobot_names without selector.names, "
+                f"which labels the decoded values by position, but type '{msg_type}' "
+                "does not decode to a vector of numbers in a fixed order. Add "
+                "selector.names to choose the values. Types that can be labelled "
+                f"by position: {sorted(POSITIONAL_TYPES)}."
+            )
+        return lr_names
     if len(lr_names) != len(sel_names):
         raise ValueError(
             f"lerobot_names length ({len(lr_names)}) != "
@@ -1985,7 +1996,7 @@ def load_contract(path: Path | str) -> Contract:
             selector=selector,
             image=image,
             align=_as_align(it, fps=fps, is_image=is_image),
-            lerobot_names=_parse_lerobot_names(selector, it["key"]),
+            lerobot_names=_parse_lerobot_names(selector, it["key"], it["type"]),
             transforms=_parse_transforms(it),
             qos=_as_qos(it),
         )
@@ -2014,7 +2025,7 @@ def load_contract(path: Path | str) -> Contract:
             role=role,
             selector=selector,
             align=_as_align(it, fps=fps),
-            lerobot_names=_parse_lerobot_names(selector, it["key"]),
+            lerobot_names=_parse_lerobot_names(selector, it["key"], msg_type),
             transforms=_parse_transforms(it),
             qos=_as_qos(it),
             safety_behavior=safety_behavior,

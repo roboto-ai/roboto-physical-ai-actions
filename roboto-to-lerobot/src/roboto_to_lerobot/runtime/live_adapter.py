@@ -39,7 +39,7 @@ from . import decoders as _decoders  # noqa: F401
 from . import encoders as _encoders  # noqa: F401
 from .causal_lowpass import CausalLowpass
 from .contract_io import Contract
-from .converters import DECODERS
+from .converters import DECODERS, check_positional_width
 from .encoders import ENCODERS, encode_value
 from .image import resize_image
 from .stream_buffer import StreamBuffer, auto_bound_tolerance_ns
@@ -378,6 +378,11 @@ class LiveAdapter:
         camera message nested at that attribute path (such as
         ``msg.cameras.front``) is decoded by the decoder registered for the
         spec's ``image.type``.
+
+        A message whose decoded vector differs in length from the
+        ``selector.lerobot_names`` that label it by position raises
+        ``ValueError``, as it does in the converter (see
+        :func:`~roboto_to_lerobot.runtime.converters.check_positional_width`).
         """
         entries = self._topic_entries.get(topic)
         if entries is None:
@@ -390,6 +395,7 @@ class LiveAdapter:
             msg_to_decode = msg if field is None else reduce(getattr, field.split("."), msg)
             # ``_make_buffer_entry`` refused any spec without a decoder at boot.
             value = DECODERS[image_message_type(spec)](msg_to_decode, spec)
+            check_positional_width(value, spec)
             if spec.image and "resize" in (spec.image or {}):
                 expected_h, expected_w = spec.image["resize"]
                 value = resize_image(value, expected_h, expected_w)
