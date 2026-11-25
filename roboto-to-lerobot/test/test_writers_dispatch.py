@@ -143,9 +143,10 @@ def test_v2_1_create_passes_use_videos_and_drops_finalize(
     assert call_kwargs["image_writer_threads"] == 4
 
     # ``task`` must reach add_frame as a separate kwarg, not inside the
-    # frame dict.
-    writer.add_frame({"observation.state": [1.0, 2.0, 3.0], "task": "ignored"}, task="real")
+    # frame dict. (The image writer is idle, so add_frame does not wait.)
     inner = fake_lerobot.create.return_value
+    inner.image_writer.queue.qsize.return_value = 0
+    writer.add_frame({"observation.state": [1.0, 2.0, 3.0], "task": "ignored"}, task="real")
     inner.add_frame.assert_called_once()
     frame_arg, kwargs = inner.add_frame.call_args.args, inner.add_frame.call_args.kwargs
     assert "task" not in frame_arg[0]

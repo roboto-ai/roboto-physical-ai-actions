@@ -31,7 +31,11 @@ from roboto_to_lerobot.contract_utils import (
     collect_topics_from_files,
     load_contract,
 )
-from roboto_to_lerobot.lerobot import generate_frames, materialize_deferred
+from roboto_to_lerobot.lerobot import (
+    episode_video_reader,
+    generate_frames,
+    materialize_deferred,
+)
 from roboto_to_lerobot.runtime import LiveAdapter
 from roboto_to_lerobot.runtime import load_contract as load_live_contract
 
@@ -202,17 +206,18 @@ def _contract(tmp_path, videos: list[dict[str, Any]]) -> Contract:
 
 def _frames(contract: Contract, topics: list[RecordTopic]) -> dict[str, list[np.ndarray]]:
     """Every video spec's frames keyed by spec key, decoded as the converter decodes them
-    (``generate_frames`` defers image decoding and ``materialize_deferred`` decodes each frame)."""
+    (``generate_frames`` defers image decoding and ``materialize_deferred`` decodes each frame,
+    reading compressed video through one reader over the episode)."""
     first = topics[0]
     collection = DataCollection(
         contract, {topic.name: [topic] for topic in topics}, first.start_time, first.end_time,
     )
     reference = pd.Series(first.log_times, name="timestamp")
     specs_by_key = {spec.key: spec for spec in contract.videos}
-    frames = [
-        materialize_deferred(frame, specs_by_key)
-        for frame in generate_frames(contract, collection, reference, defer_image_decode=True)
-    ]
+    frames = list(generate_frames(contract, collection, reference, defer_image_decode=True))
+    video_reader = episode_video_reader(frames)
+    for frame in frames:
+        materialize_deferred(frame, specs_by_key, video_reader)
     return {spec.key: [frame[spec.key] for frame in frames] for spec in contract.videos}
 
 

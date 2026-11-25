@@ -553,8 +553,11 @@ Topics that Roboto ingestion tags `compressedVideo` store one encoded video
 the middle of a group of pictures (GOP) can only be decoded together with the
 frames back to its keyframe. The converter handles that: it decodes each
 episode's whole time range in one pass, walking back up to 10 s to find the
-keyframe that anchors the range. Declare the topic's real schema name
-(`foxglove_msgs/msg/CompressedVideo`, `foxglove_msgs/CompressedVideo`, or
+keyframe that anchors the range. The pass runs twice: once while fetching,
+to learn which frames decode, and again while the episode is written, keeping
+only the few decoded frames about to be written. A camera's memory use
+therefore does not grow with the episode's length. Declare the topic's real
+schema name (`foxglove_msgs/msg/CompressedVideo`, `foxglove_msgs/CompressedVideo`, or
 `foxglove.CompressedVideo`) — declaring such a topic as `CompressedImage` is
 refused with an explanatory error rather than silently producing broken frames.
 
@@ -563,9 +566,6 @@ Notes and limits:
 - Decoding needs the `roboto[video]` extra (PyAV); it ships with the action image.
 - The codec is read from each message's `format` field. A codec outside
   H.264/H.265/VP9/AV1 fails the conversion instead of dropping the camera.
-- `image.resize` is applied as frames are decoded, which is what keeps an
-  episode's worth of frames in memory at the target resolution rather than the
-  source resolution.
 - Frames whose keyframe is unreachable are skipped with a warning; a range where
   *nothing* decodes fails the conversion.
 - `gen-node` refuses compressed video: a live ROS node holds no GOP state and

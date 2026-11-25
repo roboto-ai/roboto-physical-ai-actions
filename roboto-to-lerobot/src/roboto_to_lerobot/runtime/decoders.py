@@ -86,14 +86,14 @@ def _dec_compressed_video(msg: Any, spec: ObservationSpec) -> np.ndarray:
 
     Compressed video (``foxglove_msgs/msg/CompressedVideo``) stores one encoded
     access unit per message, and a delta frame needs its whole GOP prefix to
-    decode — there is no per-message decode for this registry to perform. Those
-    frames are decoded a range at a time during the fetch step (see
-    ``roboto_to_lerobot.video.decode_video_stream_rows``) and arrive here
-    already as HWC uint8 RGB, under a ``frame`` column.
+    decode — there is no per-message decode for this registry to perform. The
+    converter's rows carry a ``roboto_to_lerobot.video.VideoFrameRef`` under
+    ``frame``, which ``lerobot.materialize_deferred`` resolves through
+    ``video.VideoFrameReader`` without calling this function; it accepts only
+    a frame some caller has already decoded to HWC uint8 RGB.
 
-    The registration exists so compressed video still resolves through the one
-    registry every video path goes through, including the deferred-decode round
-    trip in ``lerobot.materialize_deferred``.
+    The registration is what matters: it marks every compressed-video schema
+    as a video type, which ``contract_utils.video_spec_kind`` checks.
     """
     frame = msg["frame"]
     if not isinstance(frame, np.ndarray):
