@@ -61,6 +61,7 @@ from .lerobot import episode_video_reader, generate_frames, materialize_deferred
 from .logger import logger
 from .merge_v21 import merge_v21_entries
 from .output_publish import parse_tags, publish_tagged_output
+from .spool import SpoolWriter
 from .stderr_filter import (
     disable_progress_bars,
     install_svt_stderr_filter,
@@ -141,8 +142,11 @@ _ENCODER_THREADS_ENV = "ROBOTO_TO_LEROBOT_ENCODER_THREADS"
 # hatch for external benchmark sweeps.
 _SHARD_COUNT_ENV = "ROBOTO_TO_LEROBOT_SHARD_COUNT"
 # Headroom on the in-flight submission window so the main thread can drain
-# the head-of-line future while workers continue churning. Resident memory
-# peaks around (pool_size + this) × episode_payload_size.
+# the head-of-line future while workers continue churning. Up to
+# (pool_size + this) episodes are being built or waiting to be written at
+# once; with a spool directory, their camera payloads wait in spool files on
+# disk rather than in memory. CONTRACT.md quotes this value in the disk
+# space the spool files need.
 _POOL_IN_FLIGHT_HEADROOM = 4
 # The file in the dataset's ``meta/`` that records where the dataset and each
 # of its episodes came from. The Lance converter copies ``meta/`` whole.
@@ -530,7 +534,8 @@ def _preload_episode(
     The first event's data is already loaded to discover the features, so
     building its episode here saves fetching it again in a worker. As in a
     worker, image decoding is left to the drain, which decodes each frame
-    just before the writer takes it.
+    just before the writer takes it, and the camera payloads stay in
+    ``episode_data``'s spool file, if it has one.
 
     A failure is logged and not recorded as a skip: the caller then submits
     the event to the pool like every other event, and what the pool does with
@@ -557,6 +562,7 @@ def _preload_episode(
         return None
     return WorkerEpisode(
         event_idx=event_idx, task_label=task, frames=frames, dropped_frames=tuple(dropped_frames),
+        spool_path=episode_data.spool.path if episode_data.spool is not None else None,
     )
 
 
@@ -616,6 +622,9 @@ def _drain_one_episode(
 
     Module-level so the shard subprocess can call the same code path the
     single-writer drain uses.
+
+    Deletes the episode's spool file, if it has one, whether or not the
+    episode is saved.
     """
     shard_tag = _shard_tag(shard_idx)
     logger.info(
@@ -629,13 +638,17 @@ def _drain_one_episode(
     # itself must let go of the frames. Compressed video is decoded here, a
     # few frames ahead of the writer, by one reader over the whole episode.
     frames = episode.frames
-    video_reader = episode_video_reader(frames)
-    for i, frame in enumerate(frames):
-        frames[i] = None
-        materialize_deferred(frame, video_specs_by_key, video_reader)
-        writer.add_frame(frame, task=episode.task_label)
+    try:
+        video_reader = episode_video_reader(frames)
+        for i, frame in enumerate(frames):
+            frames[i] = None
+            materialize_deferred(frame, video_specs_by_key, video_reader)
+            writer.add_frame(frame, task=episode.task_label)
+        writer.save_episode()
+    finally:
+        if episode.spool_path is not None:
+            Path(episode.spool_path).unlink(missing_ok=True)
     frame_count = len(frames)
-    writer.save_episode()
     accumulator.episode_to_event.append({
         "episode_index": accumulator.total_episodes,
         "event_id": event_id,
@@ -669,6 +682,7 @@ def _run_pool_drain(
     preloaded_episode=None,
     shard_idx: int | None = None,
     on_episode_saved: Callable[[dict], None] | None = None,
+    spool_dir: str | None = None,
 ) -> None:
     """Drive a ``ProcessPoolExecutor`` and drain ``drain_order`` in order.
 
@@ -694,6 +708,9 @@ def _run_pool_drain(
     ``on_episode_saved``, if given, is called with an event's
     ``drain_order`` entry right after its episode is saved. An exception it
     raises is not recorded as a skip; it ends the drain.
+
+    ``spool_dir``, if given, is the existing directory where the workers
+    write each episode's spool file (see :func:`_worker_init`).
     """
 
     def _drain(meta: dict, episode) -> None:
@@ -747,7 +764,7 @@ def _run_pool_drain(
         max_workers=pool_size,
         mp_context=ctx,
         initializer=_worker_init,
-        initargs=(descriptors_by_ds, contracts_by_ds),
+        initargs=(descriptors_by_ds, contracts_by_ds, spool_dir),
     )
     submitted: dict[int, Future] = {}
     next_to_submit = 0
@@ -982,6 +999,7 @@ def _run_shard_subprocess(
     result_path: str,
     video_encoding: dict | None = None,
     episode_conn: Connection | None = None,
+    spool_dir: str | None = None,
 ) -> None:
     """Entrypoint for a single shard process.
 
@@ -1061,6 +1079,7 @@ def _run_shard_subprocess(
             accumulator=accumulator,
             shard_idx=shard_idx,
             on_episode_saved=on_episode_saved,
+            spool_dir=spool_dir,
         )
         writer.finalize()
         result.update({
@@ -1102,6 +1121,7 @@ def _spawn_shards(
     log_level: int,
     video_encoding: dict | None = None,
     on_episodes: Callable[[list[dict]], None] | None = None,
+    spool_dir: str | None = None,
 ) -> list[dict]:
     """Spawn one process per shard, wait for all, return per-shard results.
 
@@ -1122,6 +1142,9 @@ def _spawn_shards(
     sees every shard's traceback in one place instead of chasing
     stale-pid output. The result list is sorted by ``shard_idx`` so
     downstream aggregation runs in original chronological order.
+
+    ``spool_dir`` is passed to every shard's worker pool (see
+    :func:`_run_pool_drain`).
     """
     shard_count = len(chunks_drain)
     ctx = mp.get_context("spawn")
@@ -1175,6 +1198,7 @@ def _spawn_shards(
                 "drain_order": chunks_drain[i],
                 "result_path": str(result_path),
                 "episode_conn": episode_conn,
+                "spool_dir": spool_dir,
             },
             name=f"shard-{i:03d}",
         )
@@ -1879,7 +1903,21 @@ def main(context: roboto.InvocationContext) -> None:
     Loads the events or sessions of the input Roboto Collection, then
     writes one combined LeRobot dataset where each episode corresponds to
     one event or one session.
+
+    The episodes' camera payloads wait in spool files under
+    ``<invocation_id>/_spool``, next to the dataset. That directory is
+    removed when the conversion ends, whether it succeeds or fails, so the
+    runtime does not upload it.
     """
+    spool_dir = context.output_dir / context.invocation_id / "_spool"
+    try:
+        _convert_collection(context, spool_dir)
+    finally:
+        shutil.rmtree(spool_dir, ignore_errors=True)
+
+
+def _convert_collection(context: roboto.InvocationContext, spool_dir: Path) -> None:
+    """Convert the collection as :func:`main` describes, creating ``spool_dir`` for the spool files."""
     # Install before any LeRobotWriter.create (i.e. before the libsvtav1
     # encoder starts) so SVT-AV1's fd-2 banner output is filtered out at
     # the source. Spawned shard/event-worker children inherit the redirect.
@@ -1939,17 +1977,21 @@ def main(context: roboto.InvocationContext) -> None:
     subfolder = context.output_dir / context.invocation_id
     dataset_root = subfolder / "combined"
     dataset_root.parent.mkdir(parents=True, exist_ok=True)
+    spool_dir.mkdir(exist_ok=True)
 
     first_resolved = prepared[first_ds_id].contract
     first_topics = prepared[first_ds_id].topics
 
     logger.info("Preloading first event to discover feature shapes...")
+    first_spool = SpoolWriter(spool_dir, prefix="first-event-")
     first_data = DataCollection(
         contract=first_resolved,
         topics=first_topics,
         start_time_ns=first_event.start_time - buffer_ns,
         end_time_ns=first_event.end_time + buffer_ns + action_lead_ns,
+        spool=first_spool,
     )
+    first_spool.close()
 
     encoder_threads = _resolve_encoder_threads(
         context.get_optional_parameter("encoder_threads"),
@@ -2049,6 +2091,7 @@ def main(context: roboto.InvocationContext) -> None:
         # Every episode is written by a shard process, so the
         # preloaded first event is only needed for feature discovery.
         del first_data
+        first_spool.discard()
         _convert_with_episode_cache(
             cache=episode_cache,
             recipe=recipe,
@@ -2071,6 +2114,7 @@ def main(context: roboto.InvocationContext) -> None:
             video_specs_by_key=video_specs_by_key,
             descriptors_by_ds=descriptors_by_ds,
             log_level=context.log_level,
+            spool_dir=str(spool_dir),
         )
     elif shard_count == 1:
         # Single-writer path — keep the preloaded-event optimisation: the
@@ -2142,7 +2186,10 @@ def main(context: roboto.InvocationContext) -> None:
         # Free the first event's fetched data now rather than after the whole
         # drain. The preloaded episode keeps only the values its frames use.
         del first_data
+        # The preloaded episode's frames refer to the first event's spool
+        # file, which the drain deletes; without that episode, nothing does.
         if preloaded_episode is None:
+            first_spool.discard()
             pool_tasks.append(EventTask(
                 event_idx=preloaded_event_idx,
                 event_id=getattr(preloaded_event, "event_id", None),
@@ -2172,6 +2219,7 @@ def main(context: roboto.InvocationContext) -> None:
             accumulator=accumulator,
             preloaded_event_idx=preloaded_event_idx,
             preloaded_episode=preloaded_episode,
+            spool_dir=str(spool_dir),
         )
         writer.finalize()
         # Same failure mode the sharded path guards against in
@@ -2195,6 +2243,7 @@ def main(context: roboto.InvocationContext) -> None:
         # Free the feature-discovery DataCollection before spawning so each
         # shard does not inherit a stale copy of the first event's payload.
         del first_data
+        first_spool.discard()
         chunks_drain, chunks_tasks = _partition_shards(
             matched, matched_events,
             shard_count=shard_count,
@@ -2240,6 +2289,7 @@ def main(context: roboto.InvocationContext) -> None:
             descriptors_by_ds=descriptors_by_ds,
             contracts_by_ds=contracts_by_ds,
             log_level=context.log_level,
+            spool_dir=str(spool_dir),
         )
         # ``shard_results`` (unfiltered) still feeds every fold-in below —
         # only the aggregation call itself should see empty shards excluded.

@@ -10,6 +10,7 @@ from .contract_utils import AlignSpec, fps_to_time_step_ns, image_message_type
 from .converters import DECODERS
 from .logger import logger
 from .runtime.image import resize_image
+from .spool import unspool
 from .transforms import apply_transforms
 from .video import VideoFrameReader, VideoFrameRef
 
@@ -26,7 +27,9 @@ class _DeferredFrame:
     these sentinels and the consumer decodes (and optionally resizes) on the
     receiving side just before ``writer.add_frame``. A compressed-video
     entry's payload is ``{"frame": VideoFrameRef}``, whose session carries
-    the packets to decode it from.
+    the packets to decode it from. When the episode was fetched with a
+    spool, a still image's ``data`` is a ``SpoolRef`` into the episode's
+    spool file, as is each packet a compressed-video session holds.
     """
 
     video_key: str
@@ -64,7 +67,8 @@ def materialize_deferred(
 
     A compressed-video entry is read from ``video_reader``, built by
     :func:`episode_video_reader` over the episode's frames; every other entry
-    goes through the decoder registered for its message type.
+    goes through the decoder registered for its message type, after any
+    ``SpoolRef`` in its payload is read back from the spool file.
 
     Raises:
         ValueError: If no decoder is registered for an entry's message type,
@@ -89,7 +93,8 @@ def materialize_deferred(
                     f"No video decoder registered for message type "
                     f"'{val.decoder_type}' (video key '{val.video_key}')."
                 )
-            image = decoder(pd.Series(val.payload), video_specs_by_key[val.video_key])
+            payload = {name: unspool(value) for name, value in val.payload.items()}
+            image = decoder(pd.Series(payload), video_specs_by_key[val.video_key])
         if val.resize is not None:
             expected_h, expected_w = val.resize
             image = resize_image(image, expected_h, expected_w)

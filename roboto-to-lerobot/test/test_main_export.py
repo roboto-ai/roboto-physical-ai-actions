@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -179,3 +180,37 @@ def test_event_collection_exports_with_event_ids_and_no_session_fields(export):
     assert [e["event_id"] for e in manifest["episode_to_event"]] == ["ev_0", "ev_1"]
     assert all("session_id" not in e for e in manifest["episode_to_event"])
     assert manifest["subtasks"] is None
+
+
+def _fail_to_label_subtasks(*_args, **_kwargs):
+    raise RuntimeError("labelling sub-tasks failed")
+
+
+@pytest.mark.parametrize(
+    ("label_subtasks", "outcome"),
+    [
+        pytest.param(main_mod.apply_session_subtasks, nullcontext(), id="succeeds"),
+        pytest.param(
+            _fail_to_label_subtasks, pytest.raises(RuntimeError, match="labelling sub-tasks failed"),
+            id="fails-after-writing",
+        ),
+    ],
+)
+def test_an_export_leaves_no_spool_directory_behind(export, monkeypatch, label_subtasks, outcome):
+    """The episodes' spool files are scratch space: the runtime must not find them in the output to upload."""
+    # Arrange
+    events = [
+        EpisodeSource("event", event_id, _DS, (_DS,), start, end, {"task": task})
+        for event_id, start, end, task in _events(0, 1)
+    ]
+    # Sub-tasks are labelled after every episode is written, so a failure there leaves a written dataset.
+    monkeypatch.setattr(main_mod, "apply_session_subtasks", label_subtasks)
+
+    # Act
+    with outcome:
+        export(roboto.CollectionResourceType.Event, events)
+
+    # Assert
+    (out,) = export.harness.tmp_path.glob("iv_*/output/iv_*")
+    assert (out / "combined").is_dir()
+    assert not (out / "_spool").exists()

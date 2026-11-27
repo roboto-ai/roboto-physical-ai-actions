@@ -42,6 +42,7 @@ from .extract import (
     keep_monotonic_timestamps,
     select_message_field,
 )
+from .spool import SpoolWriter
 from .video import (
     COMPRESSED_VIDEO_MESSAGE_PATHS,
     COMPRESSED_VIDEO_SCHEMAS,
@@ -975,7 +976,8 @@ class _TopicWorkItem(NamedTuple):
     ``"video_file"`` calls ``topic.get_data()`` and yields per-frame rows,
     ``"video_stream"`` probes a compressed-video range into frame-reference
     rows, and everything else calls ``topic.get_data_as_df`` and returns the
-    (timestamp-normalised) DataFrame. ``submission_idx`` is a monotonic counter
+    (timestamp-normalised) DataFrame, or for still images nested in one topic
+    a DataFrame per ``image.field``. ``submission_idx`` is a monotonic counter
     assigned in source-order so the fan-out step can reassemble results in
     deterministic source-order — that order is the stable-sort tie-break that
     keeps the post-fetch ``pd.concat`` bit-stable across runs.
@@ -1001,6 +1003,9 @@ class _TopicWorkItem(NamedTuple):
 _FETCH_SHAPE: dict[str, str] = {
     "video_file": "image_rows",
     "video_stream": "frame_rows",
+    # With a spool, a ``video_msgs`` fetch puts spool references in its
+    # ``data`` column, which an observation on the same topic must not receive.
+    "video_msgs": "image_dataframe",
 }
 
 
@@ -1021,7 +1026,7 @@ def _topic_intersects_window(
     return True
 
 
-def _fetch_one(item: _TopicWorkItem) -> Any:
+def _fetch_one(item: _TopicWorkItem, spool: SpoolWriter | None = None, fields: tuple[str, ...] = ()) -> Any:
     """Execute one work item against the roboto SDK.
 
     For ``video_file`` specs the SDK returns ``(timestamp, content_dict)``
@@ -1033,6 +1038,17 @@ def _fetch_one(item: _TopicWorkItem) -> Any:
     runs here, where the whole range is in hand. For every other
     ``spec_kind`` the result is the DataFrame from ``get_data_as_df``,
     normalised to int64 ns timestamps.
+
+    With ``spool``, a camera's payloads are written to the spool file as soon
+    as the fetch returns: in a ``video_file`` or ``video_msgs`` result, each
+    ``data`` value that ``SpoolWriter.put`` accepts is replaced by its
+    ``SpoolRef``, and a ``video_stream`` session keeps references to its
+    packets.
+
+    ``fields`` are the ``image.field`` s of the still images nested in the
+    topic that share a ``video_msgs`` fetch. Their result is a dict holding,
+    for each field, :func:`select_message_field` of the DataFrame, so each
+    nested camera's ``data`` is spooled the way a top-level camera's is.
     """
     from .logger import logger
 
@@ -1046,6 +1062,7 @@ def _fetch_one(item: _TopicWorkItem) -> Any:
             item.end_ns,
             topic_name=item.topic_name,
             field=item.field,
+            spool=spool,
         )
 
     if item.spec_kind == "video_file":
@@ -1070,7 +1087,7 @@ def _fetch_one(item: _TopicWorkItem) -> Any:
             rows.append({
                 "timestamp": ts_ns,
                 "format": "jpeg",
-                "data": image_data,
+                "data": image_data if spool is None else spool.put(image_data),
             })
         return rows
 
@@ -1085,13 +1102,29 @@ def _fetch_one(item: _TopicWorkItem) -> Any:
             start_time=start_time,
             end_time=end_time,
         )
-    return _add_timestamp_column(df)
+    df = _add_timestamp_column(df)
+    if item.spec_kind != "video_msgs":
+        return df
+    if not fields:
+        return _spool_camera_data(df, spool)
+    return {field: _spool_camera_data(select_message_field(df, field, item.topic_name), spool) for field in fields}
+
+
+def _spool_camera_data(df: pd.DataFrame, spool: SpoolWriter | None) -> pd.DataFrame:
+    """``df`` with each ``data`` value that ``SpoolWriter.put`` accepts replaced by its ``SpoolRef``.
+
+    Returns ``df`` itself without a spool or a ``data`` column.
+    """
+    if spool is None or "data" not in df.columns:
+        return df
+    return df.assign(data=[spool.put(value) for value in df["data"]])
 
 
 def _run_topic_fetches(
     items: list[_TopicWorkItem],
     *,
     max_workers: int = _TOPIC_FETCH_THREADS,
+    spool: SpoolWriter | None = None,
 ) -> dict[tuple[str, str], list[Any]]:
     """Fetch every work item concurrently and bucket by ``(spec_kind, spec_key)``.
 
@@ -1099,16 +1132,21 @@ def _run_topic_fetches(
     shape)`` collapse to a single fetch whose result fans out to every
     requester — catches the pathological case of two specs pinned to the same
     topic without paying for it in the common case. The shape is part of the
-    key because it changes what the fetch *returns*: a DataFrame,
-    encoded-image rows, or compressed-video frame references.
+    key because it changes what the fetch *returns*: a DataFrame, a camera
+    DataFrame whose ``data`` may hold spool references (one per field for
+    nested still images), encoded-image rows, or compressed-video frame
+    references.
+
+    ``spool`` is handed to every fetch; see :func:`_fetch_one`.
 
     The key has no ``field``. A nested compressed-video item's message paths
     already start with its field, so items at different fields never share a
-    decode. A DataFrame fetch is split by field as it fans out instead: each
-    requester with a ``field`` receives :func:`select_message_field` of the
-    shared DataFrame. Still images nested at different paths of one topic
-    request the same message paths (see :meth:`DataCollection._build_work_list`),
-    so they share one fetch.
+    decode. Still images nested at different paths of one topic request the
+    same message paths (see :meth:`DataCollection._build_work_list`), so they
+    share one fetch, which is split by field instead: it is handed every
+    requester's ``field``, returns each field's camera DataFrame with its
+    payloads spooled (see :func:`_fetch_one`), and each requester receives
+    its own.
 
     The returned per-spec lists are ordered by ``submission_idx`` so the
     downstream ``pd.concat`` always sees rows in deterministic source-order.
@@ -1128,8 +1166,14 @@ def _run_topic_fetches(
         )
 
     unique: dict[tuple, _TopicWorkItem] = {}
+    # Per fetch, the ``image.field`` of each nested still image it serves, in
+    # request order (a dict as an ordered set).
+    nested_fields: dict[tuple, dict[str, None]] = {}
     for it in items:
-        unique.setdefault(_dedup_key(it), it)
+        key = _dedup_key(it)
+        unique.setdefault(key, it)
+        if it.spec_kind == "video_msgs" and it.field is not None:
+            nested_fields.setdefault(key, {})[it.field] = None
 
     # Cap threads at the number of *distinct* fetches: no point spinning up
     # idle workers, and callers nest this inside a process pool where
@@ -1138,7 +1182,7 @@ def _run_topic_fetches(
     results_by_key: dict[tuple, Any] = {}
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(_fetch_one, item): key
+            executor.submit(_fetch_one, item, spool, tuple(nested_fields.get(key, ()))): key
             for key, item in unique.items()
         }
         for fut, key in futures.items():
@@ -1147,8 +1191,8 @@ def _run_topic_fetches(
     bucketed: dict[tuple[str, str], list[tuple[int, Any]]] = {}
     for it in items:
         result = results_by_key[_dedup_key(it)]
-        if it.field is not None and it.spec_kind not in _FETCH_SHAPE:
-            result = select_message_field(result, it.field, it.topic_name)
+        if it.spec_kind == "video_msgs" and it.field is not None:
+            result = result[it.field]
         bucketed.setdefault((it.spec_kind, it.spec_key), []).append(
             (it.submission_idx, result),
         )
@@ -1212,6 +1256,7 @@ class DataCollection:
         topics: dict[str, list[roboto.Topic]],
         start_time_ns: int,
         end_time_ns: int,
+        spool: SpoolWriter | None = None,
     ):
         """
         Initialize DataCollection by loading all topics specified in the contract.
@@ -1221,6 +1266,10 @@ class DataCollection:
             topics: Dictionary mapping topic name to list of Topic objects
             start_time_ns: Start time in nanoseconds (for filtering data)
             end_time_ns: End time in nanoseconds (for filtering data)
+            spool: Where to write camera payloads as each fetch returns. The
+                camera data then holds ``SpoolRef`` s, which stay readable
+                until the caller deletes the spool file. Without one, the
+                payloads stay in memory.
         """
         from .logger import logger
 
@@ -1228,6 +1277,7 @@ class DataCollection:
         self.topics = topics
         self.start_time_ns = start_time_ns
         self.end_time_ns = end_time_ns
+        self.spool = spool
         self.observations: dict[str, pd.DataFrame] = {}
         self.videos: dict[str, pd.DataFrame] = {}
         self.actions: dict[str, pd.DataFrame] = {}
@@ -1237,7 +1287,7 @@ class DataCollection:
         self.resolved_features: dict[str, tuple[int, list[str]]] = {}
 
         work_list = self._build_work_list(contract, topics, start_time_ns, end_time_ns)
-        raw_by_spec = _run_topic_fetches(work_list)
+        raw_by_spec = _run_topic_fetches(work_list, spool=spool)
 
         # Fixed loader order (videos → actions → observations → tasks) pins
         # the insertion order of ``self.{videos,actions,observations,tasks}``,
@@ -1291,7 +1341,7 @@ class DataCollection:
             for video in contract.videos
         }
         # Every still image nested in one topic is read by one fetch of all
-        # their message paths, which ``_run_topic_fetches`` splits per spec.
+        # their message paths, which the fetch splits into one camera per spec.
         # Each message carries every camera nested in it, and an MCAP-backed
         # read downloads every message whole whatever paths it requests, so a
         # fetch per camera would download the topic once per camera.
