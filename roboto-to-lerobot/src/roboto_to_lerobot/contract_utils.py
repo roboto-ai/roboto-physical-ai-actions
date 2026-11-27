@@ -35,11 +35,12 @@ import roboto
 import yaml
 
 from . import decoders  # noqa: F401
-from .converters import DECODERS, decode_value
+from .converters import DECODERS, POSITIONAL_TYPES, check_positional_width, decode_value
 from .extract import (
     _add_timestamp_column,
     _sanitize_topic_for_key,
     keep_monotonic_timestamps,
+    select_message_field,
 )
 from .video import (
     COMPRESSED_VIDEO_MESSAGE_PATHS,
@@ -119,6 +120,66 @@ def image_resize(spec: ObservationSpec) -> tuple[int, int] | None:
     return None
 
 
+def image_field(spec: ObservationSpec) -> str | None:
+    """The spec's ``image.field``: where each message of its topic carries the image, or ``None``.
+
+    ``None`` means the topic's messages are the images themselves. Otherwise
+    each message is a custom message of the spec's ``type`` that carries a
+    whole camera message of type ``image.type`` at this dotted message path.
+    """
+    return (spec.image or {}).get("field")
+
+
+def image_message_type(spec: ObservationSpec) -> str:
+    """The type of the camera message a spec decodes: ``image.type`` if ``image.field`` is set, else ``type``.
+
+    A spec's ``type`` always names what its topic carries. For an image nested
+    in a custom message that is the custom message, and the camera message at
+    ``image.field`` is named by ``image.type``. Everything that handles the
+    camera message (the decoder, the message paths fetched, the routing of
+    compressed video) takes its type from here, never from ``type`` directly.
+
+    ``image.type`` is returned in its ``pkg/msg/Name`` spelling (see
+    :func:`ros2_message_type`), the spelling the decoders are registered under,
+    so a contract may write either spelling.
+    """
+    if image_field(spec) is None:
+        return spec.type
+    return ros2_message_type(spec.image["type"])
+
+
+def ros2_message_type(type_str: str) -> str:
+    """``pkg/Name`` spelled as ``pkg/msg/Name``; any other spelling unchanged.
+
+    Both spellings name the same ROS message type. Roboto records a field's
+    type in the first (``sensor_msgs/CompressedImage``) and a ROS 2 topic's
+    schema in the second (``sensor_msgs/msg/CompressedImage``). Type names are
+    converted to this one spelling before they are compared or looked up in
+    the decoders.
+    """
+    package, slash, name = type_str.partition("/")
+    if slash and package and name and "/" not in name:
+        return f"{package}/msg/{name}"
+    return type_str
+
+
+def _image_message_paths(msg_type: str) -> list[str] | None:
+    """The message paths a camera message of ``msg_type`` is fetched by, or ``None`` if none.
+
+    ``None`` covers file-backed video, which is read as whole frames rather
+    than by message path, and any type that names no image, whose messages are
+    fetched whole.
+    """
+    if is_compressed_video_schema(msg_type):
+        return COMPRESSED_VIDEO_MESSAGE_PATHS
+    msg_type_lower = msg_type.lower()
+    if "compressedimage" in msg_type_lower:
+        return ["header", "format", "data"]
+    if "image" in msg_type_lower:
+        return ["header", "height", "width", "encoding", "data"]
+    return None
+
+
 def video_spec_kind(video: ObservationSpec, topic_list: list[Any]) -> str:
     """Which fetch/load shape a video spec uses, cross-checked against its topics.
 
@@ -132,11 +193,17 @@ def video_spec_kind(video: ObservationSpec, topic_list: list[Any]) -> str:
       and friends); a whole range is GOP-decoded at fetch time.
     - ``video_msgs`` — per-message stills (``CompressedImage``, ``Image``).
 
+    For an image nested in a custom message, the camera message's type
+    (``image.type``, see :func:`image_message_type`) decides, not ``type:``.
+
     The topics are consulted, not just the declared ``type:``, because a
     compressed-video topic declared as ``CompressedImage`` would otherwise hand
     single H.264 access units to ``cv2.imdecode``. Detection reads the signals
     Roboto ingestion registers — the representation format and the schema name
-    (see :py:func:`roboto_to_lerobot.video.is_compressed_video_topic`).
+    (see :py:func:`roboto_to_lerobot.video.is_compressed_video_topic`). Those
+    signals describe the topic's own messages, so a nested image skips this
+    check; :func:`_check_nested_images` compares ``image.type`` with the type
+    recorded at its path instead.
 
     Args:
         video: The contract's video spec.
@@ -151,21 +218,22 @@ def video_spec_kind(video: ObservationSpec, topic_list: list[Any]) -> str:
             does not declare it, or if it declares a compressed-video spelling
             that has no registered decoder.
     """
-    if video.type.lower() in _IMAGE_VIDEO_TYPES:
+    msg_type = image_message_type(video)
+    if msg_type.lower() in _IMAGE_VIDEO_TYPES:
         return "video_file"
 
-    if is_compressed_video_schema(video.type):
-        if video.type not in DECODERS:
+    if is_compressed_video_schema(msg_type):
+        if msg_type not in DECODERS:
             raise ValueError(
-                f"Video spec '{video.key}' declares compressed-video type '{video.type}', "
+                f"Video spec '{video.key}' declares compressed-video type '{msg_type}', "
                 f"which has no registered decoder. Use one of: "
                 f"{', '.join(sorted(COMPRESSED_VIDEO_SCHEMAS))}."
             )
         return "video_stream"
 
-    if any(is_compressed_video_topic(topic) for topic in topic_list):
+    if image_field(video) is None and any(is_compressed_video_topic(topic) for topic in topic_list):
         raise ValueError(
-            f"Video spec '{video.key}' declares type '{video.type}', but topic "
+            f"Video spec '{video.key}' declares type '{msg_type}', but topic "
             f"'{video.topic}' stores compressed video (one encoded access unit per "
             f"message, not a still image). Declare it as "
             f"'foxglove_msgs/msg/CompressedVideo' so the frames are GOP-decoded."
@@ -317,7 +385,7 @@ class ObservationSpec:
     role: str | None = None
     selector: dict[str, Any] | None = None  # {names: [...]}
     image: dict[str, Any] | None = (
-        None  # {resize:[H,W], encoding:'rgb8'|'bgr8'|'mono8'...}
+        None  # {resize:[H,W], field:'path.to.image', type:'pkg/msg/Image', encoding:'rgb8'|'bgr8'|'mono8'...}
     )
     align: AlignSpec = AlignSpec()
     lerobot_names: list[str] | None = None
@@ -460,9 +528,10 @@ class Contract:
         Args:
             resolved_features: Optional mapping of unique_key -> (num_values, names)
                 discovered at runtime by DataCollection. When present, these
-                override the static selector.names from the contract YAML
-                (which may be empty or refer to array field names rather than
-                individual joint names).
+                override the names the contract YAML gives a spec
+                (``lerobot_names``, or else the topic-prefixed
+                ``selector.names``), which may be empty or refer to array
+                field names rather than individual joint names.
 
         Note:
             Multiple observations/actions with the same base key are concatenated
@@ -493,7 +562,7 @@ class Contract:
                     num_values, names = resolved[unique_key]
                     total_values += num_values
                     all_names.extend(names)
-                elif obs.selector and "names" in obs.selector:
+                else:
                     lr_names = obs.get_lerobot_selector_names()
                     total_values += len(lr_names)
                     all_names.extend(lr_names)
@@ -531,7 +600,7 @@ class Contract:
                     num_values, names = resolved[unique_key]
                     total_values += num_values
                     all_names.extend(names)
-                elif action.selector and "names" in action.selector:
+                else:
                     lr_names = action.get_lerobot_selector_names()
                     total_values += len(lr_names)
                     all_names.extend(lr_names)
@@ -755,7 +824,9 @@ def collect_topics_from_files(
             file), for manifest reporting.
 
     Raises:
-        ValueError: If a required topic from the contract is not found in any file
+        ValueError: If a required topic from the contract is not found in any
+            file, or a topic does not carry what a nested image spec declares
+            (see :func:`_check_nested_images`).
     """
     from .logger import logger
 
@@ -828,6 +899,8 @@ def collect_topics_from_files(
             kept.append(winner)
         topics[name] = kept
 
+    _check_nested_images(contract, topics)
+
     # One summary line per file set replaces the chatty per-binding /
     # per-(topic, file) INFO output. ``scope`` keeps it greppable when
     # multiple datasets share a run; chunk_count gives a hint when a
@@ -845,6 +918,71 @@ def collect_topics_from_files(
     return topics, dedup_groups
 
 
+def _check_nested_images(contract: Contract, topics: dict[str, list[roboto.Topic]]) -> None:
+    """Refuse a nested image spec whose topic does not carry what the spec declares.
+
+    Runs when the topics are collected, before any data is fetched, against
+    each Topic (one per file of a chunked recording) bound to a spec that sets
+    ``image.field``:
+
+    - The Topic's schema name must be the spec's ``type``.
+    - The type Roboto recorded for the message path ``image.field`` must be
+      ``image.type``.
+    - The Topic must have the message paths the fetch will request under
+      ``image.field``. The SDK drops requested paths that a topic lacks instead
+      of reporting them, so without this check the camera would come back
+      empty or fail far from the cause.
+
+    Type names are compared in one spelling (:func:`ros2_message_type`). A
+    check is skipped when the Topic's record lacks what it reads: a schema
+    name, a type for the path, or any message paths.
+
+    Raises:
+        ValueError: Naming the spec, the topic, the type or path declared and
+            what the topic records instead. A missing path's error lists the
+            paths in the topic that have the fields of an ``image.type``
+            message; a path is matched by those fields, not by its type.
+    """
+    for video in contract.videos:
+        field = image_field(video)
+        if field is None:
+            continue
+        msg_type = image_message_type(video)
+        # ``header`` is a struct; only its leaves are guaranteed to be listed.
+        leaves = [path for path in _image_message_paths(msg_type) if path != "header"]
+        for topic in topics.get(video.topic, []):
+            schema_name = topic.schema_name
+            if schema_name and ros2_message_type(schema_name) != ros2_message_type(video.type):
+                raise ValueError(
+                    f"Video spec '{video.key}' declares type '{video.type}' for topic "
+                    f"'{video.topic}', but the topic records type '{schema_name}'. With "
+                    "image.field set, type: names the message the topic carries and "
+                    "image.type names the image message at image.field."
+                )
+            recorded = {record.message_path: record.data_type for record in topic.message_paths}
+            field_type = recorded.get(field)
+            if field_type and ros2_message_type(field_type) != msg_type:
+                raise ValueError(
+                    f"Video spec '{video.key}' declares image.type '{video.image['type']}' "
+                    f"at path '{field}' of topic '{video.topic}', but the topic records "
+                    f"type '{field_type}' at that path."
+                )
+            if not recorded or all(f"{field}.{leaf}" in recorded for leaf in leaves):
+                continue
+            suffix = f".{leaves[0]}"
+            candidates = sorted(
+                prefix
+                for prefix in (path[: -len(suffix)] for path in recorded if path.endswith(suffix))
+                if all(f"{prefix}.{leaf}" in recorded for leaf in leaves)
+            )
+            raise ValueError(
+                f"Video spec '{video.key}' reads a {msg_type} message at path "
+                f"'{field}' of topic '{video.topic}', but that topic lacks the message "
+                f"paths {[f'{field}.{leaf}' for leaf in leaves]}. Paths in this topic "
+                f"with the fields of a {msg_type} message: {candidates or 'none'}."
+            )
+
+
 class _TopicWorkItem(NamedTuple):
     """One unit of topic-data fetch dispatched by :func:`_run_topic_fetches`.
 
@@ -858,7 +996,9 @@ class _TopicWorkItem(NamedTuple):
     keeps the post-fetch ``pd.concat`` bit-stable across runs.
 
     ``resize`` is only set for ``video_stream`` items, whose decode step resizes
-    frames as it produces them.
+    frames as it produces them. ``field`` is the spec's ``image.field``, the
+    message path of a camera message nested in each message; the spec receives
+    that camera message's fields as if they were top-level.
     """
     spec_kind: Literal["observation", "video_msgs", "video_file", "video_stream", "action", "task"]
     spec_key: str
@@ -869,6 +1009,7 @@ class _TopicWorkItem(NamedTuple):
     message_paths_include: list[str] | None
     submission_idx: int
     resize: tuple[int, int] | None = None
+    field: str | None = None
 
 
 # The result shape each ``spec_kind`` fetches. Two work items may only share one
@@ -921,6 +1062,7 @@ def _fetch_one(item: _TopicWorkItem) -> Any:
             item.end_ns,
             topic_name=item.topic_name,
             resize=item.resize,
+            field=item.field,
         )
 
     if item.spec_kind == "video_file":
@@ -977,6 +1119,14 @@ def _run_topic_fetches(
     part of the key because they change what the fetch *returns*: a DataFrame,
     encoded-image rows, or decoded frames at a particular resolution.
 
+    The key has no ``field``. A nested compressed-video item's message paths
+    already start with its field, so items at different fields never share a
+    decode. A DataFrame fetch is split by field as it fans out instead: each
+    requester with a ``field`` receives :func:`select_message_field` of the
+    shared DataFrame. Still images nested at different paths of one topic
+    request the same message paths (see :meth:`DataCollection._build_work_list`),
+    so they share one fetch.
+
     The returned per-spec lists are ordered by ``submission_idx`` so the
     downstream ``pd.concat`` always sees rows in deterministic source-order.
     That order is the stable-sort tie-break for the timestamp sort that
@@ -1015,6 +1165,8 @@ def _run_topic_fetches(
     bucketed: dict[tuple[str, str], list[tuple[int, Any]]] = {}
     for it in items:
         result = results_by_key[_dedup_key(it)]
+        if it.field is not None and it.spec_kind not in _FETCH_SHAPE:
+            result = select_message_field(result, it.field, it.topic_name)
         bucketed.setdefault((it.spec_kind, it.spec_key), []).append(
             (it.submission_idx, result),
         )
@@ -1134,7 +1286,7 @@ class DataCollection:
         work_list: list[_TopicWorkItem] = []
         submission_idx = 0
 
-        def _append(spec_kind, spec_key, topic_name, topic_list, message_paths, resize=None):
+        def _append(spec_kind, spec_key, topic_name, topic_list, message_paths, resize=None, field=None):
             nonlocal submission_idx
             for topic in topic_list:
                 if not _topic_intersects_window(topic, start_time_ns, end_time_ns):
@@ -1149,31 +1301,45 @@ class DataCollection:
                     message_paths_include=message_paths,
                     submission_idx=submission_idx,
                     resize=resize,
+                    field=field,
                 ))
                 submission_idx += 1
 
+        spec_kinds = {
+            video.key: video_spec_kind(video, topics.get(video.topic, []))
+            for video in contract.videos
+        }
+        # Every still image nested in one topic is read by one fetch of all
+        # their message paths, which ``_run_topic_fetches`` splits per spec.
+        # Each message carries every camera nested in it, and an MCAP-backed
+        # read downloads every message whole whatever paths it requests, so a
+        # fetch per camera would download the topic once per camera.
+        nested_still_paths: dict[str, list[str]] = {}
         for video in contract.videos:
-            msg_type_lower = video.type.lower()
+            field = image_field(video)
+            if field is None or spec_kinds[video.key] != "video_msgs":
+                continue
+            shared = nested_still_paths.setdefault(video.topic, [])
+            for path in _image_message_paths(image_message_type(video)):
+                if f"{field}.{path}" not in shared:
+                    shared.append(f"{field}.{path}")
+
+        for video in contract.videos:
             video_topics = topics.get(video.topic, [])
-            spec_kind = video_spec_kind(video, video_topics)
+            spec_kind = spec_kinds[video.key]
             if spec_kind == "video_file":
                 _append("video_file", video.key, video.topic, video_topics, None)
                 continue
-            if spec_kind == "video_stream":
-                _append(
-                    "video_stream", video.key, video.topic, video_topics,
-                    COMPRESSED_VIDEO_MESSAGE_PATHS, resize=image_resize(video),
-                )
-                continue
-            if "compressedimage" in msg_type_lower:
-                paths = ["header", "format", "data"]
-            elif "image" in msg_type_lower:
-                paths = ["header", "height", "width", "encoding", "data"]
-            else:
-                paths = None
+            paths = _image_message_paths(image_message_type(video))
+            field = image_field(video)
+            if field is not None and spec_kind == "video_msgs":
+                paths = nested_still_paths[video.topic]
+            elif field is not None:
+                paths = [f"{field}.{path}" for path in paths]
             _append(
-                "video_msgs", video.key, video.topic,
-                topics.get(video.topic, []), paths,
+                spec_kind, video.key, video.topic, video_topics, paths,
+                resize=image_resize(video) if spec_kind == "video_stream" else None,
+                field=field,
             )
 
         for action in contract.actions:
@@ -1214,8 +1380,7 @@ class DataCollection:
             logger.debug("Loading action: %s (unique_key=%s) from topic %s",
                        action.key, unique_key, action.topic)
 
-            selector_names = (action.selector or {}).get("names", [])
-            # LeRobot-facing names (may be overridden by lerobot_names)
+            # LeRobot-facing names: lerobot_names, or the prefixed selector names
             lr_names = action.get_lerobot_selector_names()
 
             try:
@@ -1244,6 +1409,8 @@ class DataCollection:
                         # Regular decoder - one value per message
                         all_timestamps.append(row["timestamp"])
                         all_values.append(decoded)
+                for value in all_values:
+                    check_positional_width(value, action)
 
                 # Create DataFrame with timestamp + values columns
                 result = pd.DataFrame({
@@ -1263,17 +1430,14 @@ class DataCollection:
                     )
 
                 # Populate resolved_features with LeRobot-facing names
-                if selector_names:
-                    self.resolved_features[unique_key] = (
-                        len(selector_names),
-                        lr_names,
-                    )
+                if lr_names:
+                    self.resolved_features[unique_key] = (len(lr_names), lr_names)
                     logger.debug(
                         "Decoded action %s: %d features, %d rows",
-                        unique_key, len(selector_names), len(result),
+                        unique_key, len(lr_names), len(result),
                     )
                 else:
-                    # Infer width from first row if selector.names is empty
+                    # Infer width from first row if no names label the values
                     width = len(all_values[0]) if all_values else 0
                     self.resolved_features[unique_key] = (width, [])
                     logger.debug(
@@ -1303,8 +1467,7 @@ class DataCollection:
             logger.debug("Loading observation: %s (unique_key=%s) from topic %s",
                        observation.key, unique_key, observation.topic)
 
-            selector_names = (observation.selector or {}).get("names", [])
-            # LeRobot-facing names (may be overridden by lerobot_names)
+            # LeRobot-facing names: lerobot_names, or the prefixed selector names
             lr_names = observation.get_lerobot_selector_names()
 
             try:
@@ -1322,6 +1485,8 @@ class DataCollection:
                 # Each row is one message, with columns such as "name" and
                 # "position", which the decoder reads like a message object.
                 decoded_values = [decode_value(row, observation) for row in _message_rows(raw_df)]
+                for value in decoded_values:
+                    check_positional_width(value, observation)
 
                 # Single ``values`` column of per-row numpy arrays — matches
                 # what ``lerobot.generate_frames`` expects when it stacks /
@@ -1332,17 +1497,14 @@ class DataCollection:
                 })
 
                 # Populate resolved_features with LeRobot-facing names
-                if selector_names:
-                    self.resolved_features[unique_key] = (
-                        len(selector_names),
-                        lr_names,
-                    )
+                if lr_names:
+                    self.resolved_features[unique_key] = (len(lr_names), lr_names)
                     logger.debug(
                         "Decoded observation %s: %d features, %d rows",
-                        unique_key, len(selector_names), len(result),
+                        unique_key, len(lr_names), len(result),
                     )
                 else:
-                    # Infer width from first row if selector.names is empty
+                    # Infer width from first row if no names label the values
                     width = len(decoded_values[0]) if decoded_values else 0
                     self.resolved_features[unique_key] = (width, [])
                     logger.debug(
@@ -1603,19 +1765,33 @@ def _as_align(
 
 
 def _parse_lerobot_names(
-    selector: dict[str, Any] | None, key: str
+    selector: dict[str, Any] | None, key: str, msg_type: str
 ) -> list[str] | None:
     """Extract and validate ``lerobot_names`` from a selector block.
 
-    Returns ``None`` when no ``lerobot_names`` are specified.
-    Raises ``ValueError`` if the length doesn't match ``selector.names``.
+    Returns ``None`` when no ``lerobot_names`` are specified. With
+    ``selector.names``, raises ``ValueError`` if the lengths differ. Without
+    them, the names label the vector ``msg_type`` decodes to by position;
+    raises ``ValueError`` if ``msg_type`` is not in ``POSITIONAL_TYPES``.
+    Each message's length is checked against the names when it is decoded
+    (:func:`~roboto_to_lerobot.runtime.converters.check_positional_width`).
     """
     if not selector:
         return None
     lr_names = selector.get("lerobot_names")
     if lr_names is None:
         return None
-    sel_names = selector.get("names", [])
+    sel_names = selector.get("names") or []
+    if not sel_names:
+        if lr_names and msg_type not in POSITIONAL_TYPES:
+            raise ValueError(
+                f"Key '{key}' sets selector.lerobot_names without selector.names, "
+                f"which labels the decoded values by position, but type '{msg_type}' "
+                "does not decode to a vector of numbers in a fixed order. Add "
+                "selector.names to choose the values. Types that can be labelled "
+                f"by position: {sorted(POSITIONAL_TYPES)}."
+            )
+        return lr_names
     if len(lr_names) != len(sel_names):
         raise ValueError(
             f"lerobot_names length ({len(lr_names)}) != "
@@ -1738,6 +1914,48 @@ def _parse_transforms(it: dict[str, Any]) -> list[TransformSpec] | None:
     return specs
 
 
+def _check_nested_image(key: str, image: dict[str, Any]) -> None:
+    """Refuse an ``image`` block whose ``field`` and ``type`` do not declare a nested image.
+
+    ``image.field`` and ``image.type`` are set together: the message path of an
+    image nested in the custom message that the spec's ``type`` names, and the
+    type of the image message at that path. Without ``image.field``, the
+    spec's ``type`` names the image message, so ``image.type`` is refused. A
+    message path is field names joined by dots, as Roboto writes message
+    paths. Only image and compressed-video messages are fetched by message
+    path, so any other ``image.type`` is refused; file-backed video, for
+    example, is read as whole frames.
+    """
+    where = f"Video spec '{key}'"
+    if "field" not in image:
+        if "type" in image:
+            raise ValueError(
+                f"{where} sets image.type without image.field. image.type names the "
+                "image message at image.field; an image published as its own message "
+                "is named by type: alone."
+            )
+        return
+    field = image["field"]
+    if not isinstance(field, str) or not all(field.split(".")):
+        raise ValueError(
+            f"{where} has image.field {field!r}; it must be a message path, "
+            "field names joined by dots, such as 'observation.cameras.front'."
+        )
+    if "type" not in image:
+        raise ValueError(
+            f"{where} sets image.field without image.type, the type of the image "
+            "message at that path (such as sensor_msgs/msg/CompressedImage). "
+            "type: names the message the topic carries."
+        )
+    if not isinstance(image["type"], str) or _image_message_paths(image["type"]) is None:
+        raise ValueError(
+            f"{where} sets image.field, which applies only to an image message "
+            "read by message path (sensor_msgs/msg/CompressedImage, "
+            "sensor_msgs/msg/Image, or a compressed-video type), not to "
+            f"image.type '{image['type']}'."
+        )
+
+
 def _spec_origin(spec: Any) -> str:
     """Human-readable "where did this come from" for a parsed spec.
 
@@ -1765,6 +1983,8 @@ def load_contract(path: Path | str) -> Contract:
                 "would like to hear about it — open an issue or a PR at "
                 "https://github.com/roboto-ai/roboto-physical-ai-actions"
             )
+        if image is not None:
+            _check_nested_image(it.get("key", "?"), image)
         is_image = image is not None
         selector = it.get("selector")
         topic, role = _topic_or_role(it, is_image=is_image)
@@ -1776,7 +1996,7 @@ def load_contract(path: Path | str) -> Contract:
             selector=selector,
             image=image,
             align=_as_align(it, fps=fps, is_image=is_image),
-            lerobot_names=_parse_lerobot_names(selector, it["key"]),
+            lerobot_names=_parse_lerobot_names(selector, it["key"], it["type"]),
             transforms=_parse_transforms(it),
             qos=_as_qos(it),
         )
@@ -1805,7 +2025,7 @@ def load_contract(path: Path | str) -> Contract:
             role=role,
             selector=selector,
             align=_as_align(it, fps=fps),
-            lerobot_names=_parse_lerobot_names(selector, it["key"]),
+            lerobot_names=_parse_lerobot_names(selector, it["key"], msg_type),
             transforms=_parse_transforms(it),
             qos=_as_qos(it),
             safety_behavior=safety_behavior,

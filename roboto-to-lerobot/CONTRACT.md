@@ -84,9 +84,9 @@ distinguished by whether an `image:` block is present:
 | `key`           | yes      | LeRobot feature key. Conventionally `observation.state`, `observation.images.<name>`, etc.                                                                |
 | `topic`         | one of   | ROS topic name. Mutually exclusive with `role`.                                                                                                           |
 | `role`          | one of   | Role label resolved against file metadata at runtime. See [Role-based binding](#role-based-binding). Not allowed for image streams.                       |
-| `type`          | yes      | Message type string used to dispatch the decoder. See [Supported message types](#supported-message-types).                                                |
+| `type`          | yes      | Message type the topic carries. Picks the decoder, except where `image.type` does. See [Supported message types](#supported-message-types).               |
 | `selector`      | no       | `{names: [...], lerobot_names: [...]}`. Selects which fields the decoder extracts. See [Selectors](#selectors-and-lerobot_names).                          |
-| `image`         | no       | Image / video options: `resize: [H, W]`. See [Video / image specs](#video--image-specs).                                                                  |
+| `image`         | no       | Image / video options: `resize: [H, W]`, and `field` and `type` for a nested image. See [Video / image specs](#video--image-specs).                       |
 | `align`         | no       | `{method, tolerance_ms}`. Defaults to `hold` with the auto-bounded tolerance (`max(2/fps, 50 ms)`). See [Alignment](#alignment).                           |
 | `transforms`    | no       | List of transforms applied to the stream. See [Transforms](#transforms).                                                                                   |
 
@@ -94,7 +94,9 @@ distinguished by whether an `image:` block is present:
 
 A spec under `observations:` becomes a video feature when it has an `image:`
 block. The output dtype is always `video` (HWC uint8 RGB at the configured
-resize).
+resize). Each frame read from an image or compressed-video message, nested
+ones included, is placed at the log time of that message: when it reached the
+recorder.
 
 ```yaml
 observations:
@@ -111,11 +113,69 @@ observations:
 | Field    | Required | Description                                                                                                                                                   |
 |----------|----------|---------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `resize` | yes      | `[height, width]` in pixels. Frames are resized to this exact shape.                                                                                          |
+| `field`  | no       | Message path of an image nested in a custom message. See [Images nested in a custom message](#images-nested-in-a-custom-message).                             |
+| `type`   | with `field` | Type of the image message at `field`. Required with `field`, rejected without it.                                                                         |
 
 Restrictions on image streams:
 
 - `align.method: linear` is rejected — use `hold` or `nearest`.
 - `role:` binding is not allowed; image streams must specify `topic:` literally.
+
+### Images nested in a custom message
+
+Some recordings publish no topic per camera. Instead, one custom message
+carries every camera, each as a whole image message in a field of its own.
+Point a spec at one of those fields with `image.field`, the message path of
+the nested image: field names joined by dots, as Roboto writes message paths.
+As on every spec, `type:` names what the topic carries, here the custom
+message. `image.type` names the image message at the path. Declare one spec
+per camera:
+
+```yaml
+observations:
+  - key: observation.images.front
+    topic: /robot/observation
+    type: my_robot_msgs/msg/Observation   # what the topic publishes
+    image:
+      field: cameras.front                    # message path of the nested image
+      type: sensor_msgs/msg/CompressedImage   # what sits at that path
+      resize: [480, 640]
+  - key: observation.images.wrist
+    topic: /robot/observation
+    type: my_robot_msgs/msg/Observation
+    image:
+      field: arm.cameras.wrist
+      type: sensor_msgs/msg/Image
+      resize: [480, 640]
+```
+
+Each nested image is decoded exactly as the same image would be if it were
+published on its own topic. The still images (`CompressedImage`, `Image`)
+nested in one topic are read with a single fetch of that topic. Each nested
+compressed-video stream is fetched and decoded on its own.
+
+`image.type` may be `sensor_msgs/msg/CompressedImage`, `sensor_msgs/msg/Image`
+or a [compressed-video type](#compressed-video), and may be written with or
+without `/msg/` (`sensor_msgs/CompressedImage` names the same type).
+File-backed video (`video`, `avi_video`, `mp4_video`) is read as whole frames
+rather than by message path, so it cannot be nested.
+
+Before it fetches any data, the converter checks each topic that a nested
+image is read from. The conversion fails, with an error that names the spec
+and the topic, if the topic breaks any of these rules:
+
+- the topic's recorded type must be the spec's `type`;
+- the type Roboto recorded at the path, if any, must be `image.type`;
+- the topic must have the nested image's message paths. If it lacks them, the
+  error lists the paths in that topic that have the fields of an `image.type`
+  message.
+
+`gen-node` supports nested images. The generated node subscribes to the topic
+with the custom message from `type:`, once for all the cameras nested in it,
+and decodes each camera from its path. The robot must have the package that
+defines the custom message installed, so that the node can import it. As for
+an image on its own topic, `gen-node` refuses a nested compressed-video
+stream.
 
 ## Action specs
 
@@ -191,12 +251,46 @@ Two rules to keep in mind:
 2. **`lerobot_names` is optional but strongly recommended.** Without it, the
    feature is labeled `<topic>/<selector_name>`, which is verbose and ties
    feature names to ROS topology. With it, you get clean LeRobot-facing names.
-   `lerobot_names` must have the same length as `names`, and every
-   `lerobot_name` must be unique across the entire contract.
+   With `names`, `lerobot_names` must have the same length as `names`, and
+   every `lerobot_name` must be unique across the entire contract.
 
 When multiple specs share a `key` (e.g., two `observation.state` entries from
 two arms), all `lerobot_names` from those specs are concatenated in order to
 form the names of the combined feature.
+
+### Labels by position
+
+Some messages carry no names to select by: a `JointState` whose `name` field
+is empty, or holds a single label that names no joint, or a
+`Float64MultiArray`. Without `names`, the decoder emits the whole vector (for
+`JointState`, every `position`), and `lerobot_names` alone labels it by
+position: the first name labels the first value, and so on.
+
+```yaml
+observations:
+  - key: observation.state
+    topic: /arm/joint_states        # JointState with an empty name field
+    type: sensor_msgs/msg/JointState
+    selector:
+      lerobot_names: [shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]
+```
+
+The names reach the dataset's `meta/info.json` as they would with `names`,
+including concatenation across specs that share a `key`, and must still be
+unique across the contract.
+
+- Every message must decode to exactly as many values as there are
+  `lerobot_names`. A message with more or fewer values fails the conversion,
+  and an observation message fails the live node too. The error names the
+  spec's key, its topic and both lengths, so no value is labelled wrongly.
+- Only types whose decoder, without `names`, emits numbers in an order the
+  message fixes accept labels by position: `JointState`, `JointTrajectory`,
+  `MultiDOFCommand`, `Imu`, `Odometry`, `Twist`, the `*MultiArray` and scalar
+  `std_msgs` types, `AnymalState` and `SeActuatorReadings`. The vector each
+  emits is described in [Numeric streams](#numeric-streams). The contract
+  loader refuses `lerobot_names` without `names` on any other type, such as
+  `std_msgs/msg/String`, `string_typed_msg` or an image.
+- To keep only some of the values, select them with `names`.
 
 ## Alignment
 
@@ -434,9 +528,11 @@ To use role binding end-to-end:
 
 ## Supported message types
 
-`type:` dispatches to a registered decoder. The selector semantics depend on
-the type — see below. To add a new decoder, register it in
-`src/roboto_to_lerobot/decoders.py` via `@register_decoder("type")`.
+`type:` dispatches to a registered decoder (`image.type` does, for an
+[image nested in a custom message](#images-nested-in-a-custom-message)). The
+selector semantics depend on the type — see below. To add a new decoder,
+register it in `src/roboto_to_lerobot/decoders.py` via
+`@register_decoder("type")`.
 
 ### Image / video
 
@@ -505,12 +601,19 @@ the error message will name the offending spec.
 - **`lerobot_names` must match `names` in length**, and every `lerobot_name`
   in the contract must be globally unique. Both errors name the offending
   spec(s) — a duplicate name names both conflicting specs (key + topic/role),
-  and a length mismatch prints both lists.
+  and a length mismatch prints both lists. Without `names`, `lerobot_names`
+  label values by position, which only some types accept — see
+  [Labels by position](#labels-by-position).
 - **`align.method`** must be one of `hold`, `nearest`, `linear`, `none`.
 - **`align.tolerance_ms: 0`** is rejected — see [Alignment](#alignment).
 - **Legacy `strategy`/`tol_ms` align keys and the nested `publish:` action
   form** are rejected — see [Alignment](#alignment) and
   [Action specs](#action-specs).
+- **`image.field` and `image.type`** must be set together. `image.field` must
+  be a message path (field names joined by dots), and `image.type` must name
+  an image or compressed-video message, not file-backed video (`video`,
+  `avi_video`, `mp4_video`) — see
+  [Images nested in a custom message](#images-nested-in-a-custom-message).
 - **An `image.depth:` block is rejected** — depth images are not supported
   yet; remove the block. If you need depth support, open an issue or a PR at
   [the repository](https://github.com/roboto-ai/roboto-physical-ai-actions).

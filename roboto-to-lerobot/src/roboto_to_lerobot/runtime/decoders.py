@@ -54,19 +54,22 @@ if TYPE_CHECKING:
 # For video decoders, ``msg`` is a pandas Series whose columns are whatever
 # ``DataCollection._load_videos`` produced for that message type — see
 # ``lerobot.generate_frames`` for how payload columns are plumbed through.
+# The CompressedImage and Image decoders also receive ROS message objects from
+# the live runtime (``LiveAdapter.on_message``), so they read every field
+# through :func:`_dot_get`, which accepts either shape.
 # Every video decoder MUST return an HWC uint8 RGB array.
 # =============================================================================
 
 
 @register_decoder("sensor_msgs/msg/CompressedImage", dtype="video")
 def _dec_compressed_image(msg: Any, spec: ObservationSpec) -> np.ndarray:
-    """Decode a sensor_msgs/CompressedImage (or file-backed video) row to HWC uint8 RGB.
+    """Decode a sensor_msgs/CompressedImage (or a file-backed video row) to HWC uint8 RGB.
 
-    Expects ``msg["data"]`` (raw encoded bytes) and ``msg["format"]``
-    (format hint such as ``"jpeg"`` or ``"png"`` — informational only,
-    cv2 auto-detects from magic bytes).
+    Expects ``data`` (raw encoded bytes) and ``format`` (format hint such as
+    ``"jpeg"`` or ``"png"`` — informational only, cv2 auto-detects from magic
+    bytes).
     """
-    return decompress_image(msg["data"], msg["format"])
+    return decompress_image(_dot_get(msg, "data"), _dot_get(msg, "format"))
 
 
 # File-backed video frames (``video`` / ``avi_video`` / ``mp4_video`` contract
@@ -139,16 +142,16 @@ def _TEMP_looks_like_compressed_image(data: bytes) -> bool:
 
 @register_decoder("sensor_msgs/msg/Image", dtype="video")
 def _dec_raw_image(msg: Any, spec: ObservationSpec) -> np.ndarray:
-    """Decode a raw sensor_msgs/Image row to HWC uint8 RGB.
+    """Decode a raw sensor_msgs/Image to HWC uint8 RGB.
 
-    Dispatches on ``msg["encoding"]``. Color encodings (rgb8/bgr8/mono8) are
+    Dispatches on the ``encoding`` field. Color encodings (rgb8/bgr8/mono8) are
     reshaped in place; depth encodings (mono16/16UC1/32FC1) are normalised to
     uint8 via the ``image.depth`` block on the contract spec.
     """
-    encoding = str(msg["encoding"])
-    height = int(msg["height"])
-    width = int(msg["width"])
-    data = msg["data"]
+    encoding = str(_dot_get(msg, "encoding"))
+    height = int(_dot_get(msg, "height"))
+    width = int(_dot_get(msg, "width"))
+    data = _dot_get(msg, "data")
 
     # ------------------- TEMP SDK workaround (depth only) --------------------
     # Remove this block when roboto Topic.get_data* can serve original bytes.
@@ -190,7 +193,7 @@ def _dec_raw_image(msg: Any, spec: ObservationSpec) -> np.ndarray:
 # =============================================================================
 
 
-@register_decoder("sensor_msgs/msg/JointState", dtype="float64")
+@register_decoder("sensor_msgs/msg/JointState", dtype="float64", positional=True)
 def _dec_joint_state(msg: Any, spec: ObservationSpec | ActionSpec) -> np.ndarray:
     """Decode sensor_msgs/JointState.
 
@@ -254,7 +257,7 @@ def _dec_joint_state(msg: Any, spec: ObservationSpec | ActionSpec) -> np.ndarray
 # =============================================================================
 
 
-@register_decoder("trajectory_msgs/msg/JointTrajectory", dtype="float64")
+@register_decoder("trajectory_msgs/msg/JointTrajectory", dtype="float64", positional=True)
 def _dec_joint_trajectory(msg: Any, spec: ActionSpec) -> dict:
     """Decode trajectory_msgs/JointTrajectory.
 
@@ -357,7 +360,7 @@ def _dec_joint_trajectory(msg: Any, spec: ActionSpec) -> dict:
 # =============================================================================
 
 
-@register_decoder("control_msgs/msg/MultiDOFCommand", dtype="float64")
+@register_decoder("control_msgs/msg/MultiDOFCommand", dtype="float64", positional=True)
 def _dec_multidof_command(msg: Any, spec: ObservationSpec) -> np.ndarray:
     """Decode control_msgs/MultiDOFCommand.
 
@@ -428,7 +431,7 @@ def _dot_get(obj: Any, path: str) -> Any:
 # =============================================================================
 
 
-@register_decoder("sensor_msgs/msg/Imu", dtype="float64")
+@register_decoder("sensor_msgs/msg/Imu", dtype="float64", positional=True)
 def _dec_imu(msg: Any, spec: ObservationSpec) -> np.ndarray:
     """Decode sensor_msgs/Imu.
 
@@ -461,7 +464,7 @@ def _dec_imu(msg: Any, spec: ObservationSpec) -> np.ndarray:
 # =============================================================================
 
 
-@register_decoder("nav_msgs/msg/Odometry", dtype="float64")
+@register_decoder("nav_msgs/msg/Odometry", dtype="float64", positional=True)
 def _dec_odometry(msg: Any, spec: ObservationSpec) -> np.ndarray:
     """Decode nav_msgs/Odometry.
 
@@ -490,7 +493,7 @@ def _dec_odometry(msg: Any, spec: ObservationSpec) -> np.ndarray:
 # =============================================================================
 
 
-@register_decoder("geometry_msgs/msg/Twist", dtype="float64")
+@register_decoder("geometry_msgs/msg/Twist", dtype="float64", positional=True)
 def _dec_twist(msg: Any, spec: ObservationSpec) -> np.ndarray:
     """Decode geometry_msgs/Twist.
 
@@ -514,19 +517,19 @@ def _dec_twist(msg: Any, spec: ObservationSpec) -> np.ndarray:
 # =============================================================================
 
 
-@register_decoder("std_msgs/msg/Float32MultiArray", dtype="float32")
+@register_decoder("std_msgs/msg/Float32MultiArray", dtype="float32", positional=True)
 def _dec_float32_array(msg: Any, spec: ObservationSpec) -> np.ndarray:
     """Decode std_msgs/Float32MultiArray to float32 array."""
     return np.asarray(msg.data, dtype=np.float32)
 
 
-@register_decoder("std_msgs/msg/Float64MultiArray", dtype="float64")
+@register_decoder("std_msgs/msg/Float64MultiArray", dtype="float64", positional=True)
 def _dec_float64_array(msg: Any, spec: ObservationSpec) -> np.ndarray:
     """Decode std_msgs/Float64MultiArray to float64 array."""
     return np.asarray(msg.data, dtype=np.float64)
 
 
-@register_decoder("std_msgs/msg/Int32MultiArray", dtype="int32")
+@register_decoder("std_msgs/msg/Int32MultiArray", dtype="int32", positional=True)
 def _dec_int32_array(msg: Any, spec: ObservationSpec) -> np.ndarray:
     """Decode std_msgs/Int32MultiArray to int32 array."""
     return np.asarray(msg.data, dtype=np.int32)
@@ -537,25 +540,25 @@ def _dec_int32_array(msg: Any, spec: ObservationSpec) -> np.ndarray:
 # =============================================================================
 
 
-@register_decoder("std_msgs/msg/Float32", dtype="float32")
+@register_decoder("std_msgs/msg/Float32", dtype="float32", positional=True)
 def _dec_float32(msg: Any, spec: ObservationSpec) -> np.ndarray:
     """Decode std_msgs/Float32 to float32 scalar."""
     return np.array([msg.data], dtype=np.float32)
 
 
-@register_decoder("std_msgs/msg/Float64", dtype="float64")
+@register_decoder("std_msgs/msg/Float64", dtype="float64", positional=True)
 def _dec_float64(msg: Any, spec: ObservationSpec) -> np.ndarray:
     """Decode std_msgs/Float64 to float64 scalar."""
     return np.array([msg.data], dtype=np.float64)
 
 
-@register_decoder("std_msgs/msg/Int32", dtype="int32")
+@register_decoder("std_msgs/msg/Int32", dtype="int32", positional=True)
 def _dec_int32(msg: Any, spec: ObservationSpec) -> np.ndarray:
     """Decode std_msgs/Int32 to int32 scalar."""
     return np.array([msg.data], dtype=np.int32)
 
 
-@register_decoder("std_msgs/msg/Int64", dtype="int64")
+@register_decoder("std_msgs/msg/Int64", dtype="int64", positional=True)
 def _dec_int64(msg: Any, spec: ObservationSpec) -> np.ndarray:
     """Decode std_msgs/Int64 to int64 scalar."""
     return np.array([msg.data], dtype=np.int64)
@@ -641,7 +644,7 @@ _ANYMAL_JOINT_ORDER = (
 _ANYMAL_STATE_JOINT_FIELDS = ("position", "velocity", "acceleration", "effort")
 
 
-@register_decoder("anymal_msgs/AnymalState", dtype="float64")
+@register_decoder("anymal_msgs/AnymalState", dtype="float64", positional=True)
 def _dec_anymal_state(msg: Any, spec: ObservationSpec | ActionSpec) -> np.ndarray:
     """Decode anymal_msgs/AnymalState joint fields.
 
@@ -713,7 +716,7 @@ def _read_nested(element: Any, path: str) -> Any:
     return element
 
 
-@register_decoder("series_elastic_actuator_msgs/SeActuatorReadings", dtype="float64")
+@register_decoder("series_elastic_actuator_msgs/SeActuatorReadings", dtype="float64", positional=True)
 def _dec_se_actuator_readings(msg: Any, spec: ObservationSpec | ActionSpec) -> np.ndarray:
     """Decode series_elastic_actuator_msgs/SeActuatorReadings.
 

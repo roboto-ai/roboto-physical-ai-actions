@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 from .alignment import merge_onto_timeline
-from .contract_utils import AlignSpec, fps_to_time_step_ns
+from .contract_utils import AlignSpec, fps_to_time_step_ns, image_message_type
 from .converters import DECODERS
 from .logger import logger
 from .runtime.image import resize_image
@@ -389,6 +389,7 @@ def generate_frames(
         # so the caller can decode after the payload crosses a process
         # boundary; otherwise decode inline here.
         for video in contract.videos:
+            decoder_type = image_message_type(video)
             payload_cols = video_payload_cols[video.key]
             payload = {orig: row[f"{orig}|{video.key}"] for orig in payload_cols}
 
@@ -408,16 +409,16 @@ def generate_frames(
                 )
                 frame_dict[video.key] = _DeferredFrame(
                     video_key=video.key,
-                    decoder_type=video.type,
+                    decoder_type=decoder_type,
                     payload=payload,
                     resize=resize,
                 )
                 continue
 
-            decoder = DECODERS.get(video.type)
+            decoder = DECODERS.get(decoder_type)
             if decoder is None:
                 raise ValueError(
-                    f"No video decoder registered for message type '{video.type}' "
+                    f"No video decoder registered for message type '{decoder_type}' "
                     f"(topic '{video.topic}')."
                 )
             image = decoder(pd.Series(payload), video)

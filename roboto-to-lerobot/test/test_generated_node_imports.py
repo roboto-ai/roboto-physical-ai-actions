@@ -30,8 +30,10 @@ from textwrap import dedent
 from typing import Any
 from unittest.mock import MagicMock
 
+import cv2
 import numpy as np
 import pytest
+from roboto_to_lerobot.codegen.cli import main as gen_node_main
 from roboto_to_lerobot.codegen.render import render_node
 from roboto_to_lerobot.runtime.contract_io import load_contract
 
@@ -52,6 +54,7 @@ class _FakeNode:
         self._name = name
         self._params: dict[str, Any] = {}
         self.subscriptions: list[tuple[str, Any]] = []
+        self.subscription_types: dict[str, Any] = {}
         self.publishers: dict[str, MagicMock] = {}
         self.timer_callback: Any = None
         self._clock_ns = 1_000_000_000  # arbitrary non-zero start
@@ -64,6 +67,7 @@ class _FakeNode:
 
     def create_subscription(self, msg_cls, topic, callback, qos):
         self.subscriptions.append((topic, callback))
+        self.subscription_types[topic] = msg_cls
 
     def create_publisher(self, msg_cls, topic, qos):
         pub = MagicMock()
@@ -413,3 +417,87 @@ def test_generated_node_handles_headerless_message_type(tmp_path):
         for name in installed_names:
             sys.modules.pop(name, None)
         sys.modules.pop("_headerless_generated_node", None)
+
+
+def test_gen_node_subscribes_once_with_the_custom_message_for_nested_cameras(tmp_path):
+    """gen-node accepts two cameras nested in one custom message. The node
+    subscribes to their topic once, with the custom message class, and one
+    message on that subscription reaches the policy as both camera frames."""
+    import hashlib
+    import json
+
+    # Arrange: fakes, plus the custom message package the robot would install.
+    installed_names = _install_rclpy_fakes()
+    custom_msgs_mod = types.ModuleType("custom_msgs")
+    custom_msgs_msg_mod = types.ModuleType("custom_msgs.msg")
+    custom_msgs_msg_mod.Observation = type("Observation", (_FakeMsg,), {})
+    for name, module in (("custom_msgs", custom_msgs_mod), ("custom_msgs.msg", custom_msgs_msg_mod)):
+        sys.modules[name] = module
+        installed_names.append(name)
+    try:
+        contract_path = tmp_path / "contract.yaml"
+        contract_path.write_text(dedent("""
+            name: nested
+            version: 1
+            fps: 30
+            observations:
+              - key: observation.images.front
+                topic: /robot/observation
+                type: custom_msgs/msg/Observation
+                image: {field: cameras.front, type: sensor_msgs/msg/CompressedImage, resize: [6, 8]}
+              - key: observation.images.wrist
+                topic: /robot/observation
+                type: custom_msgs/msg/Observation
+                image: {field: arm.cameras.wrist, type: sensor_msgs/msg/Image, resize: [6, 8]}
+            actions:
+              - key: action
+                topic: /teleop/action
+                type: sensor_msgs/msg/JointState
+                selector: {names: [j1, j2]}
+        """))
+        sha = hashlib.sha256(contract_path.read_bytes()).hexdigest()
+        manifest_path = tmp_path / "manifest.json"
+        manifest_path.write_text(json.dumps({"contract": {"sha256": sha}}))
+        out = tmp_path / "generated_node.py"
+        ok, front_png = cv2.imencode(".png", np.zeros((6, 8, 3), dtype=np.uint8))
+        assert ok
+        msg = types.SimpleNamespace(
+            cameras=types.SimpleNamespace(front=types.SimpleNamespace(format="png", data=front_png.tobytes())),
+            arm=types.SimpleNamespace(cameras=types.SimpleNamespace(wrist=types.SimpleNamespace(
+                height=6, width=8, encoding="rgb8", data=bytes(6 * 8 * 3),
+            ))),
+        )
+
+        # Act
+        code = gen_node_main([
+            "gen-node", str(contract_path),
+            "--policy-module", "fake_policies",
+            "--manifest", str(manifest_path),
+            "--out", str(out),
+        ])
+
+        # Assert
+        assert code == 0
+
+        # Act
+        spec = importlib.util.spec_from_file_location("_nested_generated_node", out)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        node = module.NestedInferenceNode()
+        node._on_robot_observation(msg)
+        node._on_tick()
+
+        # Assert
+        assert node.subscriptions == [("/robot/observation", node._on_robot_observation)]
+        assert node.subscription_types["/robot/observation"] is custom_msgs_msg_mod.Observation
+        assert len(node._policy.calls) == 1
+        front = node._policy.calls[0]["observation.images.front"]
+        wrist = node._policy.calls[0]["observation.images.wrist"]
+        assert (front.shape, front.dtype) == ((6, 8, 3), np.uint8)
+        assert (wrist.shape, wrist.dtype) == ((6, 8, 3), np.uint8)
+        node.publishers["/teleop/action"].publish.assert_called_once()
+    finally:
+        for name in installed_names:
+            sys.modules.pop(name, None)
+        sys.modules.pop("_nested_generated_node", None)
