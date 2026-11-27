@@ -17,7 +17,8 @@ the resulting frame list back to the main process, which serialises
 3. ``_worker_build_episode`` runs the full ``DataCollection`` +
    ``generate_frames`` pipeline with ``defer_image_decode=True``, so video
    keys travel back across IPC as ``_DeferredFrame`` sentinels carrying raw
-   encoded bytes rather than decoded HWC RGB arrays. The main process runs
+   encoded bytes, or for compressed video a reference into the episode's
+   packets, rather than decoded HWC RGB arrays. The main process runs
    ``materialize_deferred`` before each ``writer.add_frame`` call.
 
 Pickling raw bytes is far cheaper than pickling decoded numpy arrays, which

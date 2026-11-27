@@ -11,16 +11,30 @@ fails. lerobot 0.3.x writes each frame's image to a PNG, prints and ignores a
 failed write, then encodes the episode's video from the PNGs that exist, so
 after each save the adapter checks that every video holds as many frames as
 were added.
+
+Its ``add_frame`` also keeps lerobot 0.3.x's image queue bounded; see
+``_MAX_QUEUED_IMAGES``.
 """
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from ..logger import logger
 from .base import EpisodeWriteError
+
+# The most decoded camera images that lerobot 0.3.x's image writer holds in
+# its queue after ``add_frame`` hands it a frame's images, unless one frame
+# has more cameras than this. lerobot's queue is unbounded: when frames arrive
+# faster than its threads write PNGs, the images pile up in it, about 0.9 MB
+# for each 640x480 image. ``add_frame`` waits for room instead.
+_MAX_QUEUED_IMAGES = 64
+
+# How long ``add_frame`` sleeps between looks at a full image queue.
+_QUEUE_POLL_S = 0.005
 
 
 class LeRobotWriter:
@@ -87,6 +101,13 @@ class LeRobotWriter:
         return {}
 
     def add_frame(self, frame: dict[str, Any], task: str) -> None:
+        image_writer = self._dataset.image_writer
+        if image_writer is not None:
+            # A frame with more cameras than the bound waits for an empty queue;
+            # a negative limit would make it wait forever.
+            limit = max(_MAX_QUEUED_IMAGES - len(self._dataset.meta.camera_keys), 0)
+            while image_writer.queue.qsize() > limit:
+                time.sleep(_QUEUE_POLL_S)
         # 0.3.x: ``task`` must be passed as a kwarg, not as a frame key.
         frame_no_task = {k: v for k, v in frame.items() if k != "task"}
         self._dataset.add_frame(frame_no_task, task=task)

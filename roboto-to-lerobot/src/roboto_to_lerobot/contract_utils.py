@@ -45,9 +45,9 @@ from .extract import (
 from .video import (
     COMPRESSED_VIDEO_MESSAGE_PATHS,
     COMPRESSED_VIDEO_SCHEMAS,
-    decode_video_stream_rows,
     is_compressed_video_schema,
     is_compressed_video_topic,
+    probe_video_stream_rows,
 )
 
 # Maximum threads per ``DataCollection`` for in-event topic fetches. Each
@@ -92,32 +92,17 @@ def _empty_video_df() -> pd.DataFrame:
 
 
 def _empty_video_stream_df() -> pd.DataFrame:
-    """Empty compressed-video DataFrame: one already-decoded ``frame`` per row.
+    """Empty compressed-video DataFrame: one ``frame`` reference per row.
 
-    Compressed-video streams are decoded a whole range at a time (see
-    :py:mod:`roboto_to_lerobot.video`), so their loaded shape carries decoded
-    HWC uint8 RGB arrays rather than the encoded ``format``/``data`` pair the
-    per-message image paths carry.
+    Compressed-video streams are probed a whole range at a time (see
+    :py:mod:`roboto_to_lerobot.video`), so their loaded shape carries a
+    ``VideoFrameRef`` per frame rather than the encoded ``format``/``data``
+    pair the per-message image paths carry.
     """
     return pd.DataFrame({
         "timestamp": pd.Series([], dtype="int64"),
         "frame":     pd.Series([], dtype="object"),
     })
-
-
-def image_resize(spec: ObservationSpec) -> tuple[int, int] | None:
-    """The ``(height, width)`` an image/video spec's frames must be resized to, if any.
-
-    Returns the contract's values verbatim, deliberately: the compressed-video
-    path resizes at decode time to bound memory, and ``lerobot.generate_frames``
-    resizes again just before ``add_frame`` reading ``image["resize"]`` directly.
-    The second call is a no-op only because both see the same target shape, so
-    this must not normalise what the other side does not.
-    """
-    if spec.image and "resize" in spec.image:
-        height, width = spec.image["resize"]
-        return height, width
-    return None
 
 
 def image_field(spec: ObservationSpec) -> str | None:
@@ -190,7 +175,7 @@ def video_spec_kind(video: ObservationSpec, topic_list: list[Any]) -> str:
     - ``video_file`` — file-backed video (``video``/``avi_video``/``mp4_video``);
       ``topic.get_data()`` yields one still frame per message.
     - ``video_stream`` — compressed video (``foxglove_msgs/msg/CompressedVideo``
-      and friends); a whole range is GOP-decoded at fetch time.
+      and friends); a whole range is probed at fetch time and decoded at write time.
     - ``video_msgs`` — per-message stills (``CompressedImage``, ``Image``).
 
     For an image nested in a custom message, the camera message's type
@@ -988,17 +973,16 @@ class _TopicWorkItem(NamedTuple):
 
     ``spec_kind`` selects which fetch shape applies (see :data:`_FETCH_SHAPE`):
     ``"video_file"`` calls ``topic.get_data()`` and yields per-frame rows,
-    ``"video_stream"`` GOP-decodes a compressed-video range into decoded-frame
+    ``"video_stream"`` probes a compressed-video range into frame-reference
     rows, and everything else calls ``topic.get_data_as_df`` and returns the
     (timestamp-normalised) DataFrame. ``submission_idx`` is a monotonic counter
     assigned in source-order so the fan-out step can reassemble results in
     deterministic source-order — that order is the stable-sort tie-break that
     keeps the post-fetch ``pd.concat`` bit-stable across runs.
 
-    ``resize`` is only set for ``video_stream`` items, whose decode step resizes
-    frames as it produces them. ``field`` is the spec's ``image.field``, the
-    message path of a camera message nested in each message; the spec receives
-    that camera message's fields as if they were top-level.
+    ``field`` is the spec's ``image.field``, the message path of a camera
+    message nested in each message; the spec receives that camera message's
+    fields as if they were top-level.
     """
     spec_kind: Literal["observation", "video_msgs", "video_file", "video_stream", "action", "task"]
     spec_key: str
@@ -1008,7 +992,6 @@ class _TopicWorkItem(NamedTuple):
     end_ns: int
     message_paths_include: list[str] | None
     submission_idx: int
-    resize: tuple[int, int] | None = None
     field: str | None = None
 
 
@@ -1044,11 +1027,12 @@ def _fetch_one(item: _TopicWorkItem) -> Any:
     For ``video_file`` specs the SDK returns ``(timestamp, content_dict)``
     tuples; we eagerly materialise them into ``{timestamp, format, data}``
     row dicts so the result is safe to share across threads and across the
-    later fan-out step. ``video_stream`` specs GOP-decode the range into
-    ``{timestamp, frame}`` row dicts — compressed video has no per-message
-    decode, so the decode has to happen where a whole range is in hand. For
-    every other ``spec_kind`` the result is the DataFrame from
-    ``get_data_as_df``, normalised to int64 ns timestamps.
+    later fan-out step. ``video_stream`` specs probe the range into
+    ``{timestamp, frame}`` row dicts whose ``frame`` is a ``VideoFrameRef``;
+    compressed video cannot be decoded one message at a time, so the probe
+    runs here, where the whole range is in hand. For every other
+    ``spec_kind`` the result is the DataFrame from ``get_data_as_df``,
+    normalised to int64 ns timestamps.
     """
     from .logger import logger
 
@@ -1056,12 +1040,11 @@ def _fetch_one(item: _TopicWorkItem) -> Any:
     end_time = pd.Timestamp(item.end_ns, unit="ns")
 
     if item.spec_kind == "video_stream":
-        return decode_video_stream_rows(
+        return probe_video_stream_rows(
             item.topic,
             item.start_ns,
             item.end_ns,
             topic_name=item.topic_name,
-            resize=item.resize,
             field=item.field,
         )
 
@@ -1113,11 +1096,11 @@ def _run_topic_fetches(
     """Fetch every work item concurrently and bucket by ``(spec_kind, spec_key)``.
 
     Items sharing ``(topic_id, start_ns, end_ns, sorted(message_paths), fetch
-    shape, resize)`` collapse to a single fetch whose result fans out to every
+    shape)`` collapse to a single fetch whose result fans out to every
     requester — catches the pathological case of two specs pinned to the same
-    topic without paying for it in the common case. The shape and resize are
-    part of the key because they change what the fetch *returns*: a DataFrame,
-    encoded-image rows, or decoded frames at a particular resolution.
+    topic without paying for it in the common case. The shape is part of the
+    key because it changes what the fetch *returns*: a DataFrame,
+    encoded-image rows, or compressed-video frame references.
 
     The key has no ``field``. A nested compressed-video item's message paths
     already start with its field, so items at different fields never share a
@@ -1142,7 +1125,6 @@ def _run_topic_fetches(
             it.end_ns,
             tuple(sorted(it.message_paths_include or ())),
             _FETCH_SHAPE.get(it.spec_kind, "dataframe"),
-            it.resize,
         )
 
     unique: dict[tuple, _TopicWorkItem] = {}
@@ -1286,7 +1268,7 @@ class DataCollection:
         work_list: list[_TopicWorkItem] = []
         submission_idx = 0
 
-        def _append(spec_kind, spec_key, topic_name, topic_list, message_paths, resize=None, field=None):
+        def _append(spec_kind, spec_key, topic_name, topic_list, message_paths, field=None):
             nonlocal submission_idx
             for topic in topic_list:
                 if not _topic_intersects_window(topic, start_time_ns, end_time_ns):
@@ -1300,7 +1282,6 @@ class DataCollection:
                     end_ns=end_time_ns,
                     message_paths_include=message_paths,
                     submission_idx=submission_idx,
-                    resize=resize,
                     field=field,
                 ))
                 submission_idx += 1
@@ -1337,9 +1318,7 @@ class DataCollection:
             elif field is not None:
                 paths = [f"{field}.{path}" for path in paths]
             _append(
-                spec_kind, video.key, video.topic, video_topics, paths,
-                resize=image_resize(video) if spec_kind == "video_stream" else None,
-                field=field,
+                spec_kind, video.key, video.topic, video_topics, paths, field=field,
             )
 
         for action in contract.actions:
@@ -1524,8 +1503,9 @@ class DataCollection:
         Routes on :func:`video_spec_kind`:
           - ``video_file`` → rows flattened from ``topic.get_data()`` tuples in
             the fetch step (``video`` / ``avi_video`` / ``mp4_video``).
-          - ``video_stream`` → already-decoded ``{timestamp, frame}`` rows from
-            the compressed-video GOP decode in the fetch step.
+          - ``video_stream`` → ``{timestamp, frame}`` rows from the
+            compressed-video probe in the fetch step, ``frame`` a
+            ``VideoFrameRef``.
           - ``video_msgs`` → the structured message-path DataFrame
             (``CompressedImage``, ``Image``).
         """
@@ -1557,7 +1537,7 @@ class DataCollection:
                             "No compressed-video frames in range for topic: %s", video.topic,
                         )
                     logger.debug(
-                        "Decoded %d frames from %s (compressed video)",
+                        "Probed %d frames from %s (compressed video)",
                         len(data), video.topic,
                     )
                 else:

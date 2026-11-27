@@ -1,11 +1,13 @@
-"""Tests that the v2_1 writer saves every episode whole, or fails.
+"""Tests that the v2_1 writer saves every episode whole, or fails, and bounds
+the images it holds.
 
 They drive the real lerobot 0.3.x writer and video encoding on a tiny
-camera, and make one step of a save fail.
+camera, and make one step of a save fail or slow down.
 """
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +21,10 @@ if not hasattr(lerobot_dataset, "LeRobotDatasetMetadata") or hasattr(
     pytest.skip("needs lerobot 0.3.x", allow_module_level=True)
 
 from roboto_to_lerobot.writers.base import EpisodeWriteError  # noqa: E402
-from roboto_to_lerobot.writers.v2_1 import LeRobotWriter  # noqa: E402
+from roboto_to_lerobot.writers.v2_1 import (  # noqa: E402
+    _MAX_QUEUED_IMAGES,
+    LeRobotWriter,
+)
 
 _CAM = "observation.images.cam"
 _FEATURES = {
@@ -76,3 +81,35 @@ def test_save_failing_after_video_fails_save(tmp_path, monkeypatch):
     # Act / Assert
     with pytest.raises(EpisodeWriteError):
         writer.save_episode()
+
+
+def test_image_queue_stays_bounded_when_writing_lags(tmp_path, monkeypatch):
+    """Frames arriving faster than lerobot 0.3.x writes their PNGs wait for room
+    instead of piling up decoded in its image queue."""
+    # Arrange: a slow PNG write, and a record of the queue's length after every
+    # image is put on it (``finalize`` puts one ``None`` per thread to stop them).
+    stock_save = PIL.Image.Image.save
+
+    def slow_save(self, fp, *args, **kwargs):
+        time.sleep(0.05)
+        return stock_save(self, fp, *args, **kwargs)
+
+    monkeypatch.setattr(PIL.Image.Image, "save", slow_save)
+    writer = _writer(tmp_path / "ds")
+    queue = writer._dataset.image_writer.queue
+    lengths: list[int] = []
+    stock_put = queue.put
+
+    def put(item, *args, **kwargs):
+        stock_put(item, *args, **kwargs)
+        if item is not None:
+            lengths.append(queue.qsize())
+
+    monkeypatch.setattr(queue, "put", put)
+
+    # Act
+    _add_frames(writer, 3 * _MAX_QUEUED_IMAGES)
+    writer.finalize()
+
+    # Assert
+    assert max(lengths) <= _MAX_QUEUED_IMAGES

@@ -1,4 +1,4 @@
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -11,6 +11,7 @@ from .converters import DECODERS
 from .logger import logger
 from .runtime.image import resize_image
 from .transforms import apply_transforms
+from .video import VideoFrameReader, VideoFrameRef
 
 if TYPE_CHECKING:
     from .contract_utils import Contract, DataCollection, ObservationSpec
@@ -23,7 +24,9 @@ class _DeferredFrame:
     Encoded bytes pickle far more compactly than decoded HWC arrays, so when
     frame generation runs in a worker process the video entries travel as
     these sentinels and the consumer decodes (and optionally resizes) on the
-    receiving side just before ``writer.add_frame``.
+    receiving side just before ``writer.add_frame``. A compressed-video
+    entry's payload is ``{"frame": VideoFrameRef}``, whose session carries
+    the packets to decode it from.
     """
 
     video_key: str
@@ -32,27 +35,61 @@ class _DeferredFrame:
     resize: tuple[int, int] | None
 
 
+def episode_video_reader(frames: Iterable[dict[str, Any] | None]) -> VideoFrameReader:
+    """A ``VideoFrameReader`` for every compressed-video frame the deferred ``frames`` refer to.
+
+    Build it from the whole episode before materializing any of its frames:
+    the reader keeps a decoded frame only while a later frame still refers
+    to it, so it must know every reference up front.
+    """
+    return VideoFrameReader(
+        value.payload["frame"]
+        for frame in frames
+        if frame is not None
+        for value in frame.values()
+        if isinstance(value, _DeferredFrame) and isinstance(value.payload.get("frame"), VideoFrameRef)
+    )
+
+
 def materialize_deferred(
     frame: dict[str, Any],
     video_specs_by_key: dict[str, "ObservationSpec"],
+    video_reader: VideoFrameReader | None = None,
 ) -> dict[str, Any]:
     """Decode (and optionally resize) every ``_DeferredFrame`` in ``frame``.
 
     Mutates ``frame`` in place. Entries that are not deferred pass through
     untouched, so it is safe to call on frames produced without
     ``defer_image_decode``.
+
+    A compressed-video entry is read from ``video_reader``, built by
+    :func:`episode_video_reader` over the episode's frames; every other entry
+    goes through the decoder registered for its message type.
+
+    Raises:
+        ValueError: If no decoder is registered for an entry's message type,
+            or an entry refers to a compressed-video frame and no
+            ``video_reader`` is given.
     """
     for key, val in list(frame.items()):
         if not isinstance(val, _DeferredFrame):
             continue
-        decoder = DECODERS.get(val.decoder_type)
-        if decoder is None:
-            raise ValueError(
-                f"No video decoder registered for message type "
-                f"'{val.decoder_type}' (video key '{val.video_key}')."
-            )
-        spec = video_specs_by_key[val.video_key]
-        image = decoder(pd.Series(val.payload), spec)
+        ref = val.payload.get("frame")
+        if isinstance(ref, VideoFrameRef):
+            if video_reader is None:
+                raise ValueError(
+                    f"Video key '{val.video_key}' refers to a compressed-video frame, which needs "
+                    "the episode's video reader to decode."
+                )
+            image = video_reader.frame(ref)
+        else:
+            decoder = DECODERS.get(val.decoder_type)
+            if decoder is None:
+                raise ValueError(
+                    f"No video decoder registered for message type "
+                    f"'{val.decoder_type}' (video key '{val.video_key}')."
+                )
+            image = decoder(pd.Series(val.payload), video_specs_by_key[val.video_key])
         if val.resize is not None:
             expected_h, expected_w = val.resize
             image = resize_image(image, expected_h, expected_w)
@@ -343,6 +380,20 @@ def generate_frames(
             rows_after,
         )
 
+    # Without ``defer_image_decode`` each frame is decoded as it is yielded,
+    # so the compressed-video reader is built now, from every reference the
+    # remaining rows hold.
+    video_reader = None
+    if not defer_image_decode:
+        video_reader = VideoFrameReader(
+            value
+            for video_key, payload_cols in video_payload_cols.items()
+            for col in payload_cols
+            for value in merged_df[f"{col}|{video_key}"]
+            if isinstance(value, VideoFrameRef)
+        )
+    video_specs_by_key = {video.key: video for video in contract.videos}
+
     # ── yield one frame dict per row ─────────────────────────────────────────
     frame_count = 0
     for _, row in merged_df.iterrows():
@@ -384,57 +435,35 @@ def generate_frames(
             if all_values:
                 frame_dict[base_key] = np.array(all_values, dtype=np.float32)
 
-        # Each video becomes one entry under its contract key. When
-        # ``defer_image_decode`` is set, emit a ``_DeferredFrame`` sentinel
-        # so the caller can decode after the payload crosses a process
-        # boundary; otherwise decode inline here.
+        # Each video becomes one ``_DeferredFrame`` under its contract key,
+        # so the caller can decode it after the frame crosses a process
+        # boundary (``defer_image_decode``); otherwise it is decoded here,
+        # through the same ``materialize_deferred``.
         for video in contract.videos:
             decoder_type = image_message_type(video)
             payload_cols = video_payload_cols[video.key]
             payload = {orig: row[f"{orig}|{video.key}"] for orig in payload_cols}
-
-            if defer_image_decode:
-                # Payloads must be picklable to survive IPC. Arrow-backed
-                # pandas reads can hand back ``memoryview`` (not picklable),
-                # so coerce buffer-like cells to ``bytes`` up front rather
-                # than failing opaquely at ``pool.submit`` time.
-                payload = {
-                    k: bytes(v) if isinstance(v, (memoryview, bytearray)) else v
-                    for k, v in payload.items()
-                }
-                resize = (
-                    tuple(video.image["resize"])
-                    if video.image and "resize" in video.image
-                    else None
-                )
-                frame_dict[video.key] = _DeferredFrame(
-                    video_key=video.key,
-                    decoder_type=decoder_type,
-                    payload=payload,
-                    resize=resize,
-                )
-                continue
-
-            decoder = DECODERS.get(decoder_type)
-            if decoder is None:
-                raise ValueError(
-                    f"No video decoder registered for message type '{decoder_type}' "
-                    f"(topic '{video.topic}')."
-                )
-            image = decoder(pd.Series(payload), video)
-
-            if video.image and "resize" in video.image:
-                expected_h, expected_w = video.image["resize"]
-                # Guard is logging-only: resize_image no-ops on a shape match,
-                # so the resize itself runs unconditionally below.
-                if image.shape[:2] != (expected_h, expected_w):
-                    logger.debug(
-                        "Resizing %s from %s to (%d, %d)",
-                        video.key, image.shape, expected_h, expected_w,
-                    )
-                image = resize_image(image, expected_h, expected_w)
-
-            frame_dict[video.key] = image
+            # Payloads must be picklable to survive IPC. Arrow-backed
+            # pandas reads can hand back ``memoryview`` (not picklable),
+            # so coerce buffer-like cells to ``bytes`` up front rather
+            # than failing opaquely at ``pool.submit`` time.
+            payload = {
+                k: bytes(v) if isinstance(v, (memoryview, bytearray)) else v
+                for k, v in payload.items()
+            }
+            resize = (
+                tuple(video.image["resize"])
+                if video.image and "resize" in video.image
+                else None
+            )
+            frame_dict[video.key] = _DeferredFrame(
+                video_key=video.key,
+                decoder_type=decoder_type,
+                payload=payload,
+                resize=resize,
+            )
+        if not defer_image_decode:
+            materialize_deferred(frame_dict, video_specs_by_key, video_reader)
 
         frame_dict["task"] = task
 

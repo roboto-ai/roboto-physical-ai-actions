@@ -57,7 +57,7 @@ from .event_worker import (
     _worker_init,
     topic_descriptors_from_topics,
 )
-from .lerobot import generate_frames, materialize_deferred
+from .lerobot import episode_video_reader, generate_frames, materialize_deferred
 from .logger import logger
 from .merge_v21 import merge_v21_entries
 from .output_publish import parse_tags, publish_tagged_output
@@ -626,11 +626,13 @@ def _drain_one_episode(
     # its decoded images are freed once the writer is done with them rather
     # than when the episode ends: a minute of one 1080p camera at 30 fps is
     # about 11 GB decoded. The caller still holds the episode, so the list
-    # itself must let go of the frames.
+    # itself must let go of the frames. Compressed video is decoded here, a
+    # few frames ahead of the writer, by one reader over the whole episode.
     frames = episode.frames
+    video_reader = episode_video_reader(frames)
     for i, frame in enumerate(frames):
         frames[i] = None
-        materialize_deferred(frame, video_specs_by_key)
+        materialize_deferred(frame, video_specs_by_key, video_reader)
         writer.add_frame(frame, task=episode.task_label)
     frame_count = len(frames)
     writer.save_episode()
@@ -2138,9 +2140,7 @@ def main(context: roboto.InvocationContext) -> None:
             ref_ts=preloaded_ref_ts,
         )
         # Free the first event's fetched data now rather than after the whole
-        # drain. The preloaded episode keeps only the values its frames use,
-        # and once nothing else holds the video decoded at fetch time, the
-        # drain frees each of those frames as it writes it.
+        # drain. The preloaded episode keeps only the values its frames use.
         del first_data
         if preloaded_episode is None:
             pool_tasks.append(EventTask(

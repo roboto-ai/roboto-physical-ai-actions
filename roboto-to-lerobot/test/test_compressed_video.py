@@ -3,9 +3,14 @@
 Compressed video is the one camera representation that cannot be decoded one
 message at a time: each message is a single H.264 access unit, and a delta
 frame only decodes after the keyframe that opens its GOP. These tests exercise
-that decode for real — real H.264 bitstreams produced by PyAV's libx264, fed
+that decode for real — real bitstreams produced by PyAV's encoders, fed
 through the real SDK decoder — because a fake around the decoder would test
 nothing about the property that makes this hard.
+
+The worker only probes a range (which frames decode) and ships its packets;
+the writer decodes them again. The identity tests below check that the writer
+receives the same frames, pixels and dropped frames as from a collection
+holding every frame of the range decoded up front.
 
 The fixtures are encoded in-process rather than committed: ``test/fixtures/``
 is gitignored in this repo, and an in-process encode lets a test dial GOP
@@ -16,13 +21,20 @@ REASSEMBLE recording when one is present on the machine.
 
 from __future__ import annotations
 
+import copy
 import os
-from dataclasses import dataclass, field
+import pickle
+import tracemalloc
+from dataclasses import dataclass, field, replace
+from fractions import Fraction
+from functools import cache
+from types import SimpleNamespace
 
 import av
 import numpy as np
 import pandas as pd
 import pytest
+from roboto.experimental.video import decode_frames_in_range, resolve_codec
 from roboto.experimental.video.h264 import NalUnitType, find_nal_units, is_keyframe
 from roboto_to_lerobot.contract_utils import (
     AlignSpec,
@@ -31,12 +43,17 @@ from roboto_to_lerobot.contract_utils import (
     ObservationSpec,
     video_spec_kind,
 )
+from roboto_to_lerobot.event_worker import WorkerEpisode
 from roboto_to_lerobot.lerobot import generate_frames
+from roboto_to_lerobot.main import _drain_one_episode, _DrainAccum
 from roboto_to_lerobot.runtime.converters import DECODERS
 from roboto_to_lerobot.video import (
-    decode_video_stream_rows,
+    MAX_HELD_FRAMES,
+    VideoFrameReader,
+    VideoFrameRef,
     is_compressed_video_schema,
     is_compressed_video_topic,
+    probe_video_stream_rows,
 )
 
 COMPRESSED_VIDEO = "foxglove_msgs/msg/CompressedVideo"
@@ -69,25 +86,38 @@ def _encode_h264_access_units(
     framing, parameter sets in-band at every keyframe, and no B-frames (``bf=0``)
     — the Foxglove CompressedVideo spec forbids them.
     """
-    codec_context = av.CodecContext.create("libx264", "w")
+    return _encode_access_units(
+        "libx264", frame_count, gop=gop, width=width, height=height,
+        options={"bf": "0", "tune": "zerolatency", "preset": "ultrafast"},
+    )
+
+
+def _encode_access_units(
+    encoder: str,
+    frame_count: int,
+    *,
+    gop: int,
+    options: dict[str, str],
+    width: int = 64,
+    height: int = 48,
+) -> list[bytes]:
+    """Encode a moving test pattern with PyAV's ``encoder``, one packet per frame."""
+    codec_context = av.CodecContext.create(encoder, "w")
     codec_context.width = width
     codec_context.height = height
     codec_context.pix_fmt = "yuv420p"
     codec_context.gop_size = gop
-    codec_context.options = {
-        "g": str(gop),
-        "bf": "0",
-        "tune": "zerolatency",
-        "preset": "ultrafast",
-    }
+    codec_context.time_base = Fraction(1, 30)
+    codec_context.options = {"g": str(gop), **options}
 
     access_units: list[bytes] = []
     for i in range(frame_count):
         pattern = np.zeros((height, width, 3), dtype=np.uint8)
         pattern[:, :, 0] = (i * 20) % 256
         pattern[:, : width // 2, 1] = 200
-        frame = av.VideoFrame.from_ndarray(pattern, format="rgb24")
-        for packet in codec_context.encode(frame.reformat(format="yuv420p")):
+        frame = av.VideoFrame.from_ndarray(pattern, format="rgb24").reformat(format="yuv420p")
+        frame.pts = i
+        for packet in codec_context.encode(frame):
             access_units.append(bytes(packet))
     for packet in codec_context.encode(None):
         access_units.append(bytes(packet))
@@ -167,16 +197,18 @@ def test_chunk_starting_on_a_keyframe_decodes_standalone():
     """
     topic = _topic_with(_encode_h264_access_units(12, gop=4))
 
-    rows = decode_video_stream_rows(
+    rows = probe_video_stream_rows(
         topic, topic.start_time, topic.end_time, topic_name=topic.name
     )
 
     assert len(rows) == 12
     assert [row["timestamp"] for row in rows] == [m[0] for m in topic.messages]
     assert topic.requested_ranges == [(topic.start_time, topic.end_time)]
+    reader = VideoFrameReader(row["frame"] for row in rows)
     for row in rows:
-        assert row["frame"].shape == (48, 64, 3)
-        assert row["frame"].dtype == np.uint8
+        image = reader.frame(row["frame"])
+        assert image.shape == (48, 64, 3)
+        assert image.dtype == np.uint8
 
 
 def test_range_starting_mid_gop_decodes_by_walking_back_to_the_keyframe():
@@ -189,7 +221,7 @@ def test_range_starting_mid_gop_decodes_by_walking_back_to_the_keyframe():
     mid_gop_start = topic.messages[6][0]
     assert not is_keyframe(topic.messages[6][2]), "fixture must start mid-GOP"
 
-    rows = decode_video_stream_rows(
+    rows = probe_video_stream_rows(
         topic, mid_gop_start, topic.end_time, topic_name=topic.name
     )
 
@@ -199,22 +231,11 @@ def test_range_starting_mid_gop_decodes_by_walking_back_to_the_keyframe():
     assert lookback_start < mid_gop_start and lookback_end == mid_gop_start
 
 
-def test_frames_are_resized_at_decode_time_when_the_contract_asks():
-    """``resize`` is honoured where the frames are produced, to bound memory."""
-    topic = _topic_with(_encode_h264_access_units(8, gop=4))
-
-    rows = decode_video_stream_rows(
-        topic, topic.start_time, topic.end_time, topic_name=topic.name, resize=(24, 32)
-    )
-
-    assert all(row["frame"].shape == (24, 32, 3) for row in rows)
-
-
 def test_empty_range_yields_no_rows_rather_than_failing():
     """A topic with no messages in range is an ordinary empty episode, not an error."""
     topic = _topic_with(_encode_h264_access_units(4, gop=4))
 
-    rows = decode_video_stream_rows(
+    rows = probe_video_stream_rows(
         topic, topic.end_time + 10**9, topic.end_time + 2 * 10**9, topic_name=topic.name
     )
 
@@ -236,7 +257,7 @@ def test_keyframe_beyond_the_lookback_bound_fails_loudly():
     assert not any(is_keyframe(data) for _, _, data in topic.messages[3:])
 
     with pytest.raises(ValueError, match="none decoded"):
-        decode_video_stream_rows(
+        probe_video_stream_rows(
             topic,
             mid_gop_start,
             topic.end_time,
@@ -257,7 +278,7 @@ def test_frames_before_an_out_of_reach_keyframe_are_dropped_and_reported(caplog)
     mid_gop_start = topic.messages[5][0]
 
     with caplog.at_level("WARNING"):
-        rows = decode_video_stream_rows(
+        rows = probe_video_stream_rows(
             topic,
             mid_gop_start,
             topic.end_time,
@@ -274,7 +295,7 @@ def test_unsupported_codec_is_rejected_by_name():
     topic = _topic_with(_encode_h264_access_units(4, gop=4), codec="mjpeg")
 
     with pytest.raises(ValueError, match="unsupported codec 'mjpeg'") as excinfo:
-        decode_video_stream_rows(
+        probe_video_stream_rows(
             topic, topic.start_time, topic.end_time, topic_name=topic.name
         )
 
@@ -295,7 +316,7 @@ def test_stream_missing_in_band_parameter_sets_fails_loudly():
     topic = _topic_with(stripped)
 
     with pytest.raises(ValueError, match="in-band parameter sets"):
-        decode_video_stream_rows(
+        probe_video_stream_rows(
             topic, topic.start_time, topic.end_time, topic_name=topic.name
         )
 
@@ -471,35 +492,250 @@ def test_compressed_video_topic_becomes_rgb_frames_on_the_reference_timeline():
         assert frame["task"] == "pick"
 
 
-def test_deferred_decode_round_trip_yields_the_same_frames():
-    """The worker/main-process split (``defer_image_decode``) is unaffected.
+# ── decoding in the writer: identity with frames decoded up front ───────────
 
-    Compressed video arrives pre-decoded, so its deferred payload is an array
-    rather than encoded bytes; ``materialize_deferred`` must still resolve it
-    through the registry to the same image.
+
+def _flip_bits(data: bytes) -> bytes:
+    damaged = bytearray(data)
+    for i in range(8, len(damaged), 5):
+        damaged[i] ^= 0xFF
+    return bytes(damaged)
+
+
+@cache
+def _h264(*, bframes: int) -> tuple[bytes, ...]:
+    options = {"bf": str(bframes), "preset": "ultrafast"}
+    if not bframes:
+        options["tune"] = "zerolatency"
+    return tuple(_encode_access_units("libx264", 40, gop=8, options=options))
+
+
+@cache
+def _h265() -> tuple[bytes, ...]:
+    options = {"preset": "ultrafast", "x265-params": "bframes=0:repeat-headers=1:log-level=none"}
+    return tuple(_encode_access_units("libx265", 40, gop=8, options=options))
+
+
+@cache
+def _h265_deep_bframes() -> tuple[bytes, ...]:
+    """H.265 in runs of 16 consecutive B-frames, the most x265 will encode."""
+    params = "bframes=16:b-pyramid=1:b-adapt=0:repeat-headers=1:log-level=none"
+    return tuple(_encode_access_units("libx265", 60, gop=30, options={"preset": "medium", "x265-params": params}))
+
+
+@cache
+def _vp9() -> tuple[bytes, ...]:
+    options = {"deadline": "realtime", "cpu-used": "8", "lag-in-frames": "0"}
+    return tuple(_encode_access_units("libvpx-vp9", 40, gop=8, options=options))
+
+
+def _replace_message(messages: list, index: int, data: bytes) -> list:
+    log_time, token, _ = messages[index]
+    return [*messages[:index], (log_time, token, data), *messages[index + 1:]]
+
+
+# Each case: the topic's messages and the index of the message the episode's
+# range starts at. GOPs are 8 frames long, so index 11 is mid-GOP and message
+# 16 opens the third GOP. The stream with 16 B-frames has 30-frame GOPs, so that
+# a full run of B-frames fits in one; its index 11 is mid-GOP too.
+_STREAMS = {
+    "h264, starts on a keyframe": lambda: (_messages(list(_h264(bframes=0))), 0),
+    "h264, starts mid-GOP": lambda: (_messages(list(_h264(bframes=0))), 11),
+    "h264 with B-frames": lambda: (_messages(list(_h264(bframes=2))), 11),
+    "h265": lambda: (_messages(list(_h265()), codec="h265"), 11),
+    "h265 with 16 B-frames": lambda: (_messages(list(_h265_deep_bframes()), codec="h265"), 11),
+    "vp9": lambda: (_messages(list(_vp9()), codec="vp9"), 11),
+    "damaged packet": lambda: (
+        _replace_message(_messages(list(_h264(bframes=0))), 13, _flip_bits(_h264(bframes=0)[13])), 11,
+    ),
+    "empty packet": lambda: (_replace_message(_messages(list(_h264(bframes=0))), 13, b""), 11),
+    "missing keyframe": lambda: (
+        [m for i, m in enumerate(_messages(list(_h264(bframes=0)))) if i != 16], 11,
+    ),
+}
+
+# ``hold`` on a timeline faster than the camera uses some frames twice;
+# ``nearest`` on a slower one skips some.
+_ALIGNMENTS = {"hold at 45 fps": ("hold", 45.0), "nearest at 20 fps": ("nearest", 20.0)}
+
+
+def _decoded_up_front(topic: FakeVideoTopic, start_ns: int, end_ns: int) -> pd.DataFrame:
+    """Every frame of the range decoded and converted to an array at once, in log-time order."""
+    codec = resolve_codec(topic.messages[0][1])
+
+    def load_messages(range_start: int, range_end: int) -> list[tuple[int, bytes]]:
+        return [(t, data) for t, _, data in topic.messages if range_start <= t <= range_end]
+
+    rows = [
+        {"timestamp": decoded.log_time, "frame": decoded.to_ndarray()}
+        for decoded in decode_frames_in_range(load_messages, start_ns, end_ns, codec=codec)
+    ]
+    return pd.DataFrame(rows).sort_values("timestamp", ignore_index=True)
+
+
+def _written(contract: Contract, collection: DataCollection, reference: pd.Series) -> tuple[list, list]:
+    """The images the writer receives and the dropped frames the manifest records for one episode.
+
+    The episode is built and pickled as a worker does, then drained into a
+    writer that records each image it is given.
     """
-    from roboto_to_lerobot.lerobot import materialize_deferred
+    dropped: list[int] = []
+    frames = list(generate_frames(
+        contract, collection, reference, defer_image_decode=True, dropped_frames=dropped,
+    ))
+    episode = pickle.loads(pickle.dumps(
+        WorkerEpisode(event_idx=0, task_label="t", frames=frames, dropped_frames=tuple(dropped))
+    ))
+    video_key = contract.videos[0].key
+    images: list[np.ndarray] = []
+    writer = SimpleNamespace(
+        add_frame=lambda frame, task: images.append(frame[video_key]),
+        save_episode=lambda: None,
+    )
+    accumulator = _DrainAccum()
+    _drain_one_episode(
+        writer=writer, video_specs_by_key={video.key: video for video in contract.videos}, src_ds_id="ds",
+        event_id="ev", start_time_ns=0, end_time_ns=1, episode=episode, accumulator=accumulator,
+    )
+    return images, accumulator.episode_to_event[0]["dropped_frames"]
 
-    topic = _topic_with(_encode_h264_access_units(8, gop=4))
-    spec = _video_spec(resize=(24, 32))
+
+@pytest.mark.parametrize("alignment", list(_ALIGNMENTS.values()), ids=list(_ALIGNMENTS))
+@pytest.mark.parametrize("stream", list(_STREAMS.values()), ids=list(_STREAMS))
+def test_writer_decode_matches_frames_decoded_up_front(stream, alignment):
+    """Decoding in the writer gives every frame, pixel and dropped frame that decoding up front gave."""
+    # Arrange
+    messages, start_index = stream()
+    topic = FakeVideoTopic(messages=messages, start_time=messages[0][0], end_time=messages[-1][0])
+    method, fps = alignment
+    spec = replace(_video_spec(resize=(24, 32)), align=AlignSpec(method=method, tolerance_ms=50.0))
+    contract = _contract(spec, fps=fps)
+    start_ns, end_ns = messages[start_index][0], messages[-1][0]
+    collection = DataCollection(contract, {spec.topic: [topic]}, start_ns, end_ns)
+    assert isinstance(collection.videos[spec.key]["frame"].iloc[0], VideoFrameRef)
+    up_front = copy.copy(collection)
+    up_front.videos = {spec.key: _decoded_up_front(topic, start_ns, end_ns)}
+    step_ns = round(1e9 / fps)
+    reference = pd.Series(range(start_ns, end_ns, step_ns), name="timestamp")
+
+    # Act
+    images, dropped = _written(contract, collection, reference)
+    expected_images, expected_dropped = _written(contract, up_front, reference)
+
+    # Assert
+    assert dropped == expected_dropped
+    assert len(images) == len(expected_images) > 0
+    for image, expected in zip(images, expected_images, strict=True):
+        np.testing.assert_array_equal(image, expected)
+
+
+# ── decoding in the writer: memory ──────────────────────────────────────────
+
+_WIDE, _HIGH = 640, 480
+_DECODED_FRAME_BYTES = _WIDE * _HIGH * 3
+
+
+@cache
+def _vga_stream() -> tuple[bytes, ...]:
+    return tuple(_encode_access_units(
+        "libx264", 120, gop=30, width=_WIDE, height=_HIGH,
+        options={"bf": "0", "tune": "zerolatency", "preset": "ultrafast"},
+    ))
+
+
+def _vga_episode(frame_count: int) -> tuple[ObservationSpec, bytes]:
+    """Build an episode of ``frame_count`` 640x480 frames the way a worker does; return it pickled."""
+    messages = _messages(list(_vga_stream()))
+    topic = FakeVideoTopic(messages=messages, start_time=messages[0][0], end_time=messages[-1][0])
+    spec = _video_spec(resize=(_HIGH, _WIDE))
     contract = _contract(spec)
-    collection = DataCollection(
-        contract, {spec.topic: [topic]}, topic.start_time, topic.end_time
-    )
-    reference = pd.Series(
-        [FIRST_LOG_TIME_NS + i * FRAME_INTERVAL_NS for i in range(3)], name="timestamp"
+    end_ns = messages[frame_count - 1][0]
+    collection = DataCollection(contract, {spec.topic: [topic]}, messages[0][0], end_ns)
+    reference = pd.Series([t for t, _, _ in messages[:frame_count]], name="timestamp")
+    frames = list(generate_frames(contract, collection, reference, defer_image_decode=True))
+    return spec, pickle.dumps(WorkerEpisode(event_idx=0, task_label="t", frames=frames))
+
+
+def _traced_peak(fn) -> int:
+    tracemalloc.start()
+    try:
+        fn()
+        return tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_worker_memory_does_not_grow_with_episode_length():
+    """Building and pickling four times as many frames in the worker costs about the same memory."""
+    # Arrange: encode the stream now, so neither measurement includes it.
+    _vga_stream()
+
+    # Act
+    peak_short = _traced_peak(lambda: _vga_episode(30))
+    peak_long = _traced_peak(lambda: _vga_episode(120))
+
+    # Assert: decoding the 90 extra frames would add about 83 MB.
+    assert peak_long - peak_short < 2 * _DECODED_FRAME_BYTES
+
+
+def _resident_bytes() -> int:
+    with open("/proc/self/statm") as statm:
+        return int(statm.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+
+
+@pytest.mark.skipif(not os.path.exists("/proc/self/statm"), reason="reads resident memory from /proc")
+def test_writer_holds_only_a_few_decoded_frames():
+    """The writer decodes each frame just before it is written and lets it go once written.
+
+    Measured as resident memory, not with ``tracemalloc``: PyAV hands out
+    frames in buffers FFmpeg allocates, which ``tracemalloc`` does not see.
+    """
+    # Arrange
+    spec, blob = _vga_episode(120)
+    episode = pickle.loads(blob)
+    baseline = _resident_bytes()
+    growth: list[int] = []
+    writer = SimpleNamespace(
+        add_frame=lambda frame, task: growth.append(_resident_bytes() - baseline),
+        save_episode=lambda: None,
     )
 
-    inline = list(generate_frames(contract, collection, reference))
-    deferred = list(
-        generate_frames(contract, collection, reference, defer_image_decode=True)
+    # Act
+    _drain_one_episode(
+        writer=writer, video_specs_by_key={spec.key: spec}, src_ds_id="ds", event_id="ev",
+        start_time_ns=0, end_time_ns=1, episode=episode, accumulator=_DrainAccum(),
     )
-    for frame in deferred:
-        materialize_deferred(frame, {spec.key: spec})
 
-    assert len(deferred) == len(inline) == 3
-    for deferred_frame, inline_frame in zip(deferred, inline, strict=True):
-        np.testing.assert_array_equal(deferred_frame[spec.key], inline_frame[spec.key])
+    # Assert: holding every frame would add about 110 MB. The decoder's own
+    # buffers take about three frames' worth.
+    assert len(growth) == 120
+    assert max(growth) < 10 * _DECODED_FRAME_BYTES
+
+
+def test_reader_rejects_a_frame_whose_log_time_changed():
+    """A decode that no longer emits the frame the probe saw fails instead of writing another frame."""
+    # Arrange
+    topic = _topic_with(_encode_h264_access_units(12, gop=4))
+    rows = probe_video_stream_rows(topic, topic.start_time, topic.end_time, topic_name=topic.name)
+    moved = replace(rows[5]["frame"], log_time=rows[5]["timestamp"] + 1)
+
+    # Act / Assert
+    with pytest.raises(RuntimeError, match="probe emitted"):
+        VideoFrameReader([moved]).frame(moved)
+
+
+def test_reader_refuses_to_hold_more_than_a_few_frames():
+    """Requests far out of decode order fail rather than hold a growing share of the episode."""
+    # Arrange
+    topic = _topic_with(_encode_h264_access_units(MAX_HELD_FRAMES + 8, gop=4))
+    refs = [row["frame"] for row in probe_video_stream_rows(
+        topic, topic.start_time, topic.end_time, topic_name=topic.name,
+    )]
+    reader = VideoFrameReader(refs)
+
+    # Act / Assert
+    with pytest.raises(RuntimeError, match=f"more than {MAX_HELD_FRAMES}"):
+        reader.frame(refs[-1])
 
 
 # ── real ingested data ──────────────────────────────────────────────────────
@@ -532,11 +768,13 @@ def test_real_reassemble_recording_decodes_end_to_end():
     end = start + 2 * 10**9
     expected = [log_time for log_time, _, _ in messages if start <= log_time <= end]
 
-    rows = decode_video_stream_rows(topic, start, end, topic_name=REASSEMBLE_TOPIC)
+    rows = probe_video_stream_rows(topic, start, end, topic_name=REASSEMBLE_TOPIC)
+    reader = VideoFrameReader(row["frame"] for row in rows)
+    images = [reader.frame(row["frame"]) for row in rows]
 
     assert [row["timestamp"] for row in rows] == expected
-    assert {row["frame"].shape for row in rows} == {(480, 640, 3)}
-    assert all(row["frame"].dtype == np.uint8 for row in rows)
+    assert {image.shape for image in images} == {(480, 640, 3)}
+    assert all(image.dtype == np.uint8 for image in images)
 
 
 @requires_reassemble_recording
