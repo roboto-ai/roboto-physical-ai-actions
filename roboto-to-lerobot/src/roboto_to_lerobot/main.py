@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 from importlib.metadata import version as _pkg_version
 from multiprocessing.connection import wait as _wait_for_processes
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 import pandas as pd
 import roboto
@@ -145,9 +145,26 @@ _SHARD_COUNT_ENV = "ROBOTO_TO_LEROBOT_SHARD_COUNT"
 # the head-of-line future while workers continue churning. Up to
 # (pool_size + this) episodes are being built or waiting to be written at
 # once; with a spool directory, their camera payloads wait in spool files on
-# disk rather than in memory. CONTRACT.md quotes this value in the disk
-# space the spool files need.
+# disk rather than in memory, and ``_SPOOL_DISK_SHARE`` bounds those files.
 _POOL_IN_FLIGHT_HEADROOM = 4
+# The share of the local disk's free space, measured as the conversion
+# starts, that the spool files of the episodes in flight may take, split
+# evenly among the shards. The spool files are the only files on that disk
+# whose size grows with the number of episodes in flight, but other files
+# grow as the conversion runs: the dataset is written there, and LeRobot
+# 0.3.3 (v2.1) keeps a PNG of every frame of the episode it is encoding
+# there. Half for the spool leaves the other half for those. On the
+# default 200 GB compute disk and one shard, that half is about 100 GB of
+# camera messages. Five minutes of one 30 fps 640x480 camera take about
+# 0.5 GB as JPEG and about 8 GB as raw RGB images. With up to about ten
+# JPEG cameras, the half holds more five-minute episodes than the
+# ``pool_size + _POOL_IN_FLIGHT_HEADROOM`` that can be in flight when
+# ``pool_size`` takes its default (at most ``_POOL_SIZE_CAP``). With raw
+# cameras it holds far fewer, about four episodes of three cameras, so later
+# episodes start only as earlier ones are written, instead of filling the
+# disk.
+# CONTRACT.md describes this bound.
+_SPOOL_DISK_SHARE = 0.5
 # The file in the dataset's ``meta/`` that records where the dataset and each
 # of its episodes came from. The Lance converter copies ``meta/`` whole.
 _LINEAGE_NAME = "roboto_lineage.json"
@@ -392,6 +409,53 @@ def _stamp_output_files(
             continue
         relative_path = str(path.relative_to(context.output_dir))
         changeset_manager.put_fields(relative_path, stamp)
+
+
+class _SpoolBudget(NamedTuple):
+    """How much spool one shard's episodes in flight may hold, and how much an episode is expected to hold.
+
+    ``max_bytes`` bounds the spool files of the episodes a shard's workers
+    are building or that wait to be written. ``bytes_per_ns`` is how many
+    spool bytes an episode takes per nanosecond of its fetch range, as
+    measured on the first event, which the main process fetches before any
+    worker starts. Camera messages arrive at a steady rate, so an episode's
+    spool grows with its fetch range, and the drain raises the rate to that of
+    any episode that took more.
+    """
+
+    max_bytes: int
+    bytes_per_ns: float
+
+
+def _spool_budget(spool_dir: Path, shard_count: int, first_spool_path: str, first_fetch_ns: int) -> _SpoolBudget:
+    """The :py:class:`_SpoolBudget` of each of ``shard_count`` shards writing spool files to ``spool_dir``.
+
+    ``first_spool_path`` is the first event's spool file, filled by a fetch
+    of ``first_fetch_ns`` nanoseconds.
+
+    No test covers this arithmetic: the tests of :py:func:`_run_pool_drain`
+    pass it a :py:class:`_SpoolBudget` directly, and a test of this function
+    would only restate the arithmetic against a patched
+    ``shutil.disk_usage``.
+    """
+    free = shutil.disk_usage(spool_dir).free
+    return _SpoolBudget(
+        max_bytes=int(free * _SPOOL_DISK_SHARE) // max(1, shard_count),
+        bytes_per_ns=os.path.getsize(first_spool_path) / max(1, first_fetch_ns),
+    )
+
+
+def _fetch_ns(task: EventTask) -> int:
+    """The length of the range a worker fetches for ``task``: the event plus its buffers and action lead."""
+    return task.end_time_ns - task.start_time_ns + 2 * task.buffer_ns + task.action_lead_ns
+
+
+def _spool_size(path: str | None) -> int:
+    """The size of an episode's spool file, or 0 when it has none or it is gone."""
+    try:
+        return os.path.getsize(path) if path else 0
+    except OSError:
+        return 0
 
 
 class _DrainAccum:
@@ -683,6 +747,7 @@ def _run_pool_drain(
     shard_idx: int | None = None,
     on_episode_saved: Callable[[dict], None] | None = None,
     spool_dir: str | None = None,
+    spool_budget: _SpoolBudget | None = None,
 ) -> None:
     """Drive a ``ProcessPoolExecutor`` and drain ``drain_order`` in order.
 
@@ -711,7 +776,41 @@ def _run_pool_drain(
 
     ``spool_dir``, if given, is the existing directory where the workers
     write each episode's spool file (see :func:`_worker_init`).
+
+    With ``spool_budget``, a task is also submitted only while the spool
+    bytes of the episodes in flight fit ``spool_budget.max_bytes``, counting
+    the task: a finished episode that waits to be drained counts its spool
+    file's size, and an episode still being built, like the task itself,
+    counts its fetch range times the highest bytes per nanosecond seen (see
+    :py:class:`_SpoolBudget`). A task is always submitted when nothing else
+    is in flight, so an episode larger than the budget is converted, alone.
+    Tasks are submitted in drain order, so the event the drain waits for
+    next is always in flight.
     """
+    # The drain waits on events in ``drain_order``. If tasks were submitted
+    # in another order (the main process appends the first event's task last
+    # when it cannot build that event itself), a full budget could hold back
+    # the task of the next event to drain while the drain waits for it.
+    drain_position = {meta["event_idx"]: position for position, meta in enumerate(drain_order)}
+    pool_tasks = sorted(pool_tasks, key=lambda task: drain_position[task.event_idx])
+    fetch_ns_by_event = {task.event_idx: _fetch_ns(task) for task in pool_tasks}
+    bytes_per_ns = spool_budget.bytes_per_ns if spool_budget is not None else 0.0
+
+    def _admits(task: EventTask) -> bool:
+        """Whether ``task`` may be submitted now, under the in-flight and spool limits the docstring above describes."""
+        if not submitted:
+            return True
+        if len(submitted) >= max_in_flight:
+            return False
+        if spool_budget is None:
+            return True
+        held = bytes_per_ns * fetch_ns_by_event[task.event_idx]
+        for event_idx, future in submitted.items():
+            if not future.done():
+                held += bytes_per_ns * fetch_ns_by_event[event_idx]
+            elif not future.cancelled() and future.exception() is None:
+                held += _spool_size(future.result().spool_path)
+        return held <= spool_budget.max_bytes
 
     def _drain(meta: dict, episode) -> None:
         try:
@@ -777,10 +876,7 @@ def _run_pool_drain(
             ):
                 _drain(meta, preloaded_episode)
                 continue
-            while (
-                next_to_submit < len(pool_tasks)
-                and len(submitted) < max_in_flight
-            ):
+            while next_to_submit < len(pool_tasks) and _admits(pool_tasks[next_to_submit]):
                 t = pool_tasks[next_to_submit]
                 try:
                     submitted[t.event_idx] = pool.submit(
@@ -803,6 +899,7 @@ def _run_pool_drain(
                     shard_idx=shard_idx,
                 )
                 continue
+            bytes_per_ns = max(bytes_per_ns, _spool_size(episode.spool_path) / max(1, fetch_ns_by_event[event_idx]))
             _drain(meta, episode)
     except BaseException:
         # ``cancel_futures=True`` drops pending tasks immediately rather
@@ -1000,6 +1097,7 @@ def _run_shard_subprocess(
     video_encoding: dict | None = None,
     episode_conn: Connection | None = None,
     spool_dir: str | None = None,
+    spool_budget: _SpoolBudget | None = None,
 ) -> None:
     """Entrypoint for a single shard process.
 
@@ -1080,6 +1178,7 @@ def _run_shard_subprocess(
             shard_idx=shard_idx,
             on_episode_saved=on_episode_saved,
             spool_dir=spool_dir,
+            spool_budget=spool_budget,
         )
         writer.finalize()
         result.update({
@@ -1122,6 +1221,7 @@ def _spawn_shards(
     video_encoding: dict | None = None,
     on_episodes: Callable[[list[dict]], None] | None = None,
     spool_dir: str | None = None,
+    spool_budget: _SpoolBudget | None = None,
 ) -> list[dict]:
     """Spawn one process per shard, wait for all, return per-shard results.
 
@@ -1143,8 +1243,8 @@ def _spawn_shards(
     stale-pid output. The result list is sorted by ``shard_idx`` so
     downstream aggregation runs in original chronological order.
 
-    ``spool_dir`` is passed to every shard's worker pool (see
-    :func:`_run_pool_drain`).
+    ``spool_dir`` and ``spool_budget`` are passed to every shard's worker
+    pool (see :func:`_run_pool_drain`).
     """
     shard_count = len(chunks_drain)
     ctx = mp.get_context("spawn")
@@ -1199,6 +1299,7 @@ def _spawn_shards(
                 "result_path": str(result_path),
                 "episode_conn": episode_conn,
                 "spool_dir": spool_dir,
+                "spool_budget": spool_budget,
             },
             name=f"shard-{i:03d}",
         )
@@ -1984,11 +2085,13 @@ def _convert_collection(context: roboto.InvocationContext, spool_dir: Path) -> N
 
     logger.info("Preloading first event to discover feature shapes...")
     first_spool = SpoolWriter(spool_dir, prefix="first-event-")
+    first_fetch_start_ns = first_event.start_time - buffer_ns
+    first_fetch_end_ns = first_event.end_time + buffer_ns + action_lead_ns
     first_data = DataCollection(
         contract=first_resolved,
         topics=first_topics,
-        start_time_ns=first_event.start_time - buffer_ns,
-        end_time_ns=first_event.end_time + buffer_ns + action_lead_ns,
+        start_time_ns=first_fetch_start_ns,
+        end_time_ns=first_fetch_end_ns,
         spool=first_spool,
     )
     first_spool.close()
@@ -2078,6 +2181,14 @@ def _convert_collection(context: roboto.InvocationContext, spool_dir: Path) -> N
         shard_count, pool_size, encoder_threads,
         _TOPIC_FETCH_THREADS,
     )
+    spool_budget = _spool_budget(
+        spool_dir, shard_count, first_spool.path, first_fetch_end_ns - first_fetch_start_ns,
+    )
+    logger.info(
+        "Spooled camera messages in flight: up to %.1f GB per shard; "
+        "the first event spooled %.1f MB per second of its time range.",
+        spool_budget.max_bytes / 1e9, spool_budget.bytes_per_ns * 1e3,
+    )
 
     accumulator = _DrainAccum()
     recipe = recipe_hash(
@@ -2115,6 +2226,7 @@ def _convert_collection(context: roboto.InvocationContext, spool_dir: Path) -> N
             descriptors_by_ds=descriptors_by_ds,
             log_level=context.log_level,
             spool_dir=str(spool_dir),
+            spool_budget=spool_budget,
         )
     elif shard_count == 1:
         # Single-writer path — keep the preloaded-event optimisation: the
@@ -2220,6 +2332,7 @@ def _convert_collection(context: roboto.InvocationContext, spool_dir: Path) -> N
             preloaded_event_idx=preloaded_event_idx,
             preloaded_episode=preloaded_episode,
             spool_dir=str(spool_dir),
+            spool_budget=spool_budget,
         )
         writer.finalize()
         # Same failure mode the sharded path guards against in
@@ -2290,6 +2403,7 @@ def _convert_collection(context: roboto.InvocationContext, spool_dir: Path) -> N
             contracts_by_ds=contracts_by_ds,
             log_level=context.log_level,
             spool_dir=str(spool_dir),
+            spool_budget=spool_budget,
         )
         # ``shard_results`` (unfiltered) still feeds every fold-in below —
         # only the aggregation call itself should see empty shards excluded.

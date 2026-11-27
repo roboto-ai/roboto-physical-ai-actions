@@ -140,8 +140,9 @@ class FakeVideoTopic:
 
     ``get_data_as_df`` returns what the SDK returns for a message-path read: a
     DataFrame indexed by log time, with one column per requested message path.
-    Range filtering is real, which is what lets a test drive the keyframe
-    lookback (the decoder asks for an earlier range than it was given).
+    Range filtering is real and half-open, ``[start_time, end_time)``, as in
+    the SDK. That lets a test drive the keyframe lookback (the decoder asks
+    for an earlier range than it was given) and read a range in windows.
     """
 
     topic_id: str = "tp_video"
@@ -163,7 +164,7 @@ class FakeVideoTopic:
         rows = [
             (log_time, token, data)
             for log_time, token, data in self.messages
-            if start_time.value <= log_time <= end_time.value
+            if start_time.value <= log_time < end_time.value
         ]
         return pd.DataFrame(
             {
@@ -198,12 +199,12 @@ def test_chunk_starting_on_a_keyframe_decodes_standalone():
     topic = _topic_with(_encode_h264_access_units(12, gop=4))
 
     rows = probe_video_stream_rows(
-        topic, topic.start_time, topic.end_time, topic_name=topic.name
+        topic, topic.start_time, topic.end_time + 1, topic_name=topic.name
     )
 
     assert len(rows) == 12
     assert [row["timestamp"] for row in rows] == [m[0] for m in topic.messages]
-    assert topic.requested_ranges == [(topic.start_time, topic.end_time)]
+    assert topic.requested_ranges == [(topic.start_time, topic.end_time + 1)]
     reader = VideoFrameReader(row["frame"] for row in rows)
     for row in rows:
         image = reader.frame(row["frame"])
@@ -222,7 +223,7 @@ def test_range_starting_mid_gop_decodes_by_walking_back_to_the_keyframe():
     assert not is_keyframe(topic.messages[6][2]), "fixture must start mid-GOP"
 
     rows = probe_video_stream_rows(
-        topic, mid_gop_start, topic.end_time, topic_name=topic.name
+        topic, mid_gop_start, topic.end_time + 1, topic_name=topic.name
     )
 
     assert [row["timestamp"] for row in rows] == [m[0] for m in topic.messages[6:]]
@@ -281,7 +282,7 @@ def test_frames_before_an_out_of_reach_keyframe_are_dropped_and_reported(caplog)
         rows = probe_video_stream_rows(
             topic,
             mid_gop_start,
-            topic.end_time,
+            topic.end_time + 1,
             topic_name=topic.name,
             keyframe_lookback_ns=1,
         )
@@ -472,7 +473,7 @@ def test_compressed_video_topic_becomes_rgb_frames_on_the_reference_timeline():
     contract = _contract(spec)
 
     collection = DataCollection(
-        contract, {spec.topic: [topic]}, topic.start_time, topic.end_time
+        contract, {spec.topic: [topic]}, topic.start_time, topic.end_time + 1
     )
     assert list(collection.videos[spec.key].columns) == ["timestamp", "frame"]
     assert len(collection.videos[spec.key]) == 12
@@ -564,7 +565,7 @@ def _decoded_up_front(topic: FakeVideoTopic, start_ns: int, end_ns: int) -> pd.D
     codec = resolve_codec(topic.messages[0][1])
 
     def load_messages(range_start: int, range_end: int) -> list[tuple[int, bytes]]:
-        return [(t, data) for t, _, data in topic.messages if range_start <= t <= range_end]
+        return [(t, data) for t, _, data in topic.messages if range_start <= t < range_end]
 
     rows = [
         {"timestamp": decoded.log_time, "frame": decoded.to_ndarray()}

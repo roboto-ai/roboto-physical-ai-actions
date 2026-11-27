@@ -35,6 +35,7 @@ import roboto
 import yaml
 
 from . import decoders  # noqa: F401
+from .camera_windows import fetch_in_windows, payload_nbytes
 from .converters import DECODERS, POSITIONAL_TYPES, check_positional_width, decode_value
 from .extract import (
     _add_timestamp_column,
@@ -1035,26 +1036,25 @@ def _fetch_one(item: _TopicWorkItem, spool: SpoolWriter | None = None, fields: t
     later fan-out step. ``video_stream`` specs probe the range into
     ``{timestamp, frame}`` row dicts whose ``frame`` is a ``VideoFrameRef``;
     compressed video cannot be decoded one message at a time, so the probe
-    runs here, where the whole range is in hand. For every other
+    runs here, where the whole range is read. For every other
     ``spec_kind`` the result is the DataFrame from ``get_data_as_df``,
     normalised to int64 ns timestamps.
 
-    With ``spool``, a camera's payloads are written to the spool file as soon
-    as the fetch returns: in a ``video_file`` or ``video_msgs`` result, each
-    ``data`` value that ``SpoolWriter.put`` accepts is replaced by its
-    ``SpoolRef``, and a ``video_stream`` session keeps references to its
-    packets.
+    The three camera kinds read their range in windows (see
+    :py:mod:`roboto_to_lerobot.camera_windows`) and return what one call over
+    the range returns. With ``spool``, each window's payloads are written to
+    the spool file before the next window is requested: in a ``video_file``
+    or ``video_msgs`` result, each ``data`` value that ``SpoolWriter.put``
+    accepts is replaced by its ``SpoolRef``, and a ``video_stream`` session
+    keeps references to its packets. A camera fetch then holds one window's
+    payloads at a time. Other topics are read in one call.
 
     ``fields`` are the ``image.field`` s of the still images nested in the
     topic that share a ``video_msgs`` fetch. Their result is a dict holding,
-    for each field, :func:`select_message_field` of the DataFrame, so each
-    nested camera's ``data`` is spooled the way a top-level camera's is.
+    for each field, :func:`select_message_field` of the DataFrame. Each
+    window is split by field before it is spooled, so each nested camera's
+    ``data`` is spooled the way a top-level camera's is.
     """
-    from .logger import logger
-
-    start_time = pd.Timestamp(item.start_ns, unit="ns")
-    end_time = pd.Timestamp(item.end_ns, unit="ns")
-
     if item.spec_kind == "video_stream":
         return probe_video_stream_rows(
             item.topic,
@@ -1064,17 +1064,49 @@ def _fetch_one(item: _TopicWorkItem, spool: SpoolWriter | None = None, fields: t
             field=item.field,
             spool=spool,
         )
-
     if item.spec_kind == "video_file":
-        camera_data = item.topic.get_data(start_time=start_time, end_time=end_time)
+        return [row for rows in _fetch_in_windows(item, _image_rows_fetch(item, spool)) for row in rows]
+    if item.spec_kind == "video_msgs":
+        windows = list(_fetch_in_windows(item, _image_df_fetch(item, spool, fields)))
+        if fields:
+            return {field: _concat_windows([window[field] for window in windows]) for field in fields}
+        return _add_timestamp_column(_concat_windows(windows))
+    return _add_timestamp_column(_get_data_as_df(item, item.start_ns, item.end_ns))
+
+
+def _fetch_in_windows(item: _TopicWorkItem, fetch: Callable[[int, int], tuple[Any, int, int | None]]) -> Iterator[Any]:
+    """Run ``fetch`` over ``item``'s range in windows placed by its topic's recorded span."""
+    return fetch_in_windows(
+        fetch,
+        item.start_ns,
+        item.end_ns,
+        data_start_ns=getattr(item.topic, "start_time", None),
+        data_end_ns=getattr(item.topic, "end_time", None),
+    )
+
+
+def _get_data_as_df(item: _TopicWorkItem, start_ns: int, end_ns: int) -> pd.DataFrame:
+    """``item``'s topic's ``get_data_as_df`` for ``[start_ns, end_ns)``, with its message paths if it has any."""
+    window = {"start_time": pd.Timestamp(start_ns, unit="ns"), "end_time": pd.Timestamp(end_ns, unit="ns")}
+    if item.message_paths_include:
+        return item.topic.get_data_as_df(**window, message_paths_include=item.message_paths_include)
+    return item.topic.get_data_as_df(**window)
+
+
+def _image_rows_fetch(
+    item: _TopicWorkItem, spool: SpoolWriter | None,
+) -> Callable[[int, int], tuple[list[dict], int, int | None]]:
+    """A window fetch for a ``video_file`` item: ``{timestamp, format, data}`` rows from ``topic.get_data``."""
+    from .logger import logger
+
+    def fetch(start_ns: int, end_ns: int) -> tuple[list[dict], int, int | None]:
+        camera_data = item.topic.get_data(
+            start_time=pd.Timestamp(start_ns, unit="ns"), end_time=pd.Timestamp(end_ns, unit="ns"),
+        )
         rows: list[dict] = []
+        payload_bytes = 0
         for timestamp, content_dict in camera_data:
-            if hasattr(timestamp, "value"):
-                ts_ns = timestamp.value
-            elif isinstance(timestamp, pd.Timestamp):
-                ts_ns = timestamp.value
-            else:
-                ts_ns = int(pd.Timestamp(timestamp).value)
+            ts_ns = timestamp.value if hasattr(timestamp, "value") else int(pd.Timestamp(timestamp).value)
 
             image_data = content_dict.get("image")
             if image_data is None:
@@ -1084,40 +1116,98 @@ def _fetch_one(item: _TopicWorkItem, spool: SpoolWriter | None = None, fields: t
                 )
                 continue
 
+            payload_bytes += payload_nbytes(image_data)
             rows.append({
                 "timestamp": ts_ns,
                 "format": "jpeg",
                 "data": image_data if spool is None else spool.put(image_data),
             })
-        return rows
+        return rows, payload_bytes, rows[0]["timestamp"] if rows else None
 
-    if item.message_paths_include:
-        df = item.topic.get_data_as_df(
-            start_time=start_time,
-            end_time=end_time,
-            message_paths_include=item.message_paths_include,
-        )
-    else:
-        df = item.topic.get_data_as_df(
-            start_time=start_time,
-            end_time=end_time,
-        )
-    df = _add_timestamp_column(df)
-    if item.spec_kind != "video_msgs":
-        return df
-    if not fields:
-        return _spool_camera_data(df, spool)
-    return {field: _spool_camera_data(select_message_field(df, field, item.topic_name), spool) for field in fields}
+    return fetch
 
 
-def _spool_camera_data(df: pd.DataFrame, spool: SpoolWriter | None) -> pd.DataFrame:
-    """``df`` with each ``data`` value that ``SpoolWriter.put`` accepts replaced by its ``SpoolRef``.
+def _image_df_fetch(
+    item: _TopicWorkItem, spool: SpoolWriter | None, fields: tuple[str, ...] = (),
+) -> Callable[[int, int], tuple[Any, int, int | None]]:
+    """A window fetch for a ``video_msgs`` item: the SDK's DataFrame, its ``data`` spooled if ``spool`` is given.
 
-    Returns ``df`` itself without a spool or a ``data`` column.
+    With ``fields``, the window is split into each field's camera
+    (:func:`select_message_field`) before anything is spooled, and the fetch
+    returns those DataFrames keyed by field.
     """
-    if spool is None or "data" not in df.columns:
-        return df
-    return df.assign(data=[spool.put(value) for value in df["data"]])
+
+    def fetch(start_ns: int, end_ns: int) -> tuple[Any, int, int | None]:
+        df = _get_data_as_df(item, start_ns, end_ns)
+        if fields:
+            df = _add_timestamp_column(df)
+            cameras: dict[str, pd.DataFrame] = {}
+            payload_bytes = 0
+            for field in fields:
+                cameras[field], nbytes = _spool_camera_data(select_message_field(df, field, item.topic_name), spool)
+                payload_bytes += nbytes
+            return cameras, payload_bytes, int(df["timestamp"].iloc[0]) if len(df) else None
+        if len(df) == 0 or "data" not in df.columns:
+            return df, 0, None
+        df, payload_bytes = _spool_camera_data(df, spool)
+        first_ns = int(_add_timestamp_column(df.iloc[:1])["timestamp"].iloc[0])
+        return df, payload_bytes, first_ns
+
+    return fetch
+
+
+def _spool_camera_data(df: pd.DataFrame, spool: SpoolWriter | None) -> tuple[pd.DataFrame, int]:
+    """``df`` with each ``data`` value that ``SpoolWriter.put`` accepts replaced by its ``SpoolRef``, and its payload bytes.
+
+    Returns ``df`` itself without a spool, and with no payload bytes without
+    a ``data`` column.
+    """
+    if "data" not in df.columns:
+        return df, 0
+    payload_bytes = sum(payload_nbytes(value) for value in df["data"])
+    if spool is not None:
+        # Rebuilt column by column rather than with ``df.assign``: on
+        # pandas 2, the columns ``assign`` keeps can be views of the block
+        # that also holds the old ``data`` column, which would keep every
+        # spooled payload in memory as long as the DataFrame lives.
+        refs = [spool.put(value) for value in df["data"]]
+        df = pd.DataFrame({column: refs if column == "data" else df[column] for column in df.columns}, index=df.index)
+    return df, payload_bytes
+
+
+def _concat_windows(windows: list[pd.DataFrame]) -> pd.DataFrame:
+    """Concatenate one topic's window DataFrames into what one call over their union returns.
+
+    The windows are the SDK's DataFrames, or for a nested still image one
+    camera's :func:`select_message_field` of each.
+
+    A column with no value in a window has a dtype of its own there: on
+    pandas 3 an all-null string column is ``object``, not ``str``, and the
+    concatenated column would be ``object``, holding ``None`` where one call
+    holds NaN. Such a column takes the dtype the column has in the windows
+    where it has values, so its nulls come out as one call's do. Empty
+    windows add no rows and are left out; when every window is empty, the
+    first is returned as it was built.
+    """
+    filled = [window for window in windows if len(window)]
+    if len(filled) <= 1:
+        return filled[0] if filled else windows[0]
+    valued_dtypes: dict[str, set] = {}
+    for window in filled:
+        for column in window.columns:
+            if window[column].notna().any():
+                valued_dtypes.setdefault(column, set()).add(window[column].dtype)
+    aligned = []
+    for window in filled:
+        for column in window.columns:
+            dtypes = valued_dtypes.get(column, set())
+            if len(dtypes) == 1 and window[column].dtype not in dtypes and window[column].isna().all():
+                try:
+                    window = window.astype({column: next(iter(dtypes))})
+                except (TypeError, ValueError):
+                    pass  # e.g. an integer column, which cannot hold a null; left as it is
+        aligned.append(window)
+    return pd.concat(aligned)
 
 
 def _run_topic_fetches(
